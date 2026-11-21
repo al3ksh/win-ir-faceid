@@ -3,7 +3,13 @@
 
   const $ = (id) => document.getElementById(id);
 
+  const CHECK_SVG =
+    '<svg class="dropdown-check" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.8 7.3 5.7 10.2 11.2 4.2"/></svg>';
+
   const els = {
+    appShell: document.querySelector(".app-shell"),
+    settingsPane: document.querySelector(".settings-pane"),
+
     headerServiceDot: $("headerServiceDot"),
     headerServiceText: $("headerServiceText"),
     btnHeaderRestart: $("btnHeaderRestart"),
@@ -11,6 +17,7 @@
     viewport: $("viewport"),
     streamImg: $("streamImg"),
     standbyOverlay: $("standbyOverlay"),
+    standbyTitle: $("standbyTitle"),
     faceReticle: $("faceReticle"),
     aePill: $("aePill"),
     matchPill: $("matchPill"),
@@ -24,8 +31,10 @@
     btnLiveTest: $("btnLiveTest"),
     btnPreview: $("btnPreview"),
     btnDiagnostics: $("btnDiagnostics"),
+    diagnosticsDrawer: $("diagnosticsDrawer"),
     diagnosticsStrip: $("diagnosticsStrip"),
     diagnosticsText: $("diagnosticsText"),
+    feedbackDrawer: $("feedbackDrawer"),
     stageFeedback: $("stageFeedback"),
     stageFeedbackText: $("stageFeedbackText"),
 
@@ -33,6 +42,7 @@
     profileSuggestions: $("profileSuggestions"),
     btnPassword: $("btnPassword"),
     btnRemove: $("btnRemove"),
+    removeConfirmDrawer: $("removeConfirmDrawer"),
     removeConfirmRow: $("removeConfirmRow"),
     removeConfirmText: $("removeConfirmText"),
     btnRemoveConfirm: $("btnRemoveConfirm"),
@@ -48,10 +58,14 @@
     thresholdSlider: $("thresholdSlider"),
     thresholdValue: $("thresholdValue"),
 
+    feedSegThumb: $("feedSegThumb"),
     btnFeedSubtract: $("btnFeedSubtract"),
     btnFeedBright: $("btnFeedBright"),
     cameraSelectRow: $("cameraSelectRow"),
-    cameraSelect: $("cameraSelect"),
+    cameraDropdown: $("cameraDropdown"),
+    cameraDropdownBtn: $("cameraDropdownBtn"),
+    cameraDropdownLabel: $("cameraDropdownLabel"),
+    cameraDropdownMenu: $("cameraDropdownMenu"),
     paneServiceDesc: $("paneServiceDesc"),
     btnPaneRestart: $("btnPaneRestart"),
 
@@ -67,16 +81,23 @@
   };
 
   const state = {
+    appReady: false,
     bootstrap: null,
     profiles: [],
     live: null,
     streamActiveUrl: "",
+    streamFrameReady: false,
+    clearSrcTimer: null,
     diagnosticsVisible: false,
     pollTimer: null,
     serviceTimer: null,
     feedbackTimer: null,
     wasDownloading: false,
     wasEnrolling: false,
+    cameras: [],
+    selectedCameraIdx: 0,
+    dropdownOpen: false,
+    dropdownFocusIdx: -1,
   };
 
   function api() {
@@ -103,21 +124,45 @@
     });
   }
 
+  function markAppReady() {
+    if (state.appReady) return;
+    state.appReady = true;
+    positionSegThumb(false);
+    if (els.appShell) {
+      els.appShell.dataset.ready = "true";
+    }
+  }
+
+  function setDrawerOpen(drawerEl, open) {
+    if (!drawerEl) return;
+    drawerEl.dataset.open = open ? "true" : "false";
+    drawerEl.setAttribute("aria-hidden", open ? "false" : "true");
+  }
+
+  function setVisible(el, visible) {
+    if (!el) return;
+    const val = visible ? "true" : "false";
+    if (el.dataset.visible !== val) {
+      el.dataset.visible = val;
+    }
+    el.setAttribute("aria-hidden", visible ? "false" : "true");
+  }
+
   function showFeedback(message, tone = "neutral", durationMs = 4000) {
     if (state.feedbackTimer) {
       clearTimeout(state.feedbackTimer);
       state.feedbackTimer = null;
     }
     if (!message) {
-      els.stageFeedback.classList.add("hidden");
+      setDrawerOpen(els.feedbackDrawer, false);
       return;
     }
     els.stageFeedbackText.textContent = message;
     els.stageFeedback.dataset.tone = tone;
-    els.stageFeedback.classList.remove("hidden");
+    setDrawerOpen(els.feedbackDrawer, true);
     if (durationMs > 0) {
       state.feedbackTimer = setTimeout(() => {
-        els.stageFeedback.classList.add("hidden");
+        setDrawerOpen(els.feedbackDrawer, false);
       }, durationMs);
     }
   }
@@ -185,12 +230,12 @@
       els.accountStatusLine.textContent = "Not enrolled";
       els.accountStatusLine.dataset.tone = "neutral";
       els.btnRemove.classList.add("hidden");
-      els.removeConfirmRow.classList.add("hidden");
+      setDrawerOpen(els.removeConfirmDrawer, false);
     } else {
       els.accountStatusLine.textContent = "Enter a Windows username";
       els.accountStatusLine.dataset.tone = "warn";
       els.btnRemove.classList.add("hidden");
-      els.removeConfirmRow.classList.add("hidden");
+      setDrawerOpen(els.removeConfirmDrawer, false);
     }
 
     updateEnrollButton(mode, prof);
@@ -255,10 +300,205 @@
     }
   }
 
+  function positionSegThumb(animate = true) {
+    const thumb = els.feedSegThumb;
+    const activeBtn = els.btnFeedBright.classList.contains("active")
+      ? els.btnFeedBright
+      : els.btnFeedSubtract;
+    if (!thumb || !activeBtn) return;
+
+    const width = activeBtn.offsetWidth;
+    const left = activeBtn.offsetLeft;
+    if (!width) return;
+
+    if (!animate) {
+      thumb.classList.add("no-transition");
+    }
+    thumb.style.width = `${width}px`;
+    thumb.style.transform = `translateX(${left}px)`;
+    if (!animate) {
+      void thumb.offsetWidth;
+      thumb.classList.remove("no-transition");
+    }
+  }
+
   function renderFeedMode(mode) {
     const isBright = mode === "bright";
     els.btnFeedSubtract.classList.toggle("active", !isBright);
     els.btnFeedBright.classList.toggle("active", isBright);
+    positionSegThumb(state.appReady);
+  }
+
+  /* Custom Monochrome Camera Dropdown */
+  function renderCameraDropdown(cameras, selectedIdx) {
+    state.cameras = Array.isArray(cameras) ? cameras : [];
+    state.selectedCameraIdx = Number.isFinite(Number(selectedIdx)) ? Number(selectedIdx) : 0;
+
+    if (state.cameras.length <= 1) {
+      closeCameraDropdown(false);
+      els.cameraSelectRow.classList.add("hidden");
+      els.cameraDropdownMenu.innerHTML = "";
+      return;
+    }
+
+    els.cameraDropdownMenu.innerHTML = "";
+    let activeCam = state.cameras[0];
+
+    state.cameras.forEach((cam, pos) => {
+      const isSelected = Number(cam.index) === state.selectedCameraIdx;
+      if (isSelected) activeCam = cam;
+
+      const opt = document.createElement("div");
+      opt.className = "dropdown-option";
+      opt.id = `cameraOption-${cam.index}`;
+      opt.setAttribute("role", "option");
+      opt.setAttribute("tabindex", "-1");
+      opt.setAttribute("aria-selected", isSelected ? "true" : "false");
+      opt.dataset.index = String(cam.index);
+      opt.dataset.pos = String(pos);
+
+      const labelSpan = document.createElement("span");
+      labelSpan.className = "dropdown-option-label";
+      labelSpan.textContent = cam.label;
+      opt.appendChild(labelSpan);
+
+      if (cam.is_ir === true) {
+        const badge = document.createElement("span");
+        badge.className = "dropdown-ir-badge";
+        badge.textContent = "IR";
+        opt.appendChild(badge);
+      }
+
+      opt.insertAdjacentHTML("beforeend", CHECK_SVG);
+
+      opt.addEventListener("mouseenter", () => {
+        setDropdownFocus(pos);
+      });
+      opt.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        selectCameraOption(Number(cam.index));
+      });
+
+      els.cameraDropdownMenu.appendChild(opt);
+    });
+
+    els.cameraDropdownLabel.textContent = activeCam ? activeCam.label : "Select camera";
+    els.cameraSelectRow.classList.remove("hidden");
+  }
+
+  function updateDropdownSelectionUI(selectedIdx) {
+    state.selectedCameraIdx = Number(selectedIdx);
+    let activeCam = null;
+    const options = els.cameraDropdownMenu.querySelectorAll(".dropdown-option");
+    options.forEach((opt) => {
+      const idx = Number(opt.dataset.index);
+      const selected = idx === state.selectedCameraIdx;
+      opt.setAttribute("aria-selected", selected ? "true" : "false");
+      if (selected) {
+        activeCam = state.cameras.find((c) => Number(c.index) === idx) || null;
+      }
+    });
+    if (activeCam) {
+      els.cameraDropdownLabel.textContent = activeCam.label;
+    }
+  }
+
+  function setDropdownFocus(pos) {
+    const options = els.cameraDropdownMenu.querySelectorAll(".dropdown-option");
+    if (!options.length) {
+      state.dropdownFocusIdx = -1;
+      els.cameraDropdownBtn.removeAttribute("aria-activedescendant");
+      return;
+    }
+    const clamped = ((pos % options.length) + options.length) % options.length;
+    state.dropdownFocusIdx = clamped;
+    options.forEach((opt, idx) => {
+      opt.classList.toggle("is-focused", idx === clamped);
+    });
+    const activeOpt = options[clamped];
+    if (activeOpt) {
+      els.cameraDropdownBtn.setAttribute("aria-activedescendant", activeOpt.id);
+      activeOpt.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function positionCameraDropdownMenu() {
+    const btn = els.cameraDropdownBtn;
+    const menu = els.cameraDropdownMenu;
+    if (!btn || !menu) return;
+
+    const rect = btn.getBoundingClientRect();
+    const minW = Math.max(rect.width, 200);
+    const maxW = Math.min(296, Math.max(184, window.innerWidth - 24));
+    menu.style.minWidth = `${minW}px`;
+    menu.style.maxWidth = `${maxW}px`;
+
+    const menuHeight = Math.min(240, menu.scrollHeight || state.cameras.length * 32 + 10);
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const spaceAbove = rect.top;
+
+    // Open upward when near the bottom of the settings pane to prevent clipping.
+    const openUpward = spaceBelow < menuHeight + 12 || (spaceBelow < 160 && spaceAbove >= spaceBelow);
+    const rightOffset = Math.max(8, window.innerWidth - rect.right);
+
+    menu.style.right = `${rightOffset}px`;
+    menu.style.left = "auto";
+
+    if (openUpward) {
+      menu.dataset.placement = "top";
+      menu.style.bottom = `${window.innerHeight - rect.top + 6}px`;
+      menu.style.top = "auto";
+    } else {
+      menu.dataset.placement = "bottom";
+      menu.style.top = `${rect.bottom + 6}px`;
+      menu.style.bottom = "auto";
+    }
+  }
+
+  function openCameraDropdown() {
+    if (state.dropdownOpen || state.cameras.length <= 1) return;
+    state.dropdownOpen = true;
+    positionCameraDropdownMenu();
+    els.cameraDropdownMenu.dataset.open = "true";
+    els.cameraDropdownMenu.setAttribute("aria-hidden", "false");
+    els.cameraDropdownBtn.setAttribute("aria-expanded", "true");
+
+    const selectedPos = Math.max(
+      0,
+      state.cameras.findIndex((c) => Number(c.index) === state.selectedCameraIdx)
+    );
+    setDropdownFocus(selectedPos);
+  }
+
+  function closeCameraDropdown(restoreFocus = false) {
+    if (!state.dropdownOpen) return;
+    state.dropdownOpen = false;
+    state.dropdownFocusIdx = -1;
+    els.cameraDropdownMenu.dataset.open = "false";
+    els.cameraDropdownMenu.setAttribute("aria-hidden", "true");
+    els.cameraDropdownBtn.setAttribute("aria-expanded", "false");
+    els.cameraDropdownBtn.removeAttribute("aria-activedescendant");
+    els.cameraDropdownMenu
+      .querySelectorAll(".dropdown-option.is-focused")
+      .forEach((opt) => opt.classList.remove("is-focused"));
+    if (restoreFocus) {
+      els.cameraDropdownBtn.focus();
+    }
+  }
+
+  async function selectCameraOption(idx) {
+    const prevIdx = state.selectedCameraIdx;
+    closeCameraDropdown(true);
+    if (idx === prevIdx) return;
+
+    updateDropdownSelectionUI(idx);
+    const a = api();
+    if (!a) return;
+    const res = await a.select_camera(idx);
+    if (res && !res.ok) {
+      updateDropdownSelectionUI(prevIdx);
+      if (res.error) showFeedback(res.error, "error");
+    }
   }
 
   function humanizeReason(reason) {
@@ -282,14 +522,14 @@
 
   function updateReticlePosition(bboxNorm, tone) {
     if (!bboxNorm || bboxNorm.length !== 4) {
-      els.faceReticle.classList.add("hidden");
+      els.faceReticle.dataset.visible = "false";
       return;
     }
 
     const vpW = els.viewport.clientWidth;
     const vpH = els.viewport.clientHeight;
     if (!vpW || !vpH) {
-      els.faceReticle.classList.add("hidden");
+      els.faceReticle.dataset.visible = "false";
       return;
     }
 
@@ -302,12 +542,34 @@
     const offsetY = (vpH - drawH) * 0.5;
 
     const [nx, ny, nw, nh] = bboxNorm;
-    els.faceReticle.style.left = `${(offsetX + nx * drawW).toFixed(1)}px`;
-    els.faceReticle.style.top = `${(offsetY + ny * drawH).toFixed(1)}px`;
-    els.faceReticle.style.width = `${Math.max(16, nw * drawW).toFixed(1)}px`;
-    els.faceReticle.style.height = `${Math.max(16, nh * drawH).toFixed(1)}px`;
+    const x = offsetX + nx * drawW;
+    const y = offsetY + ny * drawH;
+    const w = Math.max(16, nw * drawW);
+    const h = Math.max(16, nh * drawH);
+
+    const wasVisible = els.faceReticle.dataset.visible === "true";
+    if (!wasVisible) {
+      els.faceReticle.classList.add("no-pos-transition");
+    }
+
+    els.faceReticle.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0)`;
+    els.faceReticle.style.width = `${w.toFixed(1)}px`;
+    els.faceReticle.style.height = `${h.toFixed(1)}px`;
     els.faceReticle.dataset.tone = tone;
-    els.faceReticle.classList.remove("hidden");
+
+    if (!wasVisible) {
+      void els.faceReticle.offsetWidth;
+      els.faceReticle.classList.remove("no-pos-transition");
+    }
+    els.faceReticle.dataset.visible = "true";
+  }
+
+  function revealStreamFrame() {
+    if (!state.streamActiveUrl) return;
+    state.streamFrameReady = true;
+    els.streamImg.dataset.visible = "true";
+    els.standbyOverlay.dataset.visible = "false";
+    els.standbyOverlay.dataset.starting = "false";
   }
 
   function renderLiveState(live) {
@@ -315,23 +577,43 @@
     const mode = live.mode || "standby";
     const active = Boolean(live.camera_active) && mode !== "standby";
 
-    // Stream image & standby placeholder
+    // Stream image & standby cross-fade (wait for first real frame before revealing)
     if (active) {
+      if (state.clearSrcTimer) {
+        clearTimeout(state.clearSrcTimer);
+        state.clearSrcTimer = null;
+      }
       const targetUrl = `${state.bootstrap.stream_url}`;
       if (!state.streamActiveUrl) {
+        state.streamFrameReady = false;
+        els.standbyTitle.textContent = "Starting IR sensor...";
+        els.standbyOverlay.dataset.starting = "true";
+        els.standbyOverlay.dataset.visible = "true";
+        els.streamImg.dataset.visible = "false";
         state.streamActiveUrl = `${targetUrl}&ts=${Date.now()}`;
         els.streamImg.src = state.streamActiveUrl;
       }
-      els.streamImg.classList.remove("hidden");
-      els.standbyOverlay.classList.add("hidden");
+      if (state.streamFrameReady || (els.streamImg.complete && els.streamImg.naturalWidth > 0)) {
+        revealStreamFrame();
+      }
     } else {
+      state.streamFrameReady = false;
+      els.streamImg.dataset.visible = "false";
+      els.standbyTitle.textContent = "IR sensor on standby";
+      els.standbyOverlay.dataset.starting = "false";
+      els.standbyOverlay.dataset.visible = "true";
+      els.faceReticle.dataset.visible = "false";
+
       if (state.streamActiveUrl) {
         state.streamActiveUrl = "";
-        els.streamImg.removeAttribute("src");
+        if (state.clearSrcTimer) clearTimeout(state.clearSrcTimer);
+        state.clearSrcTimer = setTimeout(() => {
+          state.clearSrcTimer = null;
+          if (!state.streamActiveUrl) {
+            els.streamImg.removeAttribute("src");
+          }
+        }, 270);
       }
-      els.streamImg.classList.add("hidden");
-      els.standbyOverlay.classList.remove("hidden");
-      els.faceReticle.classList.add("hidden");
     }
 
     // Buttons state
@@ -342,11 +624,7 @@
     els.btnPreview.setAttribute("aria-pressed", mode === "preview" ? "true" : "false");
 
     // AE settling pill
-    if (active && live.ae_settling) {
-      els.aePill.classList.remove("hidden");
-    } else {
-      els.aePill.classList.add("hidden");
-    }
+    setVisible(els.aePill, active && Boolean(live.ae_settling));
 
     // Match pill & reticle tone
     let reticleTone = "neutral";
@@ -378,9 +656,9 @@
         els.matchPill.dataset.tone = "neutral";
         els.matchPillText.textContent = "Looking for face";
       }
-      els.matchPill.classList.remove("hidden");
+      setVisible(els.matchPill, true);
     } else {
-      els.matchPill.classList.add("hidden");
+      setVisible(els.matchPill, false);
       if (active && live.liveness) {
         if (live.liveness.passed) {
           reticleTone = "ok";
@@ -405,10 +683,10 @@
       segs.forEach((seg, idx) => {
         seg.classList.toggle("filled", idx < enr.count);
       });
-      els.enrollHud.classList.remove("hidden");
+      setVisible(els.enrollHud, true);
       state.wasEnrolling = true;
     } else {
-      els.enrollHud.classList.add("hidden");
+      setVisible(els.enrollHud, false);
       if (state.wasEnrolling) {
         state.wasEnrolling = false;
         const doneUser = live.enroll && live.enroll.completed_user;
@@ -508,21 +786,7 @@
     renderFeedMode(boot.feed_mode || "subtract");
     renderModelsRow(Boolean(boot.models_ready), null);
     renderServiceStatus(boot.service_status, boot.config_dirty);
-
-    const cams = boot.cameras || [];
-    if (cams.length > 1) {
-      els.cameraSelect.innerHTML = "";
-      for (const cam of cams) {
-        const opt = document.createElement("option");
-        opt.value = String(cam.index);
-        opt.textContent = cam.label;
-        els.cameraSelect.appendChild(opt);
-      }
-      els.cameraSelect.value = String(boot.selected_camera ?? 0);
-      els.cameraSelectRow.classList.remove("hidden");
-    } else {
-      els.cameraSelectRow.classList.add("hidden");
-    }
+    renderCameraDropdown(boot.cameras || [], boot.selected_camera ?? 0);
   }
 
   async function persistSecurityConfig() {
@@ -537,6 +801,19 @@
     }
   }
 
+  function resetPasswordVisibility() {
+    els.pwInput.type = "password";
+    els.pwConfirmInput.type = "password";
+    els.passwordModal.querySelectorAll(".pw-toggle-btn").forEach((btn) => {
+      btn.setAttribute("aria-pressed", "false");
+      btn.setAttribute("aria-label", "Show password");
+    });
+  }
+
+  function isPasswordModalOpen() {
+    return els.passwordModal.dataset.open === "true";
+  }
+
   function openPasswordModal() {
     const user = currentUsername();
     if (!user) {
@@ -544,24 +821,36 @@
       els.usernameInput.focus();
       return;
     }
+    closeCameraDropdown(false);
     const prof = findProfile(user);
     els.pwModalUser.textContent = user;
     els.pwDomainInput.value = prof && prof.domain ? prof.domain : ".";
     els.pwInput.value = "";
     els.pwConfirmInput.value = "";
+    resetPasswordVisibility();
     els.pwModalError.classList.add("hidden");
-    els.passwordModal.classList.remove("hidden");
+    els.passwordModal.dataset.open = "true";
+    els.passwordModal.setAttribute("aria-hidden", "false");
     els.pwInput.focus();
   }
 
   function closePasswordModal() {
     els.pwInput.value = "";
     els.pwConfirmInput.value = "";
+    resetPasswordVisibility();
     els.pwModalError.classList.add("hidden");
-    els.passwordModal.classList.add("hidden");
+    els.passwordModal.dataset.open = "false";
+    els.passwordModal.setAttribute("aria-hidden", "true");
   }
 
   function wireEvents() {
+    els.streamImg.addEventListener("load", () => {
+      revealStreamFrame();
+      if (state.live && state.live.camera_active && state.live.bbox_norm) {
+        updateReticlePosition(state.live.bbox_norm, els.faceReticle.dataset.tone || "neutral");
+      }
+    });
+
     els.btnEnroll.addEventListener("click", async () => {
       const a = api();
       if (!a) return;
@@ -610,12 +899,12 @@
     els.btnDiagnostics.addEventListener("click", () => {
       state.diagnosticsVisible = !state.diagnosticsVisible;
       els.btnDiagnostics.setAttribute("aria-pressed", state.diagnosticsVisible ? "true" : "false");
-      els.diagnosticsStrip.classList.toggle("hidden", !state.diagnosticsVisible);
+      setDrawerOpen(els.diagnosticsDrawer, state.diagnosticsVisible);
       if (state.live) renderLiveState(state.live);
     });
 
     els.usernameInput.addEventListener("input", () => {
-      els.removeConfirmRow.classList.add("hidden");
+      setDrawerOpen(els.removeConfirmDrawer, false);
       renderAccountSection();
     });
 
@@ -623,13 +912,31 @@
     els.btnPwClose.addEventListener("click", closePasswordModal);
     els.btnPwCancel.addEventListener("click", closePasswordModal);
 
+    els.passwordModal.querySelectorAll(".pw-toggle-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const target = $(btn.dataset.target);
+        if (!target) return;
+        const revealing = target.type === "password";
+        target.type = revealing ? "text" : "password";
+        btn.setAttribute("aria-pressed", revealing ? "true" : "false");
+        btn.setAttribute("aria-label", revealing ? "Hide password" : "Show password");
+      });
+    });
+
     els.passwordModal.addEventListener("click", (ev) => {
       if (ev.target === els.passwordModal) closePasswordModal();
     });
 
     document.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape" && !els.passwordModal.classList.contains("hidden")) {
-        closePasswordModal();
+      if (ev.key === "Escape") {
+        if (isPasswordModalOpen()) {
+          closePasswordModal();
+          return;
+        }
+        if (state.dropdownOpen) {
+          ev.preventDefault();
+          closeCameraDropdown(true);
+        }
       }
     });
 
@@ -670,11 +977,11 @@
       const user = currentUsername();
       if (!user) return;
       els.removeConfirmText.textContent = `Remove '${user}'?`;
-      els.removeConfirmRow.classList.remove("hidden");
+      setDrawerOpen(els.removeConfirmDrawer, true);
     });
 
     els.btnRemoveCancel.addEventListener("click", () => {
-      els.removeConfirmRow.classList.add("hidden");
+      setDrawerOpen(els.removeConfirmDrawer, false);
     });
 
     els.btnRemoveConfirm.addEventListener("click", async () => {
@@ -682,7 +989,7 @@
       if (!a) return;
       const user = currentUsername();
       const res = await a.delete_profile(user);
-      els.removeConfirmRow.classList.add("hidden");
+      setDrawerOpen(els.removeConfirmDrawer, false);
       if (res && res.ok) {
         state.profiles = res.profiles || [];
         renderProfileDatalist();
@@ -719,15 +1026,57 @@
     els.btnFeedSubtract.addEventListener("click", () => setFeed("subtract"));
     els.btnFeedBright.addEventListener("click", () => setFeed("bright"));
 
-    els.cameraSelect.addEventListener("change", async () => {
-      const a = api();
-      if (!a) return;
-      const idx = parseInt(els.cameraSelect.value, 10);
-      const res = await a.select_camera(idx);
-      if (res && !res.ok && res.error) {
-        showFeedback(res.error, "error");
+    /* Custom camera dropdown interactions */
+    els.cameraDropdownBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (state.dropdownOpen) {
+        closeCameraDropdown(false);
+      } else {
+        openCameraDropdown();
       }
     });
+
+    els.cameraDropdownBtn.addEventListener("keydown", (ev) => {
+      if (!state.dropdownOpen) {
+        if (ev.key === "Enter" || ev.key === " " || ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+          ev.preventDefault();
+          openCameraDropdown();
+        }
+        return;
+      }
+
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        setDropdownFocus(state.dropdownFocusIdx + 1);
+      } else if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        setDropdownFocus(state.dropdownFocusIdx - 1);
+      } else if (ev.key === "Home") {
+        ev.preventDefault();
+        setDropdownFocus(0);
+      } else if (ev.key === "End") {
+        ev.preventDefault();
+        setDropdownFocus(state.cameras.length - 1);
+      } else if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        const cam = state.cameras[state.dropdownFocusIdx];
+        if (cam) selectCameraOption(Number(cam.index));
+      } else if (ev.key === "Tab") {
+        closeCameraDropdown(false);
+      }
+    });
+
+    document.addEventListener("pointerdown", (ev) => {
+      if (state.dropdownOpen && els.cameraDropdown && !els.cameraDropdown.contains(ev.target)) {
+        closeCameraDropdown(false);
+      }
+    });
+
+    if (els.settingsPane) {
+      els.settingsPane.addEventListener("scroll", () => {
+        if (state.dropdownOpen) positionCameraDropdownMenu();
+      });
+    }
 
     const handleRestart = async () => {
       const a = api();
@@ -744,6 +1093,8 @@
     els.btnPaneRestart.addEventListener("click", handleRestart);
 
     window.addEventListener("resize", () => {
+      positionSegThumb(false);
+      if (state.dropdownOpen) positionCameraDropdownMenu();
       if (state.live && state.live.camera_active && state.live.bbox_norm) {
         updateReticlePosition(state.live.bbox_norm, els.faceReticle.dataset.tone || "neutral");
       }
@@ -762,6 +1113,7 @@
   }
 
   async function init() {
+    const readyFallbackTimer = setTimeout(markAppReady, 600);
     await waitForPywebview();
     wireEvents();
     const a = api();
@@ -769,6 +1121,16 @@
     applyBootstrap(boot);
     const live = await a.get_state();
     renderLiveState(live);
+
+    clearTimeout(readyFallbackTimer);
+    requestAnimationFrame(() => {
+      positionSegThumb(false);
+      markAppReady();
+    });
+
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(() => positionSegThumb(false)).catch(() => {});
+    }
 
     state.serviceTimer = setInterval(async () => {
       const currApi = api();
@@ -783,6 +1145,7 @@
   }
 
   init().catch((err) => {
+    markAppReady();
     showFeedback(`Initialization error: ${err}`, "error", 0);
   });
 })();

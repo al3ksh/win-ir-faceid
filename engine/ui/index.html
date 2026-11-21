@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <div class="app-shell">
+  <div class="app-shell" data-ready="false">
     <!-- Top Header (52px) -->
     <header class="app-header">
       <div class="brand">
@@ -42,10 +42,10 @@
       <section class="stage-pane">
         <div class="viewport-frame">
           <div class="viewport" id="viewport">
-            <img class="stream-img hidden" id="streamImg" alt="Active infrared camera feed">
+            <img class="stream-img" id="streamImg" data-visible="false" alt="Active infrared camera feed">
 
             <!-- Standby Placeholder -->
-            <div class="standby-overlay" id="standbyOverlay">
+            <div class="standby-overlay" id="standbyOverlay" data-visible="true" data-starting="false">
               <svg class="standby-reticle" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M8 16v-3.5A4.5 4.5 0 0 1 12.5 8H16"/>
                 <path d="M32 8h3.5A4.5 4.5 0 0 1 40 12.5V16"/>
@@ -56,13 +56,13 @@
                 <path d="M24 21.5v4.2"/>
                 <path d="M18.8 30.2a7.4 7.4 0 0 0 10.4 0"/>
               </svg>
-              <div class="standby-title">IR sensor on standby</div>
+              <div class="standby-title" id="standbyTitle">IR sensor on standby</div>
               <p class="standby-sub">Activates on demand during enrollment, testing, or preview.</p>
             </div>
 
             <!-- Vector SVG Corner-Bracket Face Reticle Overlay -->
             <div class="reticle-layer" id="reticleLayer">
-              <div class="face-reticle hidden" id="faceReticle" data-tone="neutral">
+              <div class="face-reticle" id="faceReticle" data-tone="neutral" data-visible="false">
                 <svg viewBox="0 0 100 100" preserveAspectRatio="none" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path vector-effect="non-scaling-stroke" d="M2 22V8a6 6 0 0 1 6-6h14"/>
                   <path vector-effect="non-scaling-stroke" d="M78 2h14a6 6 0 0 1 6 6v14"/>
@@ -74,18 +74,18 @@
 
             <!-- Top Floating Status Pill (AE settling or Live Test result) -->
             <div class="viewport-top-hud">
-              <div class="hud-pill hidden" id="aePill" data-tone="warn">
-                <span class="hud-dot"></span>
-                <span>Settling exposure</span>
-              </div>
-              <div class="hud-pill hidden" id="matchPill" data-tone="neutral">
+              <div class="hud-pill" id="matchPill" data-tone="neutral" data-visible="false" aria-hidden="true">
                 <span class="hud-dot"></span>
                 <span id="matchPillText">Looking for face</span>
+              </div>
+              <div class="hud-pill" id="aePill" data-tone="warn" data-visible="false" aria-hidden="true">
+                <span class="hud-dot"></span>
+                <span>Settling exposure</span>
               </div>
             </div>
 
             <!-- Bottom Enrollment Overlay (8-segment bar + single calm pose prompt) -->
-            <div class="enroll-hud hidden" id="enrollHud">
+            <div class="enroll-hud" id="enrollHud" data-visible="false" aria-hidden="true">
               <div class="enroll-prompt-row">
                 <span class="enroll-prompt" id="enrollPrompt">Look straight at the camera</span>
                 <span class="enroll-counter tabular" id="enrollCounter">0 / 8</span>
@@ -128,14 +128,23 @@
           </div>
         </div>
 
-        <!-- Collapsible Monospace Diagnostics Strip -->
-        <div class="diagnostics-strip hidden" id="diagnosticsStrip">
-          <span class="diag-text" id="diagnosticsText">IR Δ -- · BG -- · 3D -- · Eyes --/--</span>
-        </div>
+        <!-- Reserved Fixed-Flow Footer for Collapsible Diagnostics & Feedback -->
+        <div class="stage-footer">
+          <div class="drawer diagnostics-drawer" id="diagnosticsDrawer" data-open="false" aria-hidden="true">
+            <div class="drawer-inner">
+              <div class="diagnostics-strip" id="diagnosticsStrip">
+                <span class="diag-text" id="diagnosticsText">IR Δ -- · BG -- · 3D -- · Eyes --/--</span>
+              </div>
+            </div>
+          </div>
 
-        <!-- Quiet Inline Feedback Toast / Error Line -->
-        <div class="stage-feedback hidden" id="stageFeedback" data-tone="neutral">
-          <span id="stageFeedbackText"></span>
+          <div class="drawer feedback-drawer" id="feedbackDrawer" data-open="false" aria-hidden="true">
+            <div class="drawer-inner">
+              <div class="stage-feedback" id="stageFeedback" data-tone="neutral">
+                <span id="stageFeedbackText"></span>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -145,29 +154,35 @@
         <section class="settings-section">
           <h2 class="section-title">Account</h2>
 
-          <div class="account-input-row">
-            <div class="user-field-wrap">
-              <input
-                type="text"
-                id="usernameInput"
-                class="text-input"
-                placeholder="Windows username"
-                autocomplete="off"
-                spellcheck="false"
-                list="profileSuggestions"
-              >
-              <datalist id="profileSuggestions"></datalist>
+          <div class="account-controls-group">
+            <div class="account-input-row">
+              <div class="user-field-wrap">
+                <input
+                  type="text"
+                  id="usernameInput"
+                  class="text-input"
+                  placeholder="Windows username"
+                  autocomplete="off"
+                  spellcheck="false"
+                  list="profileSuggestions"
+                >
+                <datalist id="profileSuggestions"></datalist>
+              </div>
+              <button class="btn-subtle" id="btnPassword" type="button">Password</button>
+              <button class="btn-subtle btn-danger-ghost hidden" id="btnRemove" type="button">Remove</button>
             </div>
-            <button class="btn-subtle" id="btnPassword" type="button">Password</button>
-            <button class="btn-subtle btn-danger-ghost hidden" id="btnRemove" type="button">Remove</button>
-          </div>
 
-          <!-- Inline two-step confirm for profile deletion (no browser alert/confirm) -->
-          <div class="inline-confirm hidden" id="removeConfirmRow">
-            <span class="inline-confirm-text" id="removeConfirmText">Remove enrolled data?</span>
-            <div class="inline-confirm-actions">
-              <button class="btn-danger-solid btn-xs" id="btnRemoveConfirm" type="button">Confirm</button>
-              <button class="btn-subtle btn-xs" id="btnRemoveCancel" type="button">Cancel</button>
+            <!-- Inline two-step confirm for profile deletion (no browser alert/confirm) -->
+            <div class="drawer confirm-drawer" id="removeConfirmDrawer" data-open="false" aria-hidden="true">
+              <div class="drawer-inner">
+                <div class="inline-confirm" id="removeConfirmRow">
+                  <span class="inline-confirm-text" id="removeConfirmText">Remove enrolled data?</span>
+                  <div class="inline-confirm-actions">
+                    <button class="btn-danger-solid btn-xs" id="btnRemoveConfirm" type="button">Confirm</button>
+                    <button class="btn-subtle btn-xs" id="btnRemoveCancel" type="button">Cancel</button>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -237,7 +252,8 @@
 
           <div class="control-row">
             <span class="row-label">IR mode</span>
-            <div class="segmented" role="group" aria-label="IR mode">
+            <div class="segmented" id="feedSegmented" role="group" aria-label="IR mode">
+              <span class="seg-thumb" id="feedSegThumb" aria-hidden="true"></span>
               <button class="seg-btn active" id="btnFeedSubtract" type="button" data-mode="subtract">IR - Ambient</button>
               <button class="seg-btn" id="btnFeedBright" type="button" data-mode="bright">Bright</button>
             </div>
@@ -245,7 +261,33 @@
 
           <div class="control-row hidden" id="cameraSelectRow">
             <span class="row-label">Camera</span>
-            <select class="select-input" id="cameraSelect" aria-label="IR Camera"></select>
+            <div class="camera-dropdown" id="cameraDropdown">
+              <button
+                type="button"
+                class="dropdown-trigger"
+                id="cameraDropdownBtn"
+                role="combobox"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                aria-controls="cameraDropdownMenu"
+                aria-label="IR Camera"
+              >
+                <span class="dropdown-trigger-label" id="cameraDropdownLabel">Select camera</span>
+                <svg class="dropdown-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2.5 4.5 6 8l3.5-3.5"/>
+                </svg>
+              </button>
+              <div
+                class="dropdown-menu"
+                id="cameraDropdownMenu"
+                role="listbox"
+                aria-label="IR Camera options"
+                data-open="false"
+                data-placement="top"
+                aria-hidden="true"
+                tabindex="-1"
+              ></div>
+            </div>
           </div>
 
           <div class="control-row service-control-row">
@@ -261,7 +303,7 @@
   </div>
 
   <!-- Minimalist DPAPI Password Modal -->
-  <div class="modal-backdrop hidden" id="passwordModal" role="dialog" aria-modal="true" aria-labelledby="pwModalTitle">
+  <div class="modal-backdrop" id="passwordModal" role="dialog" aria-modal="true" aria-labelledby="pwModalTitle" data-open="false" aria-hidden="true">
     <div class="modal-sheet">
       <div class="modal-header">
         <h3 class="modal-title" id="pwModalTitle">Logon password</h3>
@@ -284,12 +326,52 @@
 
         <div class="form-field">
           <label class="field-label" for="pwInput">Windows password</label>
-          <input type="password" id="pwInput" class="text-input" autocomplete="current-password" required>
+          <div class="password-field-wrap">
+            <input type="password" id="pwInput" class="text-input text-input-pw" autocomplete="current-password" required>
+            <button
+              type="button"
+              class="pw-toggle-btn"
+              data-target="pwInput"
+              aria-label="Show password"
+              aria-pressed="false"
+            >
+              <svg class="icon-eye" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1.5 8s2.4-4.2 6.5-4.2S14.5 8 14.5 8s-2.4 4.2-6.5 4.2S1.5 8 1.5 8Z"/>
+                <circle cx="8" cy="8" r="1.8"/>
+              </svg>
+              <svg class="icon-eye-off" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2 2l12 12"/>
+                <path d="M6.4 4.1A6.6 6.6 0 0 1 8 3.8c4.1 0 6.5 4.2 6.5 4.2a11.3 11.3 0 0 1-2.2 2.7"/>
+                <path d="M9.6 11.9a6.6 6.6 0 0 1-1.6.3c-4.1 0-6.5-4.2-6.5-4.2a11.4 11.4 0 0 1 2.7-3.1"/>
+                <path d="M6.7 6.7a1.8 1.8 0 0 0 2.6 2.6"/>
+              </svg>
+            </button>
+          </div>
         </div>
 
         <div class="form-field">
           <label class="field-label" for="pwConfirmInput">Confirm password</label>
-          <input type="password" id="pwConfirmInput" class="text-input" autocomplete="current-password" required>
+          <div class="password-field-wrap">
+            <input type="password" id="pwConfirmInput" class="text-input text-input-pw" autocomplete="current-password" required>
+            <button
+              type="button"
+              class="pw-toggle-btn"
+              data-target="pwConfirmInput"
+              aria-label="Show password"
+              aria-pressed="false"
+            >
+              <svg class="icon-eye" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1.5 8s2.4-4.2 6.5-4.2S14.5 8 14.5 8s-2.4 4.2-6.5 4.2S1.5 8 1.5 8Z"/>
+                <circle cx="8" cy="8" r="1.8"/>
+              </svg>
+              <svg class="icon-eye-off" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2 2l12 12"/>
+                <path d="M6.4 4.1A6.6 6.6 0 0 1 8 3.8c4.1 0 6.5 4.2 6.5 4.2a11.3 11.3 0 0 1-2.2 2.7"/>
+                <path d="M9.6 11.9a6.6 6.6 0 0 1-1.6.3c-4.1 0-6.5-4.2-6.5-4.2a11.4 11.4 0 0 1 2.7-3.1"/>
+                <path d="M6.7 6.7a1.8 1.8 0 0 0 2.6 2.6"/>
+              </svg>
+            </button>
+          </div>
         </div>
 
         <p class="modal-note">
