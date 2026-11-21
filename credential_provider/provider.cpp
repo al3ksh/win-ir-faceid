@@ -7,6 +7,7 @@
 #include <shlguid.h>
 #include <shlwapi.h>
 
+#include <cwchar>
 #include <new>
 
 namespace
@@ -59,6 +60,49 @@ bool HasDeliberateKeyOrClick()
         }
     }
     return false;
+}
+
+bool IsOurDesktopActive()
+{
+    HDESK hInput = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (hInput == nullptr)
+    {
+        // Graceful fallback to foreground window check if input desktop cannot be opened.
+        return true;
+    }
+
+    wchar_t inputName[128]{};
+    wchar_t ourName[128]{};
+    DWORD needed = 0;
+    const bool gotInput = GetUserObjectInformationW(
+        hInput, UOI_NAME, inputName, sizeof(inputName), &needed) != FALSE;
+    CloseDesktop(hInput);
+
+    HDESK hOur = GetThreadDesktop(GetCurrentThreadId());
+    const bool gotOur = (hOur != nullptr) &&
+        (GetUserObjectInformationW(hOur, UOI_NAME, ourName, sizeof(ourName), &needed) != FALSE);
+
+    if (!gotInput || !gotOur)
+    {
+        return true;
+    }
+    return _wcsicmp(inputName, ourName) == 0;
+}
+
+bool IsSignInScreenActive()
+{
+    if (!IsOurDesktopActive())
+    {
+        return false;
+    }
+    HWND fg = GetForegroundWindow();
+    if (fg == nullptr)
+    {
+        return false;
+    }
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    return fgPid == GetCurrentProcessId() && IsWindowVisible(fg) != FALSE;
 }
 
 struct FieldDescTemplate
@@ -186,11 +230,9 @@ bool WinIRFaceIDProvider::ShouldDeferInitialUnlockScan()
     {
         return false;
     }
-    if ((GetTickCount64() - adviseTickMs) < 1500ULL)
-    {
-        return true;
-    }
-    if (HasDeliberateKeyOrClick())
+    if ((GetTickCount64() - adviseTickMs) >= 1200ULL &&
+        IsSignInScreenActive() &&
+        HasDeliberateKeyOrClick())
     {
         EnterCriticalSection(&_cs);
         _unlockArmed = true;
@@ -236,43 +278,50 @@ void WinIRFaceIDProvider::RunAutoScanWatcher(
     HANDLE stopEvent,
     CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus)
 {
-    if (cpus == CPUS_LOGON || cpus == CPUS_UNLOCK_WORKSTATION)
+    if (cpus != CPUS_LOGON && cpus != CPUS_UNLOCK_WORKSTATION)
     {
-        // Phase 1 (settle 1500ms): avoid triggering on Win+L or initial lock transition.
-        const ULONGLONG lockTickMs = GetTickCount64();
-        while ((GetTickCount64() - lockTickMs) < 1500ULL)
-        {
-            if (WaitForSingleObject(stopEvent, 100) != WAIT_TIMEOUT)
-            {
-                return;
-            }
-        }
+        return;
+    }
 
-        // Phase 2 (drain at t >= 1500ms): clear any sticky LSBs left over from Win+L or
-        // prior typing, wait an extra 100ms, and drain once more for slow key releases.
-        DrainMonitoredKeys();
-        if (WaitForSingleObject(stopEvent, 100) != WAIT_TIMEOUT)
+    // Phase 1 (settle 1200ms): avoid triggering on Win+L or initial lock transition.
+    const ULONGLONG lockTickMs = GetTickCount64();
+    while ((GetTickCount64() - lockTickMs) < 1200ULL)
+    {
+        if (WaitForSingleObject(stopEvent, 80) != WAIT_TIMEOUT)
         {
             return;
         }
-        DrainMonitoredKeys();
+    }
 
-        // Phase 3 (wait for deliberate user return): poll every 100ms for a real key press
-        // or mouse click, ignoring mouse movement, HID/LockApp ticks, and focus changes.
-        while (WaitForSingleObject(stopEvent, 100) == WAIT_TIMEOUT)
+    // Phase 2 (post-lock baseline at t >= 1200ms): check whether the sign-in screen
+    // is obscured behind the lock curtain and drain stale key state.
+    bool behindCurtain = !IsSignInScreenActive();
+    DrainMonitoredKeys();
+
+    // Phase 3 (poll every 80ms): keep IR LED off behind the lock curtain; start scan
+    // immediately when the curtain is dismissed or on deliberate key/click if uncurtained.
+    while (WaitForSingleObject(stopEvent, 80) == WAIT_TIMEOUT)
+    {
+        const bool activeNow = IsSignInScreenActive();
+        if (!activeNow)
         {
-            if (HasDeliberateKeyOrClick())
-            {
-                EnterCriticalSection(&_cs);
-                _unlockArmed = true;
-                LeaveCriticalSection(&_cs);
+            behindCurtain = true;
+            DrainMonitoredKeys();
+            continue;
+        }
 
-                if (!targetCred->HasVerifiedCredential())
-                {
-                    targetCred->StartScan();
-                }
-                break;
+        // Trigger A (curtain just dismissed) or Trigger B (deliberate key/click while active).
+        if (behindCurtain || HasDeliberateKeyOrClick())
+        {
+            EnterCriticalSection(&_cs);
+            _unlockArmed = true;
+            LeaveCriticalSection(&_cs);
+
+            if (!targetCred->HasVerifiedCredential())
+            {
+                targetCred->StartScan();
             }
+            break;
         }
     }
 }
