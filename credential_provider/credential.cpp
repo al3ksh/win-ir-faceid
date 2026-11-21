@@ -206,15 +206,10 @@ HBITMAP CreateTopDown32BppDib(int width, int height, void** outBits)
     return hBmp;
 }
 
-bool DecodePngResourceToPbgra(
-    UINT resourceId,
-    UINT& outWidth,
-    UINT& outHeight,
-    std::vector<BYTE>& outPixels)
+bool LoadEmbeddedResourceBytes(UINT resourceId, const void*& outBytes, DWORD& outSize)
 {
-    outWidth = 0;
-    outHeight = 0;
-    outPixels.clear();
+    outBytes = nullptr;
+    outSize = 0;
 
     HINSTANCE hInst = GetModuleInstance();
     if (hInst == nullptr)
@@ -228,15 +223,37 @@ bool DecodePngResourceToPbgra(
         return false;
     }
 
-    const DWORD pngSize = SizeofResource(hInst, hRes);
+    const DWORD size = SizeofResource(hInst, hRes);
     HGLOBAL hResData = LoadResource(hInst, hRes);
-    if (hResData == nullptr || pngSize == 0)
+    if (hResData == nullptr || size == 0)
     {
         return false;
     }
 
-    const void* pngBytes = LockResource(hResData);
-    if (pngBytes == nullptr)
+    const void* bytes = LockResource(hResData);
+    if (bytes == nullptr)
+    {
+        return false;
+    }
+
+    outBytes = bytes;
+    outSize = size;
+    return true;
+}
+
+bool DecodePngResourceToPbgra(
+    UINT resourceId,
+    UINT& outWidth,
+    UINT& outHeight,
+    std::vector<BYTE>& outPixels)
+{
+    outWidth = 0;
+    outHeight = 0;
+    outPixels.clear();
+
+    const void* pngBytes = nullptr;
+    DWORD pngSize = 0;
+    if (!LoadEmbeddedResourceBytes(resourceId, pngBytes, pngSize))
     {
         return false;
     }
@@ -411,32 +428,22 @@ HRESULT CreateIRFaceTileBitmapBuffer(DWORD* outSize, BYTE** outBuffer)
     *outSize = 0;
     *outBuffer = nullptr;
 
-    UINT width = 0;
-    UINT height = 0;
-    std::vector<BYTE> pixels;
-    GetIRFaceTilePbgra(width, height, pixels);
-    if (width == 0 || height == 0 || pixels.empty())
+    const void* pngBytes = nullptr;
+    DWORD pngSize = 0;
+    if (!LoadEmbeddedResourceBytes(IDR_IR_FACEID_PNG, pngBytes, pngSize))
     {
         return E_FAIL;
     }
 
-    const size_t totalBytes = sizeof(BITMAPV5HEADER) + pixels.size();
-    if (totalBytes > MAXDWORD)
-    {
-        return E_OUTOFMEMORY;
-    }
-
-    auto* buffer = static_cast<BYTE*>(CoTaskMemAlloc(totalBytes));
+    auto* buffer = static_cast<BYTE*>(CoTaskMemAlloc(pngSize));
     if (buffer == nullptr)
     {
         return E_OUTOFMEMORY;
     }
 
-    auto* hdr = reinterpret_cast<BITMAPV5HEADER*>(buffer);
-    FillBitmapV5Header(*hdr, width, height);
-    std::memcpy(buffer + sizeof(BITMAPV5HEADER), pixels.data(), pixels.size());
+    std::memcpy(buffer, pngBytes, pngSize);
 
-    *outSize = static_cast<DWORD>(totalBytes);
+    *outSize = pngSize;
     *outBuffer = buffer;
     return S_OK;
 }
@@ -629,7 +636,7 @@ IFACEMETHODIMP WinIRFaceIDCredential::GetFieldState(
     switch (dwFieldID)
     {
     case FID_TILE_IMAGE:
-        *pcpfs = CPFS_DISPLAY_IN_DESELECTED_TILE;
+        *pcpfs = CPFS_DISPLAY_IN_BOTH;
         *pcpfis = CPFIS_NONE;
         return S_OK;
 
