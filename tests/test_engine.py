@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -1347,7 +1347,7 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
     import engine.gui_app as gui_app_mod
     from engine.gui_app import WinIRFaceIDController
 
-    monkeypatch.setattr(gui_app_mod, "_ENROLL_MIN_INTERVAL", 0.02)
+    monkeypatch.setattr(gui_app_mod, "_ENROLL_MIN_INTERVAL", 0.0)
 
     store = ProfileStore(tmp_path / "profiles.enc")
     alice_vec = np.zeros(128, dtype=np.float32)
@@ -1367,7 +1367,54 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
     (models_dir / "face_recognition_sface_2021dec.onnx").write_bytes(b"s" * 2048)
 
     cam_ir = MagicMock(group="g1", source_id="s1", label="IR Cam", is_ir=True, is_virtual=False)
-    created_workers: list[MagicMock] = []
+
+    class _DummyCameraWorker:
+        def __init__(
+            self,
+            pair_provider: Callable[[], DummyIRFramePair | None] | None = None,
+            frame: np.ndarray | None = None,
+        ) -> None:
+            self._lock = threading.Lock()
+            self._pair_provider = pair_provider
+            self._pair: DummyIRFramePair | None = None
+            self._frame: np.ndarray | None = frame
+            self.error: str | None = None
+            self.anti_flicker_mode: str = "bright"
+            self.stop_called: bool = False
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.stop_called = True
+
+        def set_frame_state(
+            self,
+            pair: DummyIRFramePair | None,
+            frame: np.ndarray | None,
+        ) -> None:
+            with self._lock:
+                self._pair_provider = None
+                self._pair = pair
+                self._frame = frame
+
+        def get_ir_pair(self) -> DummyIRFramePair | None:
+            with self._lock:
+                provider = self._pair_provider
+                pair = self._pair
+            if provider is not None:
+                return provider()
+            return pair
+
+        def get_frame(self) -> np.ndarray | None:
+            with self._lock:
+                return self._frame
+
+    created_workers: list[_DummyCameraWorker] = []
+    next_worker_config: dict[str, Any] = {
+        "pair_provider": None,
+        "frame": None,
+    }
     open_diff = _make_ir_eyes_frame(
         skin_intensity=180,
         left_pupil_intensity=30,
@@ -1379,11 +1426,11 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
         right_pupil_intensity=165,
     )
 
-    def _make_worker(**_kw: Any) -> MagicMock:
-        w = MagicMock()
-        w.error = None
-        w.get_ir_pair.return_value = None
-        w.get_frame.return_value = None
+    def _make_worker(**_kw: Any) -> _DummyCameraWorker:
+        w = _DummyCameraWorker(
+            pair_provider=next_worker_config["pair_provider"],
+            frame=next_worker_config["frame"],
+        )
         created_workers.append(w)
         return w
 
@@ -1476,8 +1523,10 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
         assert res_test["ok"] is True
         assert len(created_workers) == 1
         worker_test = created_workers[0]
-        worker_test.get_ir_pair.return_value = _make_pair_from_diff(closed_diff, timestamp=10.0)
-        worker_test.get_frame.return_value = closed_diff
+        worker_test.set_frame_state(
+            _make_pair_from_diff(closed_diff, timestamp=10.0),
+            closed_diff,
+        )
 
         # Wait briefly for loop to publish JPEG and evaluate closed eyes
         deadline = time.monotonic() + 2.0
@@ -1492,8 +1541,10 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
         assert saw_closed is True
 
         # Switch to open eyes -> verified match + verify live /stream delivers JPEG frame
-        worker_test.get_ir_pair.return_value = _make_pair_from_diff(open_diff, timestamp=11.0)
-        worker_test.get_frame.return_value = open_diff
+        worker_test.set_frame_state(
+            _make_pair_from_diff(open_diff, timestamp=11.0),
+            open_diff,
+        )
         deadline = time.monotonic() + 2.0
         saw_verified = False
         while time.monotonic() < deadline:
@@ -1513,7 +1564,7 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
         # Stop live test -> back to standby
         ctrl.toggle_live_test()
         assert ctrl.get_state()["mode"] == "standby"
-        worker_test.stop.assert_called()
+        assert worker_test.stop_called is True
 
         # 6. save_password & delete_profile via DPAPI store (never leaks password)
         pw_res = ctrl.save_password("Bob", ".", "BobPass99!")
@@ -1528,18 +1579,22 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
 
         # 7. Enrollment captures 8 samples and auto-returns to standby
         ctrl._config.require_open_eyes = False
-        ctrl.start_enroll("Bob")
-        assert len(created_workers) == 2
-        worker_enroll = created_workers[1]
-
+        ts_lock = threading.Lock()
         ts_counter = [100.0]
 
         def _next_pair() -> DummyIRFramePair:
-            ts_counter[0] += 1.0
-            return _make_pair_from_diff(open_diff, timestamp=ts_counter[0])
+            with ts_lock:
+                ts_counter[0] += 1.0
+                ts = ts_counter[0]
+            return _make_pair_from_diff(open_diff, timestamp=ts)
 
-        worker_enroll.get_ir_pair.side_effect = _next_pair
-        worker_enroll.get_frame.return_value = open_diff
+        next_worker_config["pair_provider"] = _next_pair
+        next_worker_config["frame"] = open_diff
+
+        res_enroll = ctrl.start_enroll("Bob")
+        assert res_enroll["ok"] is True
+        assert len(created_workers) == 2
+        worker_enroll = created_workers[1]
 
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
@@ -1549,9 +1604,10 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
             time.sleep(0.05)
 
         final_st = ctrl.get_state()
-        assert final_st["mode"] == "standby"
+        assert final_st["mode"] == "standby", f"Expected standby, got: {final_st}"
         assert final_st["camera_active"] is False
         assert final_st["enroll"]["completed_user"] == "Bob"
+        assert worker_enroll.stop_called is True
         bob_profile = store.get_user("Bob")
         assert bob_profile is not None
         assert len(bob_profile.embeddings) == 8

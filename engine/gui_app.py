@@ -1045,255 +1045,260 @@ class WinIRFaceIDController:
 
     def _processing_loop(self) -> None:
         while not self._proc_stop.is_set() and not self._shutting_down:
-            with self._lock:
-                mode = self._mode
-                worker = self._worker
-                is_ir = self._current_cam_is_ir
-                feed_mode = self._feed_mode
-                rec = self._recognizer
-                cfg = ServiceConfig(
-                    threshold=self._config.threshold,
-                    require_motion=self._config.require_motion,
-                    require_open_eyes=self._config.require_open_eyes,
-                )
-
-            if mode == "standby" or worker is None:
-                break
-
-            worker_err = getattr(worker, "error", None)
-            if worker_err:
-                self._stop_camera_and_loop(error_msg=str(worker_err))
-                break
-
-            pair = worker.get_ir_pair() if is_ir else None
-            display_frame = worker.get_frame()
-            if pair is not None:
-                if feed_mode == "subtract" and pair.dark_bgr is not None:
-                    display_frame = pair.diff_bgr
-                else:
-                    display_frame = pair.bright_bgr
-
-            if display_frame is None:
-                time.sleep(0.015)
-                continue
-
-            # Publish clean raw video frame without OpenCV drawings
-            self._publish_jpeg(display_frame)
-
-            h_img, w_img = display_frame.shape[:2]
-            ae_settling = bool(pair is not None and pair.bright_mean > 225.0)
-
-            det: FaceDetection | None = None
-            eval_src = display_frame
-            if rec is not None:
-                det = rec.detect_largest(eval_src)
-                if det is None:
-                    enhanced = enhance_ir_bgr(eval_src)
-                    det = rec.detect_largest(enhanced)
-                    if det is not None:
-                        eval_src = enhanced
-
-            bbox_norm: list[float] | None = None
-            if det is not None and w_img > 0 and h_img > 0:
-                bx, by, bw, bh = det.bbox
-                nx = _clamp(bx / float(w_img), 0.0, 1.0)
-                ny = _clamp(by / float(h_img), 0.0, 1.0)
-                nw = _clamp(bw / float(w_img), 0.0, 1.0 - nx)
-                nh = _clamp(bh / float(h_img), 0.0, 1.0 - ny)
-                bbox_norm = [round(nx, 4), round(ny, 4), round(nw, 4), round(nh, 4)]
-
-            liveness: LivenessResult | None = None
-            if pair is not None and det is not None:
-                liveness = check_ir_liveness(pair, det.bbox)
-                if liveness.reason == "overexposed_ae_settling":
-                    ae_settling = True
-
-            liveness_dict = {
-                "passed": bool(liveness and liveness.passed),
-                "reason": (
-                    liveness.reason
-                    if liveness is not None
-                    else ("no_face" if is_ir else "non_ir_camera")
-                ),
-                "delta": round(float(liveness.delta), 2) if liveness is not None else 0.0,
-                "bg_ratio": round(float(liveness.bg_ratio), 3) if liveness is not None else 0.0,
-                "relief_3d": round(float(liveness.relief_3d), 3) if liveness is not None else 0.0,
-                "eyes_left": None,
-                "eyes_right": None,
-                "eyes_passed": None,
-            }
-
-            match_dict = {
-                "state": "idle",
-                "username": "",
-                "score": 0.0,
-                "detail": "",
-            }
-
-            is_new_pair = pair is not None and pair.timestamp != self._last_processed_pair_ts
-
-            # Enrollment capture flow
-            if mode == "enroll":
-                completed_user = ""
-                completed_append = False
-                enroll_done = False
-                if (
-                    is_new_pair
-                    and rec is not None
-                    and det is not None
-                    and liveness is not None
-                    and liveness.passed
-                ):
-                    now = time.monotonic()
-                    if now - self._last_enroll_capture_ts >= _ENROLL_MIN_INTERVAL:
-                        emb = rec.extract_embedding(eval_src, det)
-                        with self._lock:
-                            self._enroll_embeddings.append(emb)
-                            self._last_enroll_capture_ts = now
-                            captured = len(self._enroll_embeddings)
-                            if captured >= _ENROLL_TARGET:
-                                target_user = self._enroll_username
-                                append_mode = self._enroll_append
-                                self._store.upsert_embeddings(
-                                    target_user,
-                                    self._enroll_embeddings,
-                                    append=append_mode,
-                                )
-                                completed_user = target_user
-                                completed_append = append_mode
-                                enroll_done = True
-                if enroll_done:
-                    if pair is not None:
-                        self._last_processed_pair_ts = pair.timestamp
-                    self._stop_camera_and_loop(
-                        completed_user=completed_user,
-                        completed_append=completed_append,
+            try:
+                with self._lock:
+                    mode = self._mode
+                    worker = self._worker
+                    is_ir = self._current_cam_is_ir
+                    feed_mode = self._feed_mode
+                    rec = self._recognizer
+                    cfg = ServiceConfig(
+                        threshold=self._config.threshold,
+                        require_motion=self._config.require_motion,
+                        require_open_eyes=self._config.require_open_eyes,
                     )
+
+                if mode == "standby" or worker is None:
                     break
 
-            # Live test flow
-            elif mode == "test":
-                if det is None:
-                    match_dict = {
-                        "state": "no_face",
-                        "username": "",
-                        "score": 0.0,
-                        "detail": "Look at the IR camera",
-                    }
-                elif rec is not None:
-                    emb = rec.extract_embedding(eval_src, det)
-                    best_user = ""
-                    best_score = 0.0
-                    for profile in self._store.list_users():
-                        if not profile.embeddings:
-                            continue
-                        _, score = rec.match_against(
-                            emb,
-                            profile.embedding_arrays(),
-                            threshold=cfg.threshold,
-                        )
-                        if score > best_score:
-                            best_score = score
-                            best_user = profile.username
+                worker_err = getattr(worker, "error", None)
+                if worker_err:
+                    self._stop_camera_and_loop(error_msg=str(worker_err))
+                    break
 
-                    live_ok = is_ir and bool(liveness and liveness.passed)
-                    motion_ok = True
-                    motion_reason = ""
-                    motion_src = (
-                        pair.diff_bgr if (pair is not None and pair.dark_bgr is not None) else eval_src
-                    )
-
-                    # Always update TemporalLivenessTracker BEFORE open-eyes gating
-                    if live_ok and cfg.require_motion:
-                        motion_ts = pair.timestamp if pair is not None else None
-                        motion_ok, motion_reason = self._motion_tracker.update(
-                            motion_src,
-                            det,
-                            timestamp=motion_ts,
-                        )
-
-                    eye_res: EyeOpenResult | None = None
-                    if live_ok and cfg.require_open_eyes:
-                        eye_res = check_eyes_open_ir(motion_src, det)
-                        liveness_dict["eyes_left"] = round(float(eye_res.left_score), 3)
-                        liveness_dict["eyes_right"] = round(float(eye_res.right_score), 3)
-                        liveness_dict["eyes_passed"] = bool(eye_res.passed)
-
-                    if not live_ok:
-                        reason_tag = liveness.reason if liveness is not None else "no_ir"
-                        match_dict = {
-                            "state": "blocked",
-                            "username": best_user,
-                            "score": round(float(best_score), 4),
-                            "detail": reason_tag,
-                        }
-                    elif not motion_ok:
-                        match_dict = {
-                            "state": "waiting",
-                            "username": best_user,
-                            "score": round(float(best_score), 4),
-                            "detail": "waiting_blink_or_motion",
-                        }
-                    elif eye_res is not None and not eye_res.passed:
-                        match_dict = {
-                            "state": "waiting",
-                            "username": best_user,
-                            "score": round(float(best_score), 4),
-                            "detail": "eyes_closed",
-                        }
-                    elif best_user and best_score >= cfg.threshold:
-                        match_dict = {
-                            "state": "verified",
-                            "username": best_user,
-                            "score": round(float(best_score), 4),
-                            "detail": motion_reason or "ok",
-                        }
-                    elif best_user:
-                        match_dict = {
-                            "state": "no_match",
-                            "username": best_user,
-                            "score": round(float(best_score), 4),
-                            "detail": "below_threshold",
-                        }
+                pair = worker.get_ir_pair() if is_ir else None
+                display_frame = worker.get_frame()
+                if pair is not None:
+                    if feed_mode == "subtract" and pair.dark_bgr is not None:
+                        display_frame = pair.diff_bgr
                     else:
-                        match_dict = {
-                            "state": "no_profiles",
-                            "username": "",
-                            "score": 0.0,
-                            "detail": "no_enrolled_profiles",
-                        }
+                        display_frame = pair.bright_bgr
 
-            if pair is not None:
-                self._last_processed_pair_ts = pair.timestamp
+                if display_frame is None:
+                    time.sleep(0.015)
+                    continue
 
-            with self._lock:
-                if self._mode == "standby":
-                    break
-                count = len(self._enroll_embeddings)
-                prompt = (
-                    _POSE_PROMPTS[min(count, len(_POSE_PROMPTS) - 1)]
-                    if self._mode == "enroll"
-                    else ""
-                )
-                self._state = {
-                    "mode": self._mode,
-                    "camera_active": True,
-                    "ae_settling": ae_settling,
-                    "bbox_norm": bbox_norm,
-                    "liveness": liveness_dict,
-                    "match": match_dict,
-                    "enroll": {
-                        "count": count,
-                        "target": _ENROLL_TARGET,
-                        "prompt": prompt,
-                        "completed_user": "",
-                        "append": self._enroll_append,
-                    },
-                    "error": None,
-                    "error_info": None,
+                # Publish clean raw video frame without OpenCV drawings
+                self._publish_jpeg(display_frame)
+
+                h_img, w_img = display_frame.shape[:2]
+                ae_settling = bool(pair is not None and pair.bright_mean > 225.0)
+
+                det: FaceDetection | None = None
+                eval_src = display_frame
+                if rec is not None:
+                    det = rec.detect_largest(eval_src)
+                    if det is None:
+                        enhanced = enhance_ir_bgr(eval_src)
+                        det = rec.detect_largest(enhanced)
+                        if det is not None:
+                            eval_src = enhanced
+
+                bbox_norm: list[float] | None = None
+                if det is not None and w_img > 0 and h_img > 0:
+                    bx, by, bw, bh = det.bbox
+                    nx = _clamp(bx / float(w_img), 0.0, 1.0)
+                    ny = _clamp(by / float(h_img), 0.0, 1.0)
+                    nw = _clamp(bw / float(w_img), 0.0, 1.0 - nx)
+                    nh = _clamp(bh / float(h_img), 0.0, 1.0 - ny)
+                    bbox_norm = [round(nx, 4), round(ny, 4), round(nw, 4), round(nh, 4)]
+
+                liveness: LivenessResult | None = None
+                if pair is not None and det is not None:
+                    liveness = check_ir_liveness(pair, det.bbox)
+                    if liveness.reason == "overexposed_ae_settling":
+                        ae_settling = True
+
+                liveness_dict = {
+                    "passed": bool(liveness and liveness.passed),
+                    "reason": (
+                        liveness.reason
+                        if liveness is not None
+                        else ("no_face" if is_ir else "non_ir_camera")
+                    ),
+                    "delta": round(float(liveness.delta), 2) if liveness is not None else 0.0,
+                    "bg_ratio": round(float(liveness.bg_ratio), 3) if liveness is not None else 0.0,
+                    "relief_3d": round(float(liveness.relief_3d), 3) if liveness is not None else 0.0,
+                    "eyes_left": None,
+                    "eyes_right": None,
+                    "eyes_passed": None,
                 }
 
-            time.sleep(0.015)
+                match_dict = {
+                    "state": "idle",
+                    "username": "",
+                    "score": 0.0,
+                    "detail": "",
+                }
+
+                is_new_pair = pair is not None and pair.timestamp != self._last_processed_pair_ts
+
+                # Enrollment capture flow
+                if mode == "enroll":
+                    completed_user = ""
+                    completed_append = False
+                    enroll_done = False
+                    if (
+                        is_new_pair
+                        and rec is not None
+                        and det is not None
+                        and liveness is not None
+                        and liveness.passed
+                    ):
+                        now = time.monotonic()
+                        if now - self._last_enroll_capture_ts >= _ENROLL_MIN_INTERVAL:
+                            emb = rec.extract_embedding(eval_src, det)
+                            with self._lock:
+                                self._enroll_embeddings.append(emb)
+                                self._last_enroll_capture_ts = now
+                                captured = len(self._enroll_embeddings)
+                                if captured >= _ENROLL_TARGET:
+                                    target_user = self._enroll_username
+                                    append_mode = self._enroll_append
+                                    self._store.upsert_embeddings(
+                                        target_user,
+                                        self._enroll_embeddings,
+                                        append=append_mode,
+                                    )
+                                    completed_user = target_user
+                                    completed_append = append_mode
+                                    enroll_done = True
+                    if enroll_done:
+                        if pair is not None:
+                            self._last_processed_pair_ts = pair.timestamp
+                        self._stop_camera_and_loop(
+                            completed_user=completed_user,
+                            completed_append=completed_append,
+                        )
+                        break
+
+                # Live test flow
+                elif mode == "test":
+                    if det is None:
+                        match_dict = {
+                            "state": "no_face",
+                            "username": "",
+                            "score": 0.0,
+                            "detail": "Look at the IR camera",
+                        }
+                    elif rec is not None:
+                        emb = rec.extract_embedding(eval_src, det)
+                        best_user = ""
+                        best_score = 0.0
+                        for profile in self._store.list_users():
+                            if not profile.embeddings:
+                                continue
+                            _, score = rec.match_against(
+                                emb,
+                                profile.embedding_arrays(),
+                                threshold=cfg.threshold,
+                            )
+                            if score > best_score:
+                                best_score = score
+                                best_user = profile.username
+
+                        live_ok = is_ir and bool(liveness and liveness.passed)
+                        motion_ok = True
+                        motion_reason = ""
+                        motion_src = (
+                            pair.diff_bgr if (pair is not None and pair.dark_bgr is not None) else eval_src
+                        )
+
+                        # Always update TemporalLivenessTracker BEFORE open-eyes gating
+                        if live_ok and cfg.require_motion:
+                            motion_ts = pair.timestamp if pair is not None else None
+                            motion_ok, motion_reason = self._motion_tracker.update(
+                                motion_src,
+                                det,
+                                timestamp=motion_ts,
+                            )
+
+                        eye_res: EyeOpenResult | None = None
+                        if live_ok and cfg.require_open_eyes:
+                            eye_res = check_eyes_open_ir(motion_src, det)
+                            liveness_dict["eyes_left"] = round(float(eye_res.left_score), 3)
+                            liveness_dict["eyes_right"] = round(float(eye_res.right_score), 3)
+                            liveness_dict["eyes_passed"] = bool(eye_res.passed)
+
+                        if not live_ok:
+                            reason_tag = liveness.reason if liveness is not None else "no_ir"
+                            match_dict = {
+                                "state": "blocked",
+                                "username": best_user,
+                                "score": round(float(best_score), 4),
+                                "detail": reason_tag,
+                            }
+                        elif not motion_ok:
+                            match_dict = {
+                                "state": "waiting",
+                                "username": best_user,
+                                "score": round(float(best_score), 4),
+                                "detail": "waiting_blink_or_motion",
+                            }
+                        elif eye_res is not None and not eye_res.passed:
+                            match_dict = {
+                                "state": "waiting",
+                                "username": best_user,
+                                "score": round(float(best_score), 4),
+                                "detail": "eyes_closed",
+                            }
+                        elif best_user and best_score >= cfg.threshold:
+                            match_dict = {
+                                "state": "verified",
+                                "username": best_user,
+                                "score": round(float(best_score), 4),
+                                "detail": motion_reason or "ok",
+                            }
+                        elif best_user:
+                            match_dict = {
+                                "state": "no_match",
+                                "username": best_user,
+                                "score": round(float(best_score), 4),
+                                "detail": "below_threshold",
+                            }
+                        else:
+                            match_dict = {
+                                "state": "no_profiles",
+                                "username": "",
+                                "score": 0.0,
+                                "detail": "no_enrolled_profiles",
+                            }
+
+                if pair is not None:
+                    self._last_processed_pair_ts = pair.timestamp
+
+                with self._lock:
+                    if self._mode == "standby":
+                        break
+                    count = len(self._enroll_embeddings)
+                    prompt = (
+                        _POSE_PROMPTS[min(count, len(_POSE_PROMPTS) - 1)]
+                        if self._mode == "enroll"
+                        else ""
+                    )
+                    self._state = {
+                        "mode": self._mode,
+                        "camera_active": True,
+                        "ae_settling": ae_settling,
+                        "bbox_norm": bbox_norm,
+                        "liveness": liveness_dict,
+                        "match": match_dict,
+                        "enroll": {
+                            "count": count,
+                            "target": _ENROLL_TARGET,
+                            "prompt": prompt,
+                            "completed_user": "",
+                            "append": self._enroll_append,
+                        },
+                        "error": None,
+                        "error_info": None,
+                    }
+
+                time.sleep(0.015)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Processing loop error: %s", exc)
+                self._stop_camera_and_loop(error_msg=str(exc))
+                break
 
     # ------------------------------------------------------------------
     # Public JS API methods
