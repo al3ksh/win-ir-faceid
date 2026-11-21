@@ -646,7 +646,7 @@ IFACEMETHODIMP WinIRFaceIDCredential::GetFieldState(
         return S_OK;
 
     case FID_LABEL:
-        *pcpfs = CPFS_DISPLAY_IN_BOTH;
+        *pcpfs = CPFS_DISPLAY_IN_DESELECTED_TILE;
         *pcpfis = CPFIS_NONE;
         return S_OK;
 

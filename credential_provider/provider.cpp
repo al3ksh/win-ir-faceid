@@ -253,7 +253,7 @@ IFACEMETHODIMP WinIRFaceIDProvider::GetFieldDescriptorAt(
         { FID_TILE_IMAGE,   CPFT_TILE_IMAGE,    L"IR Face ID",    CPFG_CREDENTIAL_PROVIDER_LOGO },
         { FID_HERO_IMAGE,   CPFT_TILE_IMAGE,    L"IR Face ID",    GUID_NULL },
         { FID_LABEL,        CPFT_LARGE_TEXT,    L"IR Face ID",    CPFG_CREDENTIAL_PROVIDER_LABEL },
-        { FID_STATUS,       CPFT_SMALL_TEXT,    L"Status",        GUID_NULL },
+        { FID_STATUS,       CPFT_LARGE_TEXT,    L"Status",        GUID_NULL },
         { FID_RETRY_SUBMIT, CPFT_SUBMIT_BUTTON, L"Retry IR Scan", GUID_NULL },
     };
 
