@@ -20,18 +20,6 @@ struct AutoScanWatcherContext
     CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus = CPUS_INVALID;
 };
 
-bool IsLogonUIForeground()
-{
-    HWND fg = GetForegroundWindow();
-    if (fg == nullptr)
-    {
-        return false;
-    }
-    DWORD fgPid = 0;
-    GetWindowThreadProcessId(fg, &fgPid);
-    return fgPid == GetCurrentProcessId();
-}
-
 constexpr int kMonitoredKeys[] = {
     // Mouse clicks (no movement)
     VK_LBUTTON, VK_RBUTTON, VK_MBUTTON,
@@ -56,6 +44,13 @@ void DrainMonitoredKeys()
 
 bool HasDeliberateKeyOrClick()
 {
+    if (((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) ||
+        ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0))
+    {
+        DrainMonitoredKeys();
+        return false;
+    }
+
     for (int vk : kMonitoredKeys)
     {
         if ((GetAsyncKeyState(vk) & 0x8001) != 0)
@@ -187,7 +182,7 @@ bool WinIRFaceIDProvider::ShouldDeferInitialUnlockScan()
     const ULONGLONG adviseTickMs = _adviseTickMs;
     LeaveCriticalSection(&_cs);
 
-    if (cpus != CPUS_UNLOCK_WORKSTATION || armed)
+    if ((cpus != CPUS_LOGON && cpus != CPUS_UNLOCK_WORKSTATION) || armed)
     {
         return false;
     }
@@ -241,31 +236,7 @@ void WinIRFaceIDProvider::RunAutoScanWatcher(
     HANDLE stopEvent,
     CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus)
 {
-    if (cpus == CPUS_LOGON)
-    {
-        while (WaitForSingleObject(stopEvent, 0) == WAIT_TIMEOUT)
-        {
-            if (IsLogonUIForeground())
-            {
-                EnterCriticalSection(&_cs);
-                _unlockArmed = true;
-                LeaveCriticalSection(&_cs);
-
-                if (!targetCred->HasVerifiedCredential())
-                {
-                    targetCred->StartScan();
-                }
-                break;
-            }
-            if (WaitForSingleObject(stopEvent, 150) != WAIT_TIMEOUT)
-            {
-                break;
-            }
-        }
-        return;
-    }
-
-    if (cpus == CPUS_UNLOCK_WORKSTATION)
+    if (cpus == CPUS_LOGON || cpus == CPUS_UNLOCK_WORKSTATION)
     {
         // Phase 1 (settle 1500ms): avoid triggering on Win+L or initial lock transition.
         const ULONGLONG lockTickMs = GetTickCount64();
