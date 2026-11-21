@@ -32,14 +32,38 @@ bool IsLogonUIForeground()
     return fgPid == GetCurrentProcessId();
 }
 
-DWORD GetLastInputTick32()
+constexpr int kMonitoredKeys[] = {
+    // Mouse clicks (no movement)
+    VK_LBUTTON, VK_RBUTTON, VK_MBUTTON,
+    // Common unlock/dismiss keys (no Win key)
+    VK_SPACE, VK_RETURN, VK_ESCAPE, VK_TAB, VK_BACK,
+    VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN,
+    VK_SHIFT, VK_CONTROL,
+    // Digits '0'..'9'
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    // Letters 'A'..'Z'
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+    'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'
+};
+
+void DrainMonitoredKeys()
 {
-    LASTINPUTINFO lii{ sizeof(lii), 0 };
-    if (!GetLastInputInfo(&lii))
+    for (int vk : kMonitoredKeys)
     {
-        return 0;
+        (void)GetAsyncKeyState(vk);
     }
-    return lii.dwTime;
+}
+
+bool HasDeliberateKeyOrClick()
+{
+    for (int vk : kMonitoredKeys)
+    {
+        if ((GetAsyncKeyState(vk) & 0x8001) != 0)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 struct FieldDescTemplate
@@ -167,11 +191,18 @@ bool WinIRFaceIDProvider::ShouldDeferInitialUnlockScan()
     {
         return false;
     }
-    if (!IsLogonUIForeground())
+    if ((GetTickCount64() - adviseTickMs) < 1500ULL)
     {
         return true;
     }
-    return (GetTickCount64() - adviseTickMs) < 2200ULL;
+    if (HasDeliberateKeyOrClick())
+    {
+        EnterCriticalSection(&_cs);
+        _unlockArmed = true;
+        LeaveCriticalSection(&_cs);
+        return false;
+    }
+    return true;
 }
 
 DWORD WINAPI WinIRFaceIDProvider::AutoScanWatcherThreadProc(LPVOID param)
@@ -236,49 +267,30 @@ void WinIRFaceIDProvider::RunAutoScanWatcher(
 
     if (cpus == CPUS_UNLOCK_WORKSTATION)
     {
-        // Phase 1: Strict 2000ms settle window. Do not record curtain state or trigger scans yet,
-        // because GetForegroundWindow() briefly returns NULL during desktop switch animations.
+        // Phase 1 (settle 1500ms): avoid triggering on Win+L or initial lock transition.
         const ULONGLONG lockTickMs = GetTickCount64();
-        while ((GetTickCount64() - lockTickMs) < 2000ULL)
+        while ((GetTickCount64() - lockTickMs) < 1500ULL)
         {
-            if (WaitForSingleObject(stopEvent, 150) != WAIT_TIMEOUT)
+            if (WaitForSingleObject(stopEvent, 100) != WAIT_TIMEOUT)
             {
                 return;
             }
         }
 
-        // Phase 2: Capture post-lock baseline once the lock screen has settled.
-        const DWORD baselineInput32 = GetLastInputTick32();
-        bool settledBehindCurtain = !IsLogonUIForeground();
-
-        // Phase 3: Wait for genuine user return (curtain dismissed or new input after settle).
-        while (WaitForSingleObject(stopEvent, 150) == WAIT_TIMEOUT)
+        // Phase 2 (drain at t >= 1500ms): clear any sticky LSBs left over from Win+L or
+        // prior typing, wait an extra 100ms, and drain once more for slow key releases.
+        DrainMonitoredKeys();
+        if (WaitForSingleObject(stopEvent, 100) != WAIT_TIMEOUT)
         {
-            const bool fgNow = IsLogonUIForeground();
-            if (!fgNow)
-            {
-                // Still behind the LockApp curtain or screen off; keep IR LED 100% off.
-                settledBehindCurtain = true;
-                continue;
-            }
+            return;
+        }
+        DrainMonitoredKeys();
 
-            bool shouldArmAndScan = false;
-            if (settledBehindCurtain)
-            {
-                // Trigger A: Curtain was active after settle and has now been dismissed.
-                shouldArmAndScan = true;
-            }
-            else
-            {
-                // Trigger B: Genuine new keyboard/mouse input arrived after settle.
-                const DWORD currInput = GetLastInputTick32();
-                if (currInput != 0 && currInput != baselineInput32)
-                {
-                    shouldArmAndScan = true;
-                }
-            }
-
-            if (shouldArmAndScan)
+        // Phase 3 (wait for deliberate user return): poll every 100ms for a real key press
+        // or mouse click, ignoring mouse movement, HID/LockApp ticks, and focus changes.
+        while (WaitForSingleObject(stopEvent, 100) == WAIT_TIMEOUT)
+        {
+            if (HasDeliberateKeyOrClick())
             {
                 EnterCriticalSection(&_cs);
                 _unlockArmed = true;
