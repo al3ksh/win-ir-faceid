@@ -1,62 +1,200 @@
-# WinIRFaceID
+<div align="center">
+  <img src="docs/screenshots/app-icon.png" alt="WinIRFaceID Icon" width="84" height="84">
+  <h1>WinIRFaceID</h1>
+  <p><strong>Pure-infrared facial recognition and native Windows 11 lock screen sign-in — built to work in total darkness.</strong></p>
+  <p>
+    <code>Windows 11 x64</code> · <code>Pure 850nm IR</code> · <code>Local-Only DPAPI</code> · <code>Additive Credential Provider</code>
+  </p>
+</div>
 
-Custom Windows infrared (IR) facial recognition suite built for laptops with Windows Hello IR cameras. Designed to work in complete darkness using active IR illumination (`IR - Ambient` frame subtraction) alongside native Windows Hello Fingerprint, PIN, and Password sign-in.
+<p align="center">
+  <img src="docs/screenshots/desktop-app.png" alt="WinIRFaceID Desktop App" width="860">
+</p>
 
-## Key Features
+## Why This Exists
 
-- **Strict IR-Only Recognition:** Verification and enrollment use only hardware IR cameras (no RGB fallback), powered by OpenCV Zoo YuNet + SFace 128-D embeddings with a calibrated `0.65` cosine similarity threshold.
-- **3D IR Anti-Spoofing:** Rejects LCD/OLED phone screens, startup auto-exposure overexposure frames, flat polycarbonate ID cards, and paper/cutout prints via active IR delta, background depth falloff, and 3D center-vs-corner relief checks, plus optional open-eyes and blink / 3D head-motion verification.
-- **Native Windows 11 Lock Screen UX:** `WinIRFaceIDProvider.dll` uses `ICredentialProviderCredential3::GetBitmapBufferValue` for true alpha-transparent Fluent icons (sign-in option tile + selected-tile hero icon) and starts scanning automatically in the background on `Win + L` even while PIN is selected—cancelling immediately when you sign in with another method.
-- **LocalSystem Service & Microsoft Account Support:** `WinIRFaceIDService.exe` supervises the Python Named Pipe engine under `LocalSystem` using machine-scoped DPAPI (`CRYPTPROTECT_LOCAL_MACHINE`) with hardened NTFS ACLs, and supports both local accounts and Microsoft Accounts (`MicrosoftAccount\...`).
-- **On-Demand Standby GUI:** Enrollment and live testing GUI keeps the IR camera and LED idle on standby until you actively start preview, enrollment, or verification.
+After Microsoft's **CVE-2025-26644** mitigation on Windows 11, native Windows Hello Face requires the color (RGB) camera to see your face alongside the infrared sensor. In dark rooms or dim lighting, face unlock fails even though the laptop has a dedicated hardware 850nm IR flood illuminator.
+
+**WinIRFaceID** bypasses the RGB requirement completely. It captures directly from the hardware IR sensor through WinRT `MediaCapture`, drives the IR flood LED via direct kernel streaming `IOCTL_KS_PROPERTY` (`KSPROPERTY_CAMERACONTROL_EXTENDED_FACEAUTH_MODE = ALTERNATIVE_FRAME_ILLUMINATION`), and computes active `IR - Ambient` difference frames with **zero RGB camera dependency**.
+
+---
+
+## Security & Anti-Spoofing
+
+WinIRFaceID is designed to be auditable, isolated, and safe to run on a daily-driver Windows 11 machine.
+
+- **100% Local & Offline:** No cloud services, no telemetry, and zero outbound network calls after downloading the two public OpenCV Zoo ONNX models (`YuNet` + `SFace`).
+- **Strict IR-Only Pipeline:** Enrollment and verification refuse non-IR cameras and never fall back to an RGB webcam.
+- **Multi-Layer Physical 3D IR Anti-Spoofing:**
+  1. **Active IR Illuminator Delta (`IR - Ambient`):** Subtracts ambient dark frames from LED-illuminated frames. OLED and LCD phone or tablet screens emit visible light rather than reflected 850nm IR, yielding near-zero delta and immediate rejection.
+  2. **Auto-Exposure Settling Guard:** Discards overexposed startup frames while the IR sensor's auto-exposure converges.
+  3. **Minimum Face Size, `1/r²` Background Falloff & 3D Facial Relief:** Evaluates active-IR intensity drop-off between the central face and surrounding background bands, plus center-vs-upper-corner 3D relief across the face bounding box, rejecting flat polycarbonate ID cards, photos, and printed cutouts held up to the camera.
+  4. **Open-Eyes Gate (Optional):** Compares IR eye-region reflectance against skin reflectance (`Require open eyes`) to prevent unlocking while asleep.
+  5. **Temporal Liveness (Optional):** Verifies a natural blink dip or 3D nose-to-eye parallax over a short sliding window (`Require blink or motion`) when extra anti-cutout protection is desired.
+- **Process Isolation (`LogonUI.exe` Hygiene):** `WinIRFaceIDProvider.dll` is a thin C++17 COM DLL that performs zero camera access and zero ML inference inside `LogonUI.exe`. All capture, anti-spoofing, and embedding matching run in the isolated `WinIRFaceIDService` (`LocalSystem`) over a secured Named Pipe (`\\.\pipe\WinIRFaceID`) using overlapped I/O (`CancelIoEx`) and `SecureZeroMemory` credential wiping.
+- **Encrypted At Rest:** Face embeddings (`128-D` SFace vectors) and Windows logon passwords are encrypted with machine-scoped Windows DPAPI (`CRYPTPROTECT_LOCAL_MACHINE`) inside `data\profiles.enc`, protected by a hardened NTFS DACL permitting only `SYSTEM`, `Administrators`, and the enrolling user.
+- **Strictly Additive Lock Screen Integration:** Does not implement `ICredentialProviderFilter` and never disables Windows Hello PIN, Fingerprint, or Password.
+
+---
+
+## Features & UX Highlights
+
+- **Native Windows 11 Lock Screen Integration:** Implements `ICredentialProviderCredential3::GetBitmapBufferValue` for alpha-transparent white Fluent icons on both the sign-in options tile and the selected hero tile. On `Win + L`, background IR scanning starts automatically even while PIN or Fingerprint is selected, and cancels immediately if you sign in another way.
+- **Local & Microsoft Account Support:** Works with local Windows accounts (`Domain = .`) and Microsoft Accounts (`MicrosoftAccount\...` resolved automatically from your Windows account password).
+- **Alternate Appearances (Glasses, Beard, Lighting):** Clicking **Add Appearance** appends 8 more IR captures (up to 4 appearances / 32 samples per user) so recognition stays reliable both with and without prescription glasses. *(Near-IR passes through most clear prescription lenses; IR-blocking sunglasses will block 850nm light.)*
+- **Minimalist Edge WebView2 Desktop App:** Keeps the IR camera and flood LED on standby until you actively start enrollment, live testing, or preview. Includes live SVG corner-bracket face tracking, a collapsible monospace IR diagnostics strip (`IR Δ`, `BG`, `3D`, `Eyes`), one-click UAC service restart when settings change, and a Start Menu shortcut installer.
+
+<details>
+<summary>Screenshot: Local-only DPAPI Logon Password modal</summary>
+<br>
+<p align="center">
+  <img src="docs/screenshots/desktop-app-password-modal.png" alt="WinIRFaceID DPAPI Logon Password Modal" width="760">
+</p>
+</details>
+
+---
 
 ## Architecture
 
-1. **`tools/ir_camera_tester/`** — Standalone IR/RGB camera tester with hardware IR illuminator toggle (`KSPROPERTY_CAMERACONTROL_EXTENDED_FACEAUTH_MODE`), anti-flicker, `IR - Ambient` mode, Dual view, snapshots, and MP4 recording.
-2. **`engine/`** — Python IR Face ID Engine:
-   - `ir_camera.py`: WinRT `MediaCapture` + direct `IOCTL_KS_PROPERTY` IR LED illuminator control and synchronized bright/dark frame pairing.
-   - `models.py` & `recognizer.py`: YuNet face detection (`0.78` score threshold) + SFace 128-D cosine similarity matching (`0.65` default threshold).
-   - `liveness.py`: Active IR illumination delta, background depth falloff, 3D facial relief, open-eyes, and `TemporalLivenessTracker` (blink / 3D parallax motion) checks.
-   - `store.py`: Windows DPAPI-encrypted face embeddings, service settings, and logon credentials.
-   - `ipc_server.py`: Windows Named Pipe server (`\\.\pipe\WinIRFaceID`) implementing [docs/IPC_PROTOCOL.md](docs/IPC_PROTOCOL.md).
-   - `gui_enroll.py` & `cli.py`: On-demand dark-mode Enrollment & Live Verification GUI (`launch_gui.bat`) and CLI.
-3. **`credential_provider/`** — Thin C++17 Windows Credential Provider V2/V3 COM DLL (`WinIRFaceIDProvider.dll`), Named Pipe test CLI (`pipe_client_test.exe`), and `LocalSystem` service host (`WinIRFaceIDService.exe`). Zero camera or AI code runs inside `LogonUI.exe`.
-
-## Quick Start
-
-```powershell
-# 1. Activate environment
-.\.venv\Scripts\Activate.ps1
-
-# 2. Download ONNX face models (YuNet + SFace)
-python -m engine.cli download-models
-
-# 3. Launch Enrollment & Live IR Verification GUI (or run launch_gui.bat)
-python -m engine.cli gui
-
-# 4. Run unit tests
-pytest
+```text
+win-ir-faceid/
+├── engine/
+│   ├── ir_camera.py          # WinRT MediaCapture + IOCTL_KS_PROPERTY IR LED control & bright/dark pairing
+│   ├── models.py             # OpenCV Zoo YuNet (detection) & SFace (128-D embedding) downloader
+│   ├── recognizer.py         # Strict IR YuNet detection (0.78) & SFace cosine matching (0.65 default)
+│   ├── liveness.py           # Active IR delta, AE guard, 1/r² background falloff, 3D relief, open eyes, temporal liveness
+│   ├── store.py              # DPAPI-encrypted profile store + hardened NTFS DACL + service_config.json
+│   ├── ipc_server.py         # LocalSystem Named Pipe server (\\.\pipe\WinIRFaceID)
+│   ├── gui_app.py            # Edge WebView2 desktop controller & loopback MJPEG server
+│   ├── ui/                   # Minimalist dark HTML/CSS/JS frontend & app.ico
+│   └── cli.py                # CLI entry points (gui, download-models, enroll, verify, serve, migrate-store)
+├── credential_provider/
+│   ├── provider.cpp / .h     # ICredentialProvider / ICredentialProviderSetUserArray (additive V2 provider)
+│   ├── credential.cpp / .h   # ICredentialProviderCredential3 (Fluent alpha icon, background scan, Kerberos unlock)
+│   ├── pipe_client.cpp / .h  # Overlapped Win32 Named Pipe client with CancelIoEx cancellation
+│   ├── service_host.cpp      # LocalSystem Windows Service supervisor (WinIRFaceIDService.exe)
+│   ├── pipe_client_test.cpp  # Standalone Named Pipe verification CLI (ping / verify)
+│   ├── install.ps1 / uninstall.ps1
+│   └── CMakeLists.txt
+├── scripts/
+│   ├── install_service.ps1   # Migrates store to machine DPAPI, installs & verifies WinIRFaceIDService
+│   ├── uninstall_service.ps1 # Stops & removes WinIRFaceIDService
+│   └── create_shortcut.ps1   # Creates Start Menu (and optional -Desktop) shortcut
+├── tools/
+│   └── ir_camera_tester/     # Standalone IR/RGB diagnostic tool with illuminator toggle & recording
+└── docs/
+    ├── IPC_PROTOCOL.md       # Named Pipe JSON protocol specification
+    └── screenshots/          # Desktop UI screenshots & app icon
 ```
 
-## Service & Lock Screen Setup (Elevated PowerShell)
+---
 
-1. Build the C++ targets (`WinIRFaceIDProvider.dll`, `pipe_client_test.exe`, `WinIRFaceIDService.exe`) — see [credential_provider/README.md](credential_provider/README.md).
-2. Migrate the encrypted profile store to machine-scoped DPAPI and install `WinIRFaceIDService`:
-   ```powershell
-   .\scripts\install_service.ps1
+## Requirements
+
+- **OS:** Windows 11 x64 with a Windows Hello IR camera (hardware IR sensor + 850nm illuminator)
+- **Python:** 3.11 or newer (`x64`)
+- **Build Tools:** Visual Studio 2022 / 2026 (Desktop development with C++ + CMake) to build the C++ Credential Provider and Service Host
+- **Runtime:** Microsoft Edge WebView2 Runtime (pre-installed on Windows 11)
+
+---
+
+## Installation & Setup
+
+### 1. Clone & Install Python Dependencies
+
+```powershell
+git clone https://github.com/al3ksh/win-ir-faceid.git
+cd win-ir-faceid
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+### 2. Launch the App, Download Models & Enroll Your Face
+
+Launch the desktop app via `launch_gui.bat` (or create a Start Menu shortcut first):
+
+```powershell
+.\scripts\create_shortcut.ps1
+.\launch_gui.bat
+```
+
+Inside the **WinIRFaceID** window:
+1. Click **Download Models** if prompted (fetches YuNet and SFace ONNX weights into `models/`, ~37 MB total; or run `python -m engine.cli download-models`).
+2. Verify your Windows username is filled in under **Account** and click **Enroll Face** (8 active-IR captures). If you wear glasses, click **Add Appearance** afterwards to enroll an additional look with glasses on.
+3. Click **Password** and save your Windows logon password (encrypted locally via DPAPI). For a Microsoft Account, enter your Microsoft Account password and keep **Domain** set to `.`.
+4. Click **Test Live** to verify active-IR detection, anti-spoofing, and match score before enabling lock screen integration.
+
+### 3. Build the C++ Credential Provider & Service Host (`x64 Release`)
+
+```powershell
+cmake -S credential_provider -B credential_provider/build -A x64
+cmake --build credential_provider/build --config Release
+```
+
+*(If `cmake` on your `PATH` defaults to Ninja instead of Visual Studio, pass `-G "Visual Studio 17 2022" -A x64` or invoke Visual Studio's bundled `cmake.exe` — see [credential_provider/README.md](credential_provider/README.md).)*
+
+This produces:
+- `credential_provider\build\Release\WinIRFaceIDProvider.dll`
+- `credential_provider\build\Release\WinIRFaceIDService.exe`
+- `credential_provider\build\Release\pipe_client_test.exe`
+
+### 4. Install & Verify `WinIRFaceIDService` (Administrator PowerShell)
+
+Run the following from an **elevated (Administrator) PowerShell** prompt at the repository root:
+
+```powershell
+.\scripts\install_service.ps1
+.\credential_provider\build\Release\pipe_client_test.exe verify <your-windows-username>
+```
+
+`install_service.ps1` migrates `data\profiles.enc` to machine-scoped DPAPI with a hardened NTFS DACL, installs `WinIRFaceIDService` as `LocalSystem`, starts it, and runs `pipe_client_test.exe ping`. Confirm `pipe_client_test.exe verify <your-windows-username>` matches your face cleanly before registering the lock screen DLL.
+
+### 5. Register the Credential Provider (Administrator PowerShell)
+
+Still in an **elevated PowerShell** prompt (keep Windows Hello PIN or Password enabled as your fallback):
+
+```powershell
+cd credential_provider
+.\install.ps1
+```
+
+Press **`Win + L`** to lock your workstation and test pure-IR unlock.
+
+---
+
+## Development & Tests
+
+```powershell
+.\.venv\Scripts\pytest.exe -v
+```
+
+---
+
+## Clean Uninstall & Safe Mode Recovery
+
+To unregister the Credential Provider and remove the background service, run in an **Administrator PowerShell** prompt:
+
+```powershell
+.\credential_provider\uninstall.ps1
+.\scripts\uninstall_service.ps1
+```
+
+### Emergency Safe Mode Recovery
+
+If `LogonUI.exe` ever fails to load or sign in after registering the DLL:
+1. Boot into **Safe Mode with Command Prompt** (`Shift` + **Restart** -> **Troubleshoot** -> **Advanced options** -> **Startup Settings** -> **6 / F6**).
+2. Remove the Credential Provider registry entries (`CLSID {49C8AEC3-2A43-4BED-987D-DE31E44DF41D}`) and DLL:
+   ```cmd
+   reg delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{49C8AEC3-2A43-4BED-987D-DE31E44DF41D}" /f
+   reg delete "HKLM\SOFTWARE\Classes\CLSID\{49C8AEC3-2A43-4BED-987D-DE31E44DF41D}" /f
+   del C:\Windows\System32\WinIRFaceIDProvider.dll
    ```
-3. Verify the Named Pipe responds (`credential_provider\build\Release\pipe_client_test.exe ping` and `verify`), then register the Credential Provider:
-   ```powershell
-   cd credential_provider
-   .\install.ps1
-   ```
+3. Reboot normally.
 
-## Safety & Uninstall
+---
 
-- Keep Windows Hello PIN, Fingerprint, or Password enabled as fallback—the Credential Provider is strictly additive and never disables built-in sign-in methods.
-- To uninstall completely (run in an **Administrator** PowerShell prompt):
-  ```powershell
-  .\credential_provider\uninstall.ps1
-  .\scripts\uninstall_service.ps1
-  ```
-- See [credential_provider/README.md](credential_provider/README.md) for Safe Mode emergency recovery commands.
+## License
+
+Released under the [MIT License](LICENSE).
