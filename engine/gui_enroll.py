@@ -210,6 +210,10 @@ class IREnrollmentApp(tk.Tk):
         self._discover_and_start_camera()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(300, lambda: self.attributes("-topmost", False))
         self.after(30, self._update_loop)
 
     def _build_ui(self) -> None:
