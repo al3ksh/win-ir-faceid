@@ -171,7 +171,7 @@ bool WinIRFaceIDProvider::ShouldDeferInitialUnlockScan()
     {
         return true;
     }
-    return (GetTickCount64() - adviseTickMs) < 1800ULL;
+    return (GetTickCount64() - adviseTickMs) < 2200ULL;
 }
 
 DWORD WINAPI WinIRFaceIDProvider::AutoScanWatcherThreadProc(LPVOID param)
@@ -236,36 +236,49 @@ void WinIRFaceIDProvider::RunAutoScanWatcher(
 
     if (cpus == CPUS_UNLOCK_WORKSTATION)
     {
-        const DWORD lockTick32 = GetTickCount();
-        DWORD baselineInput32 = GetLastInputTick32();
-        bool sawCurtain = !IsLogonUIForeground();
+        // Phase 1: Strict 2000ms settle window. Do not record curtain state or trigger scans yet,
+        // because GetForegroundWindow() briefly returns NULL during desktop switch animations.
+        const ULONGLONG lockTickMs = GetTickCount64();
+        while ((GetTickCount64() - lockTickMs) < 2000ULL)
+        {
+            if (WaitForSingleObject(stopEvent, 150) != WAIT_TIMEOUT)
+            {
+                return;
+            }
+        }
 
+        // Phase 2: Capture post-lock baseline once the lock screen has settled.
+        const DWORD baselineInput32 = GetLastInputTick32();
+        bool settledBehindCurtain = !IsLogonUIForeground();
+
+        // Phase 3: Wait for genuine user return (curtain dismissed or new input after settle).
         while (WaitForSingleObject(stopEvent, 150) == WAIT_TIMEOUT)
         {
-            const DWORD now32 = GetTickCount();
-            const DWORD elapsed = now32 - lockTick32;
             const bool fgNow = IsLogonUIForeground();
-
-            if (elapsed < 1200)
-            {
-                // Absorb Win + L key-up and hand-leaving-mouse jitter during initial lock transition.
-                baselineInput32 = GetLastInputTick32();
-                if (!fgNow)
-                {
-                    sawCurtain = true;
-                }
-                continue;
-            }
-
             if (!fgNow)
             {
-                // Still behind the LockApp curtain; keep IR LED 100% off.
-                sawCurtain = true;
+                // Still behind the LockApp curtain or screen off; keep IR LED 100% off.
+                settledBehindCurtain = true;
                 continue;
             }
 
-            // Trigger A: LockApp curtain was active and has now been dismissed.
-            if (sawCurtain && fgNow)
+            bool shouldArmAndScan = false;
+            if (settledBehindCurtain)
+            {
+                // Trigger A: Curtain was active after settle and has now been dismissed.
+                shouldArmAndScan = true;
+            }
+            else
+            {
+                // Trigger B: Genuine new keyboard/mouse input arrived after settle.
+                const DWORD currInput = GetLastInputTick32();
+                if (currInput != 0 && currInput != baselineInput32)
+                {
+                    shouldArmAndScan = true;
+                }
+            }
+
+            if (shouldArmAndScan)
             {
                 EnterCriticalSection(&_cs);
                 _unlockArmed = true;
@@ -276,29 +289,6 @@ void WinIRFaceIDProvider::RunAutoScanWatcher(
                     targetCred->StartScan();
                 }
                 break;
-            }
-
-            // Trigger B: NoLockScreen=1 or Lock UI without separate LockApp process —
-            // arm once new user input arrives after the lock grace window.
-            if (fgNow && elapsed >= 2000)
-            {
-                const DWORD currInput = GetLastInputTick32();
-                const DWORD inputDelta = currInput - lockTick32;
-                if (currInput != 0 &&
-                    currInput != baselineInput32 &&
-                    inputDelta < 0x80000000UL &&
-                    inputDelta >= 1500)
-                {
-                    EnterCriticalSection(&_cs);
-                    _unlockArmed = true;
-                    LeaveCriticalSection(&_cs);
-
-                    if (!targetCred->HasVerifiedCredential())
-                    {
-                        targetCred->StartScan();
-                    }
-                    break;
-                }
             }
         }
     }
