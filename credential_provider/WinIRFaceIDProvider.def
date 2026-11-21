@@ -1,0 +1,4 @@
+LIBRARY WinIRFaceIDProvider
+EXPORTS
+    DllCanUnloadNow     PRIVATE
+    DllGetClassObject   PRIVATE

@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Models & local user data (never commit biometric embeddings or credentials!)
+models/*.onnx
+data/
+*.enc
+*.bin
+
+# C++ / CMake / Visual Studio
+build/
+credential_provider/build/
+out/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+.vs/
+
+# OS
+Thumbs.db
+desktop.ini
