@@ -181,11 +181,13 @@ WinIRFaceIDCredential::WinIRFaceIDCredential(
     WinIRFaceIDProvider* pProvider,
     CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     std::wstring userSid,
-    std::wstring userName)
+    std::wstring userName,
+    std::wstring qualifiedName)
     : _pProvider(pProvider)
     , _cpus(cpus)
     , _userSid(std::move(userSid))
     , _userName(std::move(userName))
+    , _qualifiedName(std::move(qualifiedName))
 {
     DllAddRef();
     InitializeCriticalSection(&_cs);
@@ -544,13 +546,27 @@ IFACEMETHODIMP WinIRFaceIDCredential::GetSerialization(
         domain = username.substr(0, slashPos);
         username = username.substr(slashPos + 1);
     }
-    else if (username.find(L'@') != std::wstring::npos && (domain.empty() || domain == L"."))
+    else if (username.find(L'@') != std::wstring::npos)
     {
-        domain.clear();
+        if (domain.empty() || domain == L".")
+        {
+            domain.clear();
+        }
     }
     else if (domain.empty() || domain == L".")
     {
-        domain = GetLocalComputerNetbiosName();
+        // Preserve Windows qualified identity (e.g. MicrosoftAccount\user@example.com or COMPUTER\DELL)
+        // when the profile store uses the default local domain placeholder ".".
+        const size_t qSlash = _qualifiedName.find(L'\\');
+        if (qSlash != std::wstring::npos && qSlash > 0 && qSlash + 1 < _qualifiedName.size())
+        {
+            domain = _qualifiedName.substr(0, qSlash);
+            username = _qualifiedName.substr(qSlash + 1);
+        }
+        else
+        {
+            domain = GetLocalComputerNetbiosName();
+        }
     }
 
     ULONG authPackage = 0;

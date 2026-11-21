@@ -19,7 +19,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from engine import __version__
-from engine.cli import _select_enrollment_camera, build_parser
+from engine.cli import _resolve_serve_options, _select_enrollment_camera, build_parser, main as cli_main
 from engine.ipc_server import (
     DEFAULT_THRESHOLD,
     IRFaceVerifier,
@@ -42,7 +42,13 @@ from engine.recognizer import (
     FaceRecognizer,
     enhance_ir_bgr,
 )
-from engine.store import ProfileStore
+from engine.store import (
+    ProfileStore,
+    ServiceConfig,
+    harden_file_acl,
+    load_service_config,
+    save_service_config,
+)
 
 
 @dataclass
@@ -469,6 +475,81 @@ def test_store_dpapi_roundtrip_and_encryption(tmp_path: Path) -> None:
     assert reloaded.delete_user("Alice") is True
     assert reloaded.delete_user("Alice") is False
     assert reloaded.list_users() == []
+
+
+def test_store_local_machine_default_acl_and_migration(tmp_path: Path) -> None:
+    import win32security
+
+    store_path = tmp_path / "profiles.enc"
+    # Default local_machine must be True
+    default_store = ProfileStore(store_path)
+    assert default_store.local_machine is True
+
+    # Create a legacy user-scoped store (local_machine=False)
+    legacy_store = ProfileStore(store_path, local_machine=False)
+    assert legacy_store.local_machine is False
+    emb = np.ones(128, dtype=np.float32) / np.sqrt(128.0)
+    legacy_store.upsert_embeddings("DELL", [emb], domain=".")
+    legacy_store.set_credentials("DELL", password="LegacyPassword!1", domain=".")
+    legacy_bytes = store_path.read_bytes()
+
+    # Non-existent store returns False on migrate_to_local_machine
+    missing_store = ProfileStore(tmp_path / "missing.enc")
+    assert missing_store.migrate_to_local_machine() is False
+
+    # Migrate legacy store to local_machine=True + hardened NTFS ACL
+    migrated = legacy_store.migrate_to_local_machine()
+    assert migrated is True
+    assert legacy_store.local_machine is True
+    assert store_path.read_bytes() != legacy_bytes
+
+    # Reload via fresh ProfileStore(local_machine=True) and verify contents
+    reloaded = ProfileStore(store_path, local_machine=True)
+    user = reloaded.get_user("DELL")
+    assert user is not None
+    assert user.password == "LegacyPassword!1"
+    assert len(user.embeddings) == 1
+    np.testing.assert_allclose(user.embedding_arrays()[0], emb, atol=1e-6)
+
+    # Verify hardened protected DACL on store_path (SYSTEM + Administrators + current user)
+    sd = win32security.GetNamedSecurityInfo(
+        str(store_path),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION,
+    )
+    ctrl_flags, _ = sd.GetSecurityDescriptorControl()
+    assert ctrl_flags & win32security.SE_DACL_PROTECTED
+    dacl = sd.GetSecurityDescriptorDacl()
+    assert dacl.GetAceCount() >= 2
+
+    # Best-effort ACL hardening must never raise on a missing path
+    assert harden_file_acl(tmp_path / "does_not_exist.enc") is False
+
+
+def test_service_config_defaults_and_roundtrip(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "service_config.json"
+
+    # Missing file falls back to defaults
+    defaults = load_service_config(cfg_path)
+    assert defaults == ServiceConfig(
+        threshold=DEFAULT_MATCH_THRESHOLD,
+        require_motion=False,
+        require_open_eyes=False,
+    )
+
+    # Save and reload roundtrip
+    custom = ServiceConfig(threshold=0.72, require_motion=True, require_open_eyes=True)
+    save_service_config(custom, cfg_path)
+    assert cfg_path.is_file()
+    reloaded = load_service_config(cfg_path)
+    assert reloaded.threshold == pytest.approx(0.72)
+    assert reloaded.require_motion is True
+    assert reloaded.require_open_eyes is True
+
+    # Corrupt JSON falls back cleanly to defaults
+    cfg_path.write_text("{not valid json", encoding="utf-8")
+    fallback = load_service_config(cfg_path)
+    assert fallback == ServiceConfig()
 
 
 # ---------------------------------------------------------------------------
@@ -977,6 +1058,44 @@ def test_cli_require_open_eyes_flags() -> None:
     assert args_serve.require_open_eyes is True
     assert args_serve.require_motion is False
 
+    args_svc_mode = parser.parse_args(["serve", "--service-mode"])
+    assert args_svc_mode.service is True
+
+
+def test_cli_migrate_store_and_serve_config_defaults(tmp_path: Path, capsys: Any) -> None:
+    store_path = tmp_path / "profiles.enc"
+    legacy = ProfileStore(store_path, local_machine=False)
+    emb = np.ones(128, dtype=np.float32) / np.sqrt(128.0)
+    legacy.upsert_embeddings("DELL", [emb])
+    legacy.set_credentials("DELL", password="Pw!", domain=".")
+
+    # migrate-store on existing file
+    rc = cli_main(["migrate-store", "--path", str(store_path)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Migrated profile store" in out
+    assert ProfileStore(store_path).get_user("DELL").password == "Pw!"
+
+    # migrate-store on missing file
+    rc_missing = cli_main(["migrate-store", "--path", str(tmp_path / "absent.enc")])
+    assert rc_missing == 0
+    out_missing = capsys.readouterr().out
+    assert "No existing profile store found" in out_missing
+
+    # serve defaults loaded from service_config.json when not explicitly overridden
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(
+        ServiceConfig(threshold=0.73, require_motion=True, require_open_eyes=True),
+        cfg_path,
+    )
+    parser = build_parser()
+    with patch("engine.cli.load_service_config", side_effect=lambda: load_service_config(cfg_path)):
+        args_default = parser.parse_args(["serve", "--service-mode"])
+        assert _resolve_serve_options(args_default) == (pytest.approx(0.73), True, True)
+
+        args_override = parser.parse_args(["serve", "--service-mode", "--threshold", "0.68"])
+        assert _resolve_serve_options(args_override) == (pytest.approx(0.68), True, True)
+
 
 def test_gui_on_demand_camera_standby_and_open_eyes(tmp_path: Path) -> None:
     from engine.gui_enroll import IREnrollmentApp, _STANDBY_LIVENESS_TEXT, _STANDBY_VIDEO_TEXT
@@ -994,10 +1113,20 @@ def test_gui_on_demand_camera_standby_and_open_eyes(tmp_path: Path) -> None:
         return w
 
     store = ProfileStore(tmp_path / "profiles.enc")
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(
+        ServiceConfig(threshold=0.71, require_motion=False, require_open_eyes=False),
+        cfg_path,
+    )
     mock_rec = MagicMock()
 
     with (
         patch("engine.gui_enroll.ProfileStore", return_value=store),
+        patch("engine.gui_enroll.load_service_config", side_effect=lambda: load_service_config(cfg_path)),
+        patch(
+            "engine.gui_enroll.save_service_config",
+            side_effect=lambda cfg: save_service_config(cfg, cfg_path),
+        ),
         patch("engine.gui_enroll.models_exist", return_value=True),
         patch("engine.gui_enroll.FaceRecognizer", return_value=mock_rec),
         patch("engine.ir_camera.discover_cameras", return_value=[cam_rgb, cam_ir]),
@@ -1012,6 +1141,8 @@ def test_gui_on_demand_camera_standby_and_open_eyes(tmp_path: Path) -> None:
             assert app.liveness_var.get() == _STANDBY_LIVENESS_TEXT
             assert app.match_var.get() == "Match: Idle"
             assert app.video_label.cget("text") == _STANDBY_VIDEO_TEXT
+            assert app.threshold_var.get() == pytest.approx(0.71)
+            assert app.require_motion_var.get() is False
             assert app.require_open_eyes_var.get() is False
 
             # Switching camera in standby does NOT start camera
@@ -1081,5 +1212,34 @@ def test_gui_on_demand_camera_standby_and_open_eyes(tmp_path: Path) -> None:
             assert app._enrolling is False
             assert app.worker is None
             assert app.ae_var.get() == "AE Status: Standby"
+
+            # Changing threshold / motion / open-eyes persists to service_config.json
+            app.threshold_var.set(0.68)
+            app._on_threshold_changed()
+            assert "Saved service settings" in app.status_var.get()
+
+            app.require_motion_var.set(True)
+            app._on_motion_toggle()
+            app.require_open_eyes_var.set(True)
+            app._on_open_eyes_toggle()
+
+            saved_cfg = load_service_config(cfg_path)
+            assert saved_cfg.threshold == pytest.approx(0.68)
+            assert saved_cfg.require_motion is True
+            assert saved_cfg.require_open_eyes is True
+
+            # PasswordDialog includes Microsoft Account helper note
+            from engine.gui_enroll import PasswordDialog
+
+            dlg = PasswordDialog(app, username="DELL", default_domain=".")
+            try:
+                labels = [
+                    child.cget("text")
+                    for child in dlg.winfo_children()[0].winfo_children()
+                    if child.winfo_class() == "Label"
+                ]
+                assert any("Microsoft Account" in text for text in labels)
+            finally:
+                dlg.destroy()
         finally:
             app._on_close()

@@ -24,7 +24,8 @@ public:
         WinIRFaceIDProvider* pProvider,
         CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
         std::wstring userSid,
-        std::wstring userName);
+        std::wstring userName,
+        std::wstring qualifiedName);
 
     // IUnknown
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
@@ -95,6 +96,7 @@ private:
     CREDENTIAL_PROVIDER_USAGE_SCENARIO _cpus = CPUS_INVALID;
     std::wstring _userSid;
     std::wstring _userName;
+    std::wstring _qualifiedName;
 
     ICredentialProviderCredentialEvents* _pCredEvents = nullptr;
     HANDLE _cancelEvent = nullptr;

@@ -50,3 +50,12 @@ target_link_libraries(pipe_client_test PRIVATE
     advapi32
     user32
 )
+
+# Native Windows Service host supervising the Python Named Pipe engine under LocalSystem
+add_executable(WinIRFaceIDService
+    service_host.cpp
+)
+
+target_link_libraries(WinIRFaceIDService PRIVATE
+    advapi32
+)

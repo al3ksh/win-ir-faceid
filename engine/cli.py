@@ -14,7 +14,9 @@ from engine import __version__
 from engine.liveness import check_ir_liveness
 from engine.models import ensure_models
 from engine.recognizer import DEFAULT_MATCH_THRESHOLD, FaceRecognizer, enhance_ir_bgr
-from engine.store import ProfileStore
+from engine.store import ProfileStore, load_service_config
+
+logger = logging.getLogger(__name__)
 
 
 _POSE_HINTS = (
@@ -226,16 +228,45 @@ def _cmd_delete(args: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_migrate_store(args: argparse.Namespace) -> int:
+    path = getattr(args, "path", None)
+    store = ProfileStore(path, local_machine=True) if path else ProfileStore(local_machine=True)
+    migrated = store.migrate_to_local_machine()
+    if migrated:
+        print(
+            f"Migrated profile store '{store.path}' to machine-scoped DPAPI with hardened NTFS ACL.",
+            flush=True,
+        )
+    else:
+        print(f"No existing profile store found at '{store.path}'; nothing to migrate.", flush=True)
+    return 0
+
+
+def _resolve_serve_options(args: argparse.Namespace) -> tuple[float, bool, bool]:
+    """Resolve effective ``serve`` options, falling back to ``service_config.json``."""
+    cfg = load_service_config()
+    explicit = getattr(args, "_explicit_args", set())
+    threshold = float(args.threshold) if "threshold" in explicit else float(cfg.threshold)
+    require_motion = bool(args.require_motion) if "require_motion" in explicit else bool(cfg.require_motion)
+    require_open_eyes = (
+        bool(args.require_open_eyes) if "require_open_eyes" in explicit else bool(cfg.require_open_eyes)
+    )
+    return threshold, require_motion, require_open_eyes
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     from engine.ipc_server import IRFaceVerifier, NamedPipeServer
 
     ensure_models()
-    store = ProfileStore(local_machine=args.service)
+    store = ProfileStore()
+    threshold, require_motion, require_open_eyes = _resolve_serve_options(args)
+    enrolled_count = sum(1 for u in store.list_users() if u.embeddings)
+
     verifier = IRFaceVerifier(
         store,
-        threshold=args.threshold,
-        require_motion=args.require_motion,
-        require_open_eyes=args.require_open_eyes,
+        threshold=threshold,
+        require_motion=require_motion,
+        require_open_eyes=require_open_eyes,
     )
     server = NamedPipeServer(
         pipe_name=args.pipe,
@@ -243,13 +274,24 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         verifier=verifier,
         service_mode=args.service,
     )
-    print(f"WinIRFaceID IPC server v{__version__} listening on {args.pipe}")
+    startup_msg = (
+        f"WinIRFaceID IPC server v{__version__} listening on {args.pipe} "
+        f"(service_mode={bool(args.service)}, enrolled_users={enrolled_count}, "
+        f"threshold={threshold:.2f}, require_motion={require_motion}, "
+        f"require_open_eyes={require_open_eyes})"
+    )
+    logger.info(startup_msg)
+    print(startup_msg, flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down IPC server...")
+        print("\nShutting down IPC server...", flush=True)
     finally:
         server.close()
+        sys.stdout.flush()
+        sys.stderr.flush()
     return 0
 
 
@@ -258,6 +300,60 @@ def _cmd_gui(_args: argparse.Namespace) -> int:
 
     gui_main()
     return 0
+
+
+class _TrackStoreTrue(argparse.Action):
+    """Store True and record the option destination as explicitly passed on CLI."""
+
+    def __init__(
+        self,
+        option_strings: Sequence[str],
+        dest: str,
+        default: bool = False,
+        required: bool = False,
+        help: str | None = None,
+    ) -> None:
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            nargs=0,
+            const=True,
+            default=default,
+            required=required,
+            help=help,
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, True)
+        explicit = getattr(namespace, "_explicit_args", None)
+        if explicit is None:
+            explicit = set()
+            setattr(namespace, "_explicit_args", explicit)
+        explicit.add(self.dest)
+
+
+class _TrackValue(argparse.Action):
+    """Store an argument value and record the option destination as explicitly passed on CLI."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        explicit = getattr(namespace, "_explicit_args", None)
+        if explicit is None:
+            explicit = set()
+            setattr(namespace, "_explicit_args", explicit)
+        explicit.add(self.dest)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -323,23 +419,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_del.add_argument("--user", required=True, help="Windows username to delete")
     p_del.set_defaults(func=_cmd_delete)
 
+    p_migrate = sub.add_parser(
+        "migrate-store",
+        help="Migrate profiles.enc to machine-scoped DPAPI with hardened NTFS ACL",
+    )
+    p_migrate.add_argument("--path", default=None, help="Optional custom profile store path")
+    p_migrate.set_defaults(func=_cmd_migrate_store)
+
     p_serve = sub.add_parser("serve", help="Run the Named Pipe IPC server")
     p_serve.add_argument("--pipe", default=r"\\.\pipe\WinIRFaceID", help="Named pipe path")
-    p_serve.add_argument("--service", action="store_true", help="Use LocalSystem pipe ACL and machine DPAPI store")
+    p_serve.add_argument(
+        "--service",
+        "--service-mode",
+        dest="service",
+        action="store_true",
+        help="Use LocalSystem pipe ACL and service logging mode",
+    )
     p_serve.add_argument(
         "--threshold",
         type=float,
         default=DEFAULT_MATCH_THRESHOLD,
-        help=f"Cosine similarity threshold (default: {DEFAULT_MATCH_THRESHOLD})",
+        action=_TrackValue,
+        help=f"Cosine similarity threshold (default: service_config.json or {DEFAULT_MATCH_THRESHOLD})",
     )
     p_serve.add_argument(
         "--require-motion",
-        action="store_true",
+        action=_TrackStoreTrue,
         help="Require live blink or 3D head micro-motion during verification",
     )
     p_serve.add_argument(
         "--require-open-eyes",
-        action="store_true",
+        action=_TrackStoreTrue,
         help="Require both eyes to be open in active IR during verification",
     )
     p_serve.set_defaults(func=_cmd_serve)

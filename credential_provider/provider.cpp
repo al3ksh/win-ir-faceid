@@ -271,21 +271,39 @@ IFACEMETHODIMP WinIRFaceIDProvider::SetUserArray(ICredentialProviderUserArray* u
             CoTaskMemFree(pszSid);
         }
 
-        std::wstring userName;
+        std::wstring rawUserName;
         LPWSTR pszName = nullptr;
         if (SUCCEEDED(pUser->GetStringValue(PKEY_Identity_UserName, &pszName)) && pszName != nullptr)
         {
-            userName = ExtractShortUsername(pszName);
+            rawUserName = pszName;
             CoTaskMemFree(pszName);
         }
-        else if (SUCCEEDED(pUser->GetStringValue(PKEY_Identity_QualifiedUserName, &pszName)) && pszName != nullptr)
+
+        std::wstring qualifiedName;
+        LPWSTR pszQualified = nullptr;
+        if (SUCCEEDED(pUser->GetStringValue(PKEY_Identity_QualifiedUserName, &pszQualified)) && pszQualified != nullptr)
         {
-            userName = ExtractShortUsername(pszName);
-            CoTaskMemFree(pszName);
+            qualifiedName = pszQualified;
+            CoTaskMemFree(pszQualified);
         }
-        else
+        if (qualifiedName.empty() && !rawUserName.empty())
         {
-            userName = LookupUsernameFromSidString(sidStr);
+            qualifiedName = rawUserName;
+        }
+
+        // Prefer SID -> SAM account name (e.g. "DELL" on Microsoft Accounts where
+        // PKEY_Identity_UserName may return the email address).
+        std::wstring samName = LookupUsernameFromSidString(sidStr);
+        if (samName.empty())
+        {
+            if (!rawUserName.empty())
+            {
+                samName = ExtractShortUsername(rawUserName);
+            }
+            else if (!qualifiedName.empty())
+            {
+                samName = ExtractShortUsername(qualifiedName);
+            }
         }
 
         pUser->Release();
@@ -294,7 +312,8 @@ IFACEMETHODIMP WinIRFaceIDProvider::SetUserArray(ICredentialProviderUserArray* u
             this,
             cpus,
             std::move(sidStr),
-            std::move(userName));
+            std::move(samName),
+            std::move(qualifiedName));
         if (cred != nullptr)
         {
             created.push_back(cred);

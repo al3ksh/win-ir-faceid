@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wintypes
 import json
+import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -12,7 +13,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+import ntsecuritycon
 import numpy as np
+import pywintypes
+import win32api
+import win32con
+import win32security
+
+from engine.recognizer import DEFAULT_MATCH_THRESHOLD
+
+logger = logging.getLogger(__name__)
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x01
 CRYPTPROTECT_LOCAL_MACHINE = 0x04
@@ -157,6 +167,114 @@ def get_default_store_path() -> Path:
     return Path(__file__).resolve().parent.parent / "data" / "profiles.enc"
 
 
+def get_default_service_config_path() -> Path:
+    """Return the default ``<repo>/data/service_config.json`` file path."""
+    return Path(__file__).resolve().parent.parent / "data" / "service_config.json"
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Atomically write ``data`` to ``path`` via a sibling temp file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def harden_file_acl(path: Path | str) -> bool:
+    """Set a protected DACL granting FILE_ALL_ACCESS only to SYSTEM, Admins, and current user."""
+    target = Path(path)
+    try:
+        sid_system = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
+        sid_admins = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
+
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(),
+            win32con.TOKEN_QUERY,
+        )
+        try:
+            sid_user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+        finally:
+            win32api.CloseHandle(token)
+
+        acl = win32security.ACL()
+        acl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, sid_system)
+        acl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, sid_admins)
+        if sid_user != sid_system and sid_user != sid_admins:
+            acl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, sid_user)
+
+        win32security.SetNamedSecurityInfo(
+            str(target),
+            win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            acl,
+            None,
+        )
+        return True
+    except (pywintypes.error, OSError) as exc:
+        logger.warning("Best-effort NTFS ACL hardening skipped for '%s': %s", target, exc)
+        return False
+
+
+@dataclass
+class ServiceConfig:
+    """Persisted verification settings shared between the GUI and Windows Service."""
+
+    threshold: float = DEFAULT_MATCH_THRESHOLD
+    require_motion: bool = False
+    require_open_eyes: bool = False
+
+
+def load_service_config(path: Path | str | None = None) -> ServiceConfig:
+    """Load ``ServiceConfig`` from JSON, falling back to defaults if absent or invalid."""
+    target = Path(path) if path is not None else get_default_service_config_path()
+    if not target.is_file():
+        return ServiceConfig()
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return ServiceConfig()
+        threshold = float(raw.get("threshold", DEFAULT_MATCH_THRESHOLD))
+        require_motion = bool(raw.get("require_motion", False))
+        require_open_eyes = bool(raw.get("require_open_eyes", False))
+        return ServiceConfig(
+            threshold=threshold,
+            require_motion=require_motion,
+            require_open_eyes=require_open_eyes,
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to load service config '%s', using defaults: %s", target, exc)
+        return ServiceConfig()
+
+
+def save_service_config(cfg: ServiceConfig, path: Path | str | None = None) -> Path:
+    """Persist ``ServiceConfig`` as JSON at ``path`` (default ``data/service_config.json``)."""
+    target = Path(path) if path is not None else get_default_service_config_path()
+    payload = {
+        "threshold": float(cfg.threshold),
+        "require_motion": bool(cfg.require_motion),
+        "require_open_eyes": bool(cfg.require_open_eyes),
+    }
+    raw = (json.dumps(payload, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+    _atomic_write_bytes(target, raw)
+    return target
+
+
 class ProfileStore:
     """Encrypted on-disk profile store backed by Windows DPAPI."""
 
@@ -164,7 +282,7 @@ class ProfileStore:
         self,
         path: Path | str | None = None,
         *,
-        local_machine: bool = False,
+        local_machine: bool = True,
     ) -> None:
         self.path = Path(path) if path is not None else get_default_store_path()
         self.local_machine = local_machine
@@ -185,7 +303,6 @@ class ProfileStore:
         return result
 
     def _save_all(self, users: dict[str, UserProfile]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
             "users": {
@@ -195,24 +312,23 @@ class ProfileStore:
         }
         plaintext = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         ciphertext = dpapi_protect(plaintext, local_machine=self.local_machine)
+        _atomic_write_bytes(self.path, ciphertext)
+        if self.local_machine:
+            harden_file_acl(self.path)
 
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{self.path.name}.",
-            suffix=".tmp",
-            dir=str(self.path.parent),
-        )
-        tmp_path = Path(tmp_name)
+    def migrate_to_local_machine(self) -> bool:
+        """Re-encrypt an existing store with machine-scoped DPAPI and hardened NTFS ACL."""
+        if not self.path.is_file():
+            return False
+        users = self._load_all()
+        prev_local_machine = self.local_machine
+        self.local_machine = True
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(ciphertext)
-            os.replace(tmp_path, self.path)
+            self._save_all(users)
         except Exception:
-            if tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
+            self.local_machine = prev_local_machine
             raise
+        return True
 
     def list_users(self) -> list[UserProfile]:
         """Return all stored user profiles sorted by username."""

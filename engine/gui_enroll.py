@@ -27,7 +27,12 @@ from engine.recognizer import (
     FaceRecognizer,
     enhance_ir_bgr,
 )
-from engine.store import ProfileStore
+from engine.store import (
+    ProfileStore,
+    ServiceConfig,
+    load_service_config,
+    save_service_config,
+)
 
 
 _BG_MAIN = "#12151c"
@@ -138,8 +143,18 @@ class PasswordDialog(tk.Toplevel):
         )
         confirm_entry.grid(row=3, column=1, sticky="ew", padx=(10, 0), pady=4)
 
+        tk.Label(
+            frame,
+            text="For a Microsoft Account, enter your Microsoft Account password (keep Domain as '.').",
+            bg=_BG_PANEL,
+            fg=_FG_MUTED,
+            font=("Segoe UI", 8),
+            wraplength=340,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         btn_row = tk.Frame(frame, bg=_BG_PANEL)
-        btn_row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        btn_row.grid(row=5, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         tk.Button(
             btn_row,
@@ -211,12 +226,15 @@ class IREnrollmentApp(tk.Tk):
         self._downloading_models = False
         self._motion_tracker = TemporalLivenessTracker()
 
+        svc_cfg = load_service_config()
+        initial_thresh = max(0.45, min(0.85, float(svc_cfg.threshold)))
+
         self.username_var = tk.StringVar(value=os.environ.get("USERNAME", "User"))
         self.feed_mode_var = tk.StringVar(value="IR - Ambient")
         self.camera_var = tk.StringVar(value="")
-        self.threshold_var = tk.DoubleVar(value=DEFAULT_MATCH_THRESHOLD)
-        self.require_motion_var = tk.BooleanVar(value=False)
-        self.require_open_eyes_var = tk.BooleanVar(value=False)
+        self.threshold_var = tk.DoubleVar(value=initial_thresh)
+        self.require_motion_var = tk.BooleanVar(value=bool(svc_cfg.require_motion))
+        self.require_open_eyes_var = tk.BooleanVar(value=bool(svc_cfg.require_open_eyes))
         self.status_var = tk.StringVar(value="Initializing...")
         self.liveness_var = tk.StringVar(value=_STANDBY_LIVENESS_TEXT)
         self.match_var = tk.StringVar(value="Match: Idle")
@@ -394,6 +412,7 @@ class IREnrollmentApp(tk.Tk):
             increment=0.01,
             format="%.2f",
             textvariable=self.threshold_var,
+            command=self._on_threshold_changed,
             width=6,
             bg=_BG_CARD,
             fg=_FG_PRIMARY,
@@ -403,6 +422,8 @@ class IREnrollmentApp(tk.Tk):
             font=("Consolas", 9, "bold"),
         )
         self.threshold_spin.pack(side="right")
+        self.threshold_spin.bind("<FocusOut>", self._on_threshold_changed)
+        self.threshold_spin.bind("<Return>", self._on_threshold_changed)
 
         self.motion_check = tk.Checkbutton(
             right,
@@ -423,6 +444,7 @@ class IREnrollmentApp(tk.Tk):
             right,
             text="Require Open Eyes",
             variable=self.require_open_eyes_var,
+            command=self._on_open_eyes_toggle,
             bg=_BG_PANEL,
             fg=_FG_PRIMARY,
             selectcolor=_BG_CARD,
@@ -776,8 +798,33 @@ class IREnrollmentApp(tk.Tk):
             val = DEFAULT_MATCH_THRESHOLD
         return max(0.45, min(0.85, val))
 
+    def _save_service_settings(self) -> None:
+        thresh = round(self._get_match_threshold(), 2)
+        cfg = ServiceConfig(
+            threshold=thresh,
+            require_motion=bool(self.require_motion_var.get()),
+            require_open_eyes=bool(self.require_open_eyes_var.get()),
+        )
+        try:
+            save_service_config(cfg)
+            self.status_var.set(
+                f"Saved service settings (threshold={cfg.threshold:.2f}, "
+                f"motion={cfg.require_motion}, open_eyes={cfg.require_open_eyes})."
+            )
+        except Exception as exc:
+            self.status_var.set(f"Failed to save service settings: {exc}")
+
+    def _on_threshold_changed(self, _event: Any = None) -> None:
+        thresh = round(self._get_match_threshold(), 2)
+        self.threshold_var.set(thresh)
+        self._save_service_settings()
+
     def _on_motion_toggle(self) -> None:
         self._motion_tracker.reset()
+        self._save_service_settings()
+
+    def _on_open_eyes_toggle(self) -> None:
+        self._save_service_settings()
 
     def _on_toggle_preview(self) -> None:
         if not self._preview_enabled:
