@@ -7,8 +7,40 @@
 #include <shlguid.h>
 #include <shlwapi.h>
 
+#include <new>
+
 namespace
 {
+
+struct AutoScanWatcherContext
+{
+    WinIRFaceIDProvider* provider = nullptr;
+    WinIRFaceIDCredential* cred = nullptr;
+    HANDLE stopEvent = nullptr;
+    CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus = CPUS_INVALID;
+};
+
+bool IsLogonUIForeground()
+{
+    HWND fg = GetForegroundWindow();
+    if (fg == nullptr)
+    {
+        return false;
+    }
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    return fgPid == GetCurrentProcessId();
+}
+
+DWORD GetLastInputTick32()
+{
+    LASTINPUTINFO lii{ sizeof(lii), 0 };
+    if (!GetLastInputInfo(&lii))
+    {
+        return 0;
+    }
+    return lii.dwTime;
+}
 
 struct FieldDescTemplate
 {
@@ -64,6 +96,7 @@ WinIRFaceIDProvider::WinIRFaceIDProvider()
 
 WinIRFaceIDProvider::~WinIRFaceIDProvider()
 {
+    StopAutoScanWatcher();
     ClearCredentials();
     if (_pEvents != nullptr)
     {
@@ -74,12 +107,42 @@ WinIRFaceIDProvider::~WinIRFaceIDProvider()
     DllRelease();
 }
 
+void WinIRFaceIDProvider::StopAutoScanWatcher()
+{
+    HANDLE stopEvent = nullptr;
+    HANDLE thread = nullptr;
+
+    EnterCriticalSection(&_cs);
+    stopEvent = _autoScanStopEvent;
+    _autoScanStopEvent = nullptr;
+    thread = _autoScanThread;
+    _autoScanThread = nullptr;
+    LeaveCriticalSection(&_cs);
+
+    if (stopEvent != nullptr)
+    {
+        SetEvent(stopEvent);
+    }
+    if (thread != nullptr)
+    {
+        WaitForSingleObject(thread, 2000);
+        CloseHandle(thread);
+    }
+    if (stopEvent != nullptr)
+    {
+        CloseHandle(stopEvent);
+    }
+}
+
 void WinIRFaceIDProvider::ClearCredentials()
 {
+    StopAutoScanWatcher();
+
     std::vector<WinIRFaceIDCredential*> toRelease;
     EnterCriticalSection(&_cs);
     toRelease.swap(_credentials);
     _autoScanTriggered = false;
+    _unlockArmed = false;
     LeaveCriticalSection(&_cs);
 
     for (WinIRFaceIDCredential* cred : toRelease)
@@ -92,28 +155,232 @@ void WinIRFaceIDProvider::ClearCredentials()
     }
 }
 
+bool WinIRFaceIDProvider::ShouldDeferInitialUnlockScan()
+{
+    EnterCriticalSection(&_cs);
+    const CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus = _cpus;
+    const bool armed = _unlockArmed;
+    const ULONGLONG adviseTickMs = _adviseTickMs;
+    LeaveCriticalSection(&_cs);
+
+    if (cpus != CPUS_UNLOCK_WORKSTATION || armed)
+    {
+        return false;
+    }
+    if (!IsLogonUIForeground())
+    {
+        return true;
+    }
+    return (GetTickCount64() - adviseTickMs) < 1800ULL;
+}
+
+DWORD WINAPI WinIRFaceIDProvider::AutoScanWatcherThreadProc(LPVOID param)
+{
+    auto* ctx = static_cast<AutoScanWatcherContext*>(param);
+    if (ctx != nullptr)
+    {
+        WinIRFaceIDProvider* provider = ctx->provider;
+        WinIRFaceIDCredential* cred = ctx->cred;
+        HANDLE stopEvent = ctx->stopEvent;
+        const CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus = ctx->cpus;
+        delete ctx;
+
+        if (provider != nullptr && cred != nullptr && stopEvent != nullptr)
+        {
+            provider->RunAutoScanWatcher(cred, stopEvent, cpus);
+        }
+        if (stopEvent != nullptr)
+        {
+            CloseHandle(stopEvent);
+        }
+        if (cred != nullptr)
+        {
+            cred->Release();
+        }
+        if (provider != nullptr)
+        {
+            provider->Release();
+        }
+    }
+    return 0;
+}
+
+void WinIRFaceIDProvider::RunAutoScanWatcher(
+    WinIRFaceIDCredential* targetCred,
+    HANDLE stopEvent,
+    CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus)
+{
+    if (cpus == CPUS_LOGON)
+    {
+        while (WaitForSingleObject(stopEvent, 0) == WAIT_TIMEOUT)
+        {
+            if (IsLogonUIForeground())
+            {
+                EnterCriticalSection(&_cs);
+                _unlockArmed = true;
+                LeaveCriticalSection(&_cs);
+
+                if (!targetCred->HasVerifiedCredential())
+                {
+                    targetCred->StartScan();
+                }
+                break;
+            }
+            if (WaitForSingleObject(stopEvent, 150) != WAIT_TIMEOUT)
+            {
+                break;
+            }
+        }
+        return;
+    }
+
+    if (cpus == CPUS_UNLOCK_WORKSTATION)
+    {
+        const DWORD lockTick32 = GetTickCount();
+        DWORD baselineInput32 = GetLastInputTick32();
+        bool sawCurtain = !IsLogonUIForeground();
+
+        while (WaitForSingleObject(stopEvent, 150) == WAIT_TIMEOUT)
+        {
+            const DWORD now32 = GetTickCount();
+            const DWORD elapsed = now32 - lockTick32;
+            const bool fgNow = IsLogonUIForeground();
+
+            if (elapsed < 1200)
+            {
+                // Absorb Win + L key-up and hand-leaving-mouse jitter during initial lock transition.
+                baselineInput32 = GetLastInputTick32();
+                if (!fgNow)
+                {
+                    sawCurtain = true;
+                }
+                continue;
+            }
+
+            if (!fgNow)
+            {
+                // Still behind the LockApp curtain; keep IR LED 100% off.
+                sawCurtain = true;
+                continue;
+            }
+
+            // Trigger A: LockApp curtain was active and has now been dismissed.
+            if (sawCurtain && fgNow)
+            {
+                EnterCriticalSection(&_cs);
+                _unlockArmed = true;
+                LeaveCriticalSection(&_cs);
+
+                if (!targetCred->HasVerifiedCredential())
+                {
+                    targetCred->StartScan();
+                }
+                break;
+            }
+
+            // Trigger B: NoLockScreen=1 or Lock UI without separate LockApp process —
+            // arm once new user input arrives after the lock grace window.
+            if (fgNow && elapsed >= 2000)
+            {
+                const DWORD currInput = GetLastInputTick32();
+                const DWORD inputDelta = currInput - lockTick32;
+                if (currInput != 0 &&
+                    currInput != baselineInput32 &&
+                    inputDelta < 0x80000000UL &&
+                    inputDelta >= 1500)
+                {
+                    EnterCriticalSection(&_cs);
+                    _unlockArmed = true;
+                    LeaveCriticalSection(&_cs);
+
+                    if (!targetCred->HasVerifiedCredential())
+                    {
+                        targetCred->StartScan();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
 void WinIRFaceIDProvider::MaybeStartBackgroundAutoScan()
 {
-    WinIRFaceIDCredential* targetCred = nullptr;
+    HANDLE stopEvent = nullptr;
+    HANDLE threadStopEvent = nullptr;
+    AutoScanWatcherContext* ctx = nullptr;
 
     EnterCriticalSection(&_cs);
-    if (_pEvents != nullptr && !_autoScanTriggered && _credentials.size() == 1)
+    if (_pEvents != nullptr && !_autoScanTriggered && _credentials.size() == 1 &&
+        _autoScanThread == nullptr && _autoScanStopEvent == nullptr)
     {
-        targetCred = _credentials[0];
+        WinIRFaceIDCredential* targetCred = _credentials[0];
+        const CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus = _cpus;
         if (targetCred != nullptr)
         {
-            targetCred->AddRef();
-            _autoScanTriggered = true;
+            stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (stopEvent != nullptr)
+            {
+                if (!DuplicateHandle(
+                        GetCurrentProcess(),
+                        stopEvent,
+                        GetCurrentProcess(),
+                        &threadStopEvent,
+                        0,
+                        FALSE,
+                        DUPLICATE_SAME_ACCESS))
+                {
+                    threadStopEvent = nullptr;
+                }
+            }
+
+            if (stopEvent != nullptr && threadStopEvent != nullptr)
+            {
+                ctx = new (std::nothrow) AutoScanWatcherContext{};
+                if (ctx != nullptr)
+                {
+                    AddRef();
+                    targetCred->AddRef();
+                    ctx->provider = this;
+                    ctx->cred = targetCred;
+                    ctx->stopEvent = threadStopEvent;
+                    ctx->cpus = cpus;
+
+                    HANDLE hThread = CreateThread(nullptr, 0, AutoScanWatcherThreadProc, ctx, 0, nullptr);
+                    if (hThread != nullptr)
+                    {
+                        _autoScanStopEvent = stopEvent;
+                        _autoScanThread = hThread;
+                        _autoScanTriggered = true;
+                        stopEvent = nullptr;
+                        threadStopEvent = nullptr;
+                        ctx = nullptr;
+                    }
+                }
+            }
         }
     }
     LeaveCriticalSection(&_cs);
 
-    if (targetCred != nullptr)
+    if (ctx != nullptr)
     {
-        // Mimic native Windows Hello Fingerprint by scanning in the background
-        // immediately on lock screen activation even while PIN is selected.
-        targetCred->StartScan();
-        targetCred->Release();
+        if (ctx->cred != nullptr)
+        {
+            ctx->cred->Release();
+        }
+        if (ctx->provider != nullptr)
+        {
+            ctx->provider->Release();
+        }
+        delete ctx;
+    }
+    if (threadStopEvent != nullptr)
+    {
+        CloseHandle(threadStopEvent);
+    }
+    if (stopEvent != nullptr)
+    {
+        CloseHandle(stopEvent);
     }
 }
 
@@ -174,6 +441,11 @@ IFACEMETHODIMP WinIRFaceIDProvider::Advise(
     ICredentialProviderEvents* pcpe,
     UINT_PTR upAdviseContext)
 {
+    if (pcpe == nullptr)
+    {
+        StopAutoScanWatcher();
+    }
+
     EnterCriticalSection(&_cs);
     if (_pEvents != nullptr)
     {
@@ -186,6 +458,8 @@ IFACEMETHODIMP WinIRFaceIDProvider::Advise(
         _pEvents->AddRef();
     }
     _upAdviseContext = upAdviseContext;
+    _adviseTickMs = GetTickCount64();
+    _unlockArmed = false;
     LeaveCriticalSection(&_cs);
 
     if (pcpe != nullptr)
@@ -197,6 +471,8 @@ IFACEMETHODIMP WinIRFaceIDProvider::Advise(
 
 IFACEMETHODIMP WinIRFaceIDProvider::UnAdvise()
 {
+    StopAutoScanWatcher();
+
     std::vector<WinIRFaceIDCredential*> snapshot;
 
     EnterCriticalSection(&_cs);
@@ -207,6 +483,7 @@ IFACEMETHODIMP WinIRFaceIDProvider::UnAdvise()
     }
     _upAdviseContext = 0;
     _autoScanTriggered = false;
+    _unlockArmed = false;
     snapshot = _credentials;
     for (WinIRFaceIDCredential* cred : snapshot)
     {

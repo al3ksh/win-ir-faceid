@@ -21,6 +21,7 @@ constexpr wchar_t kStatusRecognized[] = L"Welcome back!";
 constexpr wchar_t kStatusFailed[] = L"Couldn't recognize you - try again or use Fingerprint / PIN";
 constexpr wchar_t kStatusNoPassword[] = L"Face recognized, but no saved credential - use Fingerprint or PIN";
 constexpr wchar_t kStatusSignInFailed[] = L"Sign-in failed - use Fingerprint or PIN";
+constexpr wchar_t kStatusReadyDeferred[] = L"Ready - move mouse or press key to scan";
 
 std::wstring GetLocalComputerNetbiosName()
 {
@@ -544,6 +545,7 @@ IFACEMETHODIMP_(ULONG) WinIRFaceIDCredential::Release()
 IFACEMETHODIMP WinIRFaceIDCredential::Advise(ICredentialProviderCredentialEvents* pcpce)
 {
     bool shouldStart = false;
+    WinIRFaceIDProvider* provider = nullptr;
 
     EnterCriticalSection(&_cs);
     if (_pCredEvents != nullptr)
@@ -557,11 +559,28 @@ IFACEMETHODIMP WinIRFaceIDCredential::Advise(ICredentialProviderCredentialEvents
         _pCredEvents->AddRef();
     }
     shouldStart = _selected && !_scanning && !_hasVerifiedCred;
+    if (shouldStart && _pProvider != nullptr)
+    {
+        provider = _pProvider;
+        provider->AddRef();
+    }
     LeaveCriticalSection(&_cs);
 
     if (shouldStart)
     {
-        StartScan();
+        if (provider != nullptr && provider->ShouldDeferInitialUnlockScan())
+        {
+            UpdateStatusText(kStatusReadyDeferred, true);
+        }
+        else
+        {
+            StartScan();
+        }
+    }
+
+    if (provider != nullptr)
+    {
+        provider->Release();
     }
     return S_OK;
 }
@@ -589,10 +608,16 @@ IFACEMETHODIMP WinIRFaceIDCredential::SetSelected(BOOL* pbAutoLogon)
         return E_POINTER;
     }
 
+    WinIRFaceIDProvider* provider = nullptr;
     EnterCriticalSection(&_cs);
     _selected = true;
     const bool alreadyVerified = _hasVerifiedCred && !_verifiedPassword.empty() && !_verifiedUsername.empty();
     const bool alreadyScanning = _scanning;
+    if (!alreadyVerified && !alreadyScanning && _pProvider != nullptr)
+    {
+        provider = _pProvider;
+        provider->AddRef();
+    }
     LeaveCriticalSection(&_cs);
 
     if (alreadyVerified)
@@ -604,7 +629,19 @@ IFACEMETHODIMP WinIRFaceIDCredential::SetSelected(BOOL* pbAutoLogon)
     *pbAutoLogon = FALSE;
     if (!alreadyScanning)
     {
-        StartScan();
+        if (provider != nullptr && provider->ShouldDeferInitialUnlockScan())
+        {
+            UpdateStatusText(kStatusReadyDeferred, true);
+        }
+        else
+        {
+            StartScan();
+        }
+    }
+
+    if (provider != nullptr)
+    {
+        provider->Release();
     }
     return S_OK;
 }

@@ -45,11 +45,18 @@ public:
 
     // Called by child credentials when face verification produces valid logon data.
     void NotifyCredentialsChanged();
+    bool ShouldDeferInitialUnlockScan();
 
 private:
     ~WinIRFaceIDProvider();
     void ClearCredentials();
     void MaybeStartBackgroundAutoScan();
+    void StopAutoScanWatcher();
+    static DWORD WINAPI AutoScanWatcherThreadProc(LPVOID param);
+    void RunAutoScanWatcher(
+        WinIRFaceIDCredential* targetCred,
+        HANDLE stopEvent,
+        CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus);
 
     LONG _refCount = 1;
     CRITICAL_SECTION _cs{};
@@ -57,5 +64,9 @@ private:
     ICredentialProviderEvents* _pEvents = nullptr;
     UINT_PTR _upAdviseContext = 0;
     bool _autoScanTriggered = false;
+    ULONGLONG _adviseTickMs = 0;
+    bool _unlockArmed = false;
+    HANDLE _autoScanStopEvent = nullptr;
+    HANDLE _autoScanThread = nullptr;
     std::vector<WinIRFaceIDCredential*> _credentials;
 };
