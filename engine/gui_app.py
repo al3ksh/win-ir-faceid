@@ -65,6 +65,17 @@ _DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 _DWMWA_CAPTION_COLOR = 35
 _COLORREF_CANVAS = 0x000E0C0B  # #0b0c0e in 0x00BBGGRR
 
+_IMAGE_ICON = 1
+_LR_LOADFROMFILE = 0x0010
+_WM_SETICON = 0x0080
+_ICON_SMALL = 0
+_ICON_BIG = 1
+_SM_CXICON = 11
+_SM_CYICON = 12
+_SM_CXSMICON = 49
+_SM_CYSMICON = 50
+_APP_USER_MODEL_ID = "WinIRFaceID.Desktop.App"
+
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
@@ -145,19 +156,85 @@ def restart_service_uac(service_name: str = SERVICE_NAME) -> dict[str, Any]:
     }
 
 
-def _apply_dark_title_bar(window: Any) -> None:
-    """Apply native Windows 11 dark title bar and caption color via DwmSetWindowAttribute."""
+def _get_window_hwnd(window: Any) -> int:
+    """Extract the native Win32 HWND integer from a pywebview window, or 0 if unavailable."""
     try:
         native = getattr(window, "native", None)
         handle = getattr(native, "Handle", None)
         if handle is None:
-            return
+            return 0
         if hasattr(handle, "ToInt64"):
-            hwnd = int(handle.ToInt64())
-        elif hasattr(handle, "ToInt32"):
-            hwnd = int(handle.ToInt32())
-        else:
-            hwnd = int(handle)
+            return int(handle.ToInt64())
+        if hasattr(handle, "ToInt32"):
+            return int(handle.ToInt32())
+        return int(handle)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _configure_user32_icon_api(user32: Any) -> None:
+    """Configure 64-bit-safe ctypes signatures for Win32 icon APIs."""
+    user32.LoadImageW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.LoadImageW.restype = ctypes.c_void_p
+    user32.SendMessageW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+    user32.DestroyIcon.restype = ctypes.c_int
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+
+
+def _load_hicon(icon_path: str | Path, width: int, height: int) -> int | None:
+    """Load an .ico file at the requested pixel dimensions via Win32 LoadImageW."""
+    path_str = str(icon_path)
+    if not path_str:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        _configure_user32_icon_api(user32)
+        handle = user32.LoadImageW(
+            None,
+            path_str,
+            _IMAGE_ICON,
+            int(width),
+            int(height),
+            _LR_LOADFROMFILE,
+        )
+        return int(handle) if handle else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LoadImageW failed for %s (%dx%d): %s", path_str, width, height, exc)
+        return None
+
+
+def _destroy_hicon(hicon: int | None) -> bool:
+    """Destroy a Win32 HICON handle previously loaded via _load_hicon."""
+    if not hicon:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        _configure_user32_icon_api(user32)
+        return bool(user32.DestroyIcon(ctypes.c_void_p(int(hicon))))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("DestroyIcon failed for %s: %s", hicon, exc)
+        return False
+
+
+def _apply_dark_title_bar(window: Any) -> None:
+    """Apply native Windows 11 dark title bar and caption color via DwmSetWindowAttribute."""
+    try:
+        hwnd = _get_window_hwnd(window)
         if not hwnd:
             return
 
@@ -182,26 +259,85 @@ def _apply_dark_title_bar(window: Any) -> None:
         logger.debug("Dark title bar setup skipped: %s", exc)
 
 
+def _apply_window_icon(window: Any, icon_path: str | None) -> list[int]:
+    """Apply the app .ico to the Win32 titlebar, Alt+Tab switcher, and taskbar.
+
+    Returns the list of loaded HICON handles so the caller keeps them alive
+    until the window closes.
+    """
+    loaded_handles: list[int] = []
+    if not icon_path:
+        return loaded_handles
+
+    try:
+        hwnd = _get_window_hwnd(window)
+        if hwnd:
+            user32 = ctypes.windll.user32
+            _configure_user32_icon_api(user32)
+
+            sm_cx = user32.GetSystemMetrics(_SM_CXSMICON) or 16
+            sm_cy = user32.GetSystemMetrics(_SM_CYSMICON) or 16
+            big_cx = user32.GetSystemMetrics(_SM_CXICON) or 32
+            big_cy = user32.GetSystemMetrics(_SM_CYICON) or 32
+
+            small_hicon = _load_hicon(icon_path, sm_cx, sm_cy)
+            if small_hicon:
+                user32.SendMessageW(
+                    ctypes.c_void_p(hwnd),
+                    _WM_SETICON,
+                    _ICON_SMALL,
+                    ctypes.c_void_p(small_hicon),
+                )
+                loaded_handles.append(small_hicon)
+
+            big_hicon = _load_hicon(icon_path, big_cx, big_cy)
+            if big_hicon:
+                user32.SendMessageW(
+                    ctypes.c_void_p(hwnd),
+                    _WM_SETICON,
+                    _ICON_BIG,
+                    ctypes.c_void_p(big_hicon),
+                )
+                loaded_handles.append(big_hicon)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Win32 WM_SETICON setup skipped: %s", exc)
+
+    # Extra WinForms safeguard when window.native is a .NET Form
+    try:
+        native = getattr(window, "native", None)
+        if native is not None and hasattr(native, "Icon"):
+            import System  # type: ignore[import-not-found]
+            import System.Drawing  # type: ignore[import-not-found]
+
+            dotnet_icon = System.Drawing.Icon(str(icon_path))
+
+            def _set_form_icon() -> None:
+                native.Icon = dotnet_icon
+
+            if getattr(native, "InvokeRequired", False) and hasattr(native, "Invoke"):
+                native.Invoke(System.Action(_set_form_icon))
+            else:
+                _set_form_icon()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("WinForms Icon setup skipped: %s", exc)
+
+    return loaded_handles
+
+
 def _resolve_window_icon_path() -> str | None:
-    """Return a valid .ico path for pywebview if available or convertible via Pillow."""
-    repo_root = Path(__file__).resolve().parent.parent
-    png_path = repo_root / "credential_provider" / "assets" / "ir_faceid_icon.png"
+    """Return engine/ui/app.ico, generating it if it does not exist yet."""
     ico_path = Path(__file__).resolve().parent / "ui" / "app.ico"
     if ico_path.is_file():
         return str(ico_path)
-    if not png_path.is_file():
-        return None
     try:
-        from PIL import Image
+        from engine.ui.generate_app_icon import generate_app_icon
 
-        with Image.open(png_path) as img:
-            rgba = img.convert("RGBA")
-            ico_path.parent.mkdir(parents=True, exist_ok=True)
-            rgba.save(ico_path, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
-        return str(ico_path)
+        generated = generate_app_icon(ico_path)
+        if generated.is_file():
+            return str(generated)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Icon conversion skipped: %s", exc)
-        return None
+        logger.debug("App icon generation skipped: %s", exc)
+    return None
 
 
 class _LocalUIServer(ThreadingHTTPServer):
@@ -294,11 +430,13 @@ class _LocalUIHandler(BaseHTTPRequestHandler):
 
         # Serve static UI files from engine/ui/
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
+        if rel == "favicon.ico":
+            rel = "app.ico"
         if "/" in rel or "\\" in rel or ".." in rel:
             self._send_json(404, {"error": "not_found"})
             return
 
-        allowed = {"index.html", "style.css", "app.js"}
+        allowed = {"index.html", "style.css", "app.js", "app.ico"}
         if rel not in allowed:
             self._send_json(404, {"error": "not_found"})
             return
@@ -315,6 +453,8 @@ class _LocalUIHandler(BaseHTTPRequestHandler):
             ctype = "text/css; charset=utf-8"
         elif rel.endswith(".html"):
             ctype = "text/html; charset=utf-8"
+        elif rel.endswith(".ico"):
+            ctype = "image/x-icon"
         else:
             ctype = ctype or "application/octet-stream"
 
@@ -1309,24 +1449,37 @@ def main() -> None:
     """Launch the minimalist Edge WebView2 desktop window for WinIRFaceID."""
     import webview
 
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_APP_USER_MODEL_ID)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("SetCurrentProcessExplicitAppUserModelID skipped: %s", exc)
+
     controller = WinIRFaceIDController()
     bridge = _JsApiBridge(controller)
     icon_path = _resolve_window_icon_path()
+    icon_handles: list[int] = []
 
     window = webview.create_window(
         "WinIRFaceID",
         url=controller.ui_url,
         js_api=bridge,
-        width=1000,
-        height=640,
-        min_size=(880, 560),
+        width=1060,
+        height=740,
+        min_size=(920, 680),
         background_color="#0b0c0e",
     )
 
+    def _cleanup_icons() -> None:
+        while icon_handles:
+            _destroy_hicon(icon_handles.pop())
+
     def _on_shown() -> None:
         _apply_dark_title_bar(window)
+        if icon_path:
+            icon_handles.extend(_apply_window_icon(window, icon_path))
 
     def _on_closed() -> None:
+        _cleanup_icons()
         controller.shutdown()
 
     if window is not None:
@@ -1339,6 +1492,7 @@ def main() -> None:
         except Exception:
             webview.start(icon=icon_path)
     finally:
+        _cleanup_icons()
         controller.shutdown()
 
 

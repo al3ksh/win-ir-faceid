@@ -567,10 +567,10 @@ button:disabled {
 }
 
 .settings-section {
-  padding: 20px;
+  padding: 16px 20px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 11px;
 }
 
 .settings-section + .settings-section {
