@@ -1337,11 +1337,17 @@ def test_winrt_persistent_loop_reuses_single_thread() -> None:
         assert name == "WinRT-AsyncLoop"
 
 
-def test_gui_app_controller_headless_http_security_and_lifecycle(tmp_path: Path) -> None:
+def test_gui_app_controller_headless_http_security_and_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import urllib.error
     import urllib.request
 
+    import engine.gui_app as gui_app_mod
     from engine.gui_app import WinIRFaceIDController
+
+    monkeypatch.setattr(gui_app_mod, "_ENROLL_MIN_INTERVAL", 0.02)
 
     store = ProfileStore(tmp_path / "profiles.enc")
     alice_vec = np.zeros(128, dtype=np.float32)
