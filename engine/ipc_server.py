@@ -19,8 +19,8 @@ import win32security
 import winerror
 
 from engine import __version__
-from engine.liveness import check_ir_liveness
-from engine.recognizer import FaceRecognizer, enhance_ir_bgr
+from engine.liveness import TemporalLivenessTracker, check_ir_liveness
+from engine.recognizer import DEFAULT_MATCH_THRESHOLD, FaceRecognizer, enhance_ir_bgr
 from engine.store import ProfileStore, UserProfile
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 PIPE_NAME = r"\\.\pipe\WinIRFaceID"
 MAX_MESSAGE_BYTES = 65536
 DEFAULT_TIMEOUT_MS = 8000
-DEFAULT_THRESHOLD = 0.42
+DEFAULT_THRESHOLD = DEFAULT_MATCH_THRESHOLD
 DEFAULT_REQUIRED_CONSECUTIVE = 2
 
 
@@ -62,7 +62,7 @@ def build_pipe_security_attributes(service_mode: bool = False) -> pywintypes.SEC
 
 
 def _select_camera(cameras: list[Any]) -> Any | None:
-    """Pick the best camera descriptor (real IR first, then any IR, then real RGB)."""
+    """Pick the best IR camera descriptor (real IR first, then any IR; never RGB)."""
     if not cameras:
         return None
     for cam in cameras:
@@ -71,10 +71,7 @@ def _select_camera(cameras: list[Any]) -> Any | None:
     for cam in cameras:
         if getattr(cam, "is_ir", False):
             return cam
-    for cam in cameras:
-        if not getattr(cam, "is_virtual", False):
-            return cam
-    return cameras[0]
+    return None
 
 
 class IRFaceVerifier:
@@ -89,6 +86,7 @@ class IRFaceVerifier:
         required_consecutive: int = DEFAULT_REQUIRED_CONSECUTIVE,
         min_liveness_delta: float = 12.0,
         min_liveness_ratio: float = 1.30,
+        require_motion: bool = False,
         camera_discoverer: Callable[[], list[Any]] | None = None,
         worker_factory: Callable[..., Any] | None = None,
     ) -> None:
@@ -98,6 +96,7 @@ class IRFaceVerifier:
         self.required_consecutive = max(1, int(required_consecutive))
         self.min_liveness_delta = min_liveness_delta
         self.min_liveness_ratio = min_liveness_ratio
+        self.require_motion = bool(require_motion)
         self._camera_discoverer = camera_discoverer
         self._worker_factory = worker_factory
 
@@ -170,6 +169,7 @@ class IRFaceVerifier:
         last_timestamp: float | None = None
         consecutive_user: str | None = None
         consecutive_count = 0
+        motion_tracker = TemporalLivenessTracker() if self.require_motion else None
 
         try:
             worker.start()
@@ -229,6 +229,18 @@ class IRFaceVerifier:
                     consecutive_user = None
                     consecutive_count = 0
                     continue
+
+                if motion_tracker is not None:
+                    motion_frame = pair.diff_bgr if pair.dark_bgr is not None else pair.bright_bgr
+                    motion_ok, _motion_reason = motion_tracker.update(
+                        motion_frame,
+                        det,
+                        timestamp=pair.timestamp,
+                    )
+                    if not motion_ok:
+                        consecutive_user = None
+                        consecutive_count = 0
+                        continue
 
                 emb = recognizer.extract_embedding(eval_frame, det)
 

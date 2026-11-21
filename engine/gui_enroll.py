@@ -13,9 +13,14 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from engine.liveness import LivenessResult, check_ir_liveness
+from engine.liveness import LivenessResult, TemporalLivenessTracker, check_ir_liveness
 from engine.models import ensure_models, models_exist
-from engine.recognizer import FaceDetection, FaceRecognizer, enhance_ir_bgr
+from engine.recognizer import (
+    DEFAULT_MATCH_THRESHOLD,
+    FaceDetection,
+    FaceRecognizer,
+    enhance_ir_bgr,
+)
 from engine.store import ProfileStore
 
 
@@ -176,8 +181,8 @@ class IREnrollmentApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("WinIRFaceID - IR Face Enrollment & Live Tester")
-        self.geometry("1040x700")
-        self.minsize(920, 620)
+        self.geometry("1140x720")
+        self.minsize(960, 620)
         self.configure(bg=_BG_MAIN)
 
         self.store = ProfileStore()
@@ -194,12 +199,15 @@ class IREnrollmentApp(tk.Tk):
         self._last_enroll_capture_ts = 0.0
         self._last_processed_pair_ts: float | None = None
         self._downloading_models = False
+        self._motion_tracker = TemporalLivenessTracker()
 
         self.username_var = tk.StringVar(value=os.environ.get("USERNAME", "User"))
         self.feed_mode_var = tk.StringVar(value="IR - Ambient")
         self.camera_var = tk.StringVar(value="")
+        self.threshold_var = tk.DoubleVar(value=DEFAULT_MATCH_THRESHOLD)
+        self.require_motion_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Initializing...")
-        self.liveness_var = tk.StringVar(value="IR Δ: --  |  Ratio: --")
+        self.liveness_var = tk.StringVar(value="IR Δ: --  |  BG: --  |  3D: --  |  --")
         self.match_var = tk.StringVar(value="Match: Idle")
         self.ae_var = tk.StringVar(value="AE Status: Normal")
         self.prompt_var = tk.StringVar(value="Ready to enroll or test live IR matching.")
@@ -309,7 +317,7 @@ class IREnrollmentApp(tk.Tk):
             textvariable=self.liveness_var,
             bg=_BG_CARD,
             fg=_FG_PRIMARY,
-            font=("Consolas", 10, "bold"),
+            font=("Consolas", 9, "bold"),
         ).pack(side="left")
 
         self.match_label = tk.Label(
@@ -317,7 +325,7 @@ class IREnrollmentApp(tk.Tk):
             textvariable=self.match_var,
             bg=_BG_CARD,
             fg=_ACCENT_BLUE,
-            font=("Consolas", 10, "bold"),
+            font=("Consolas", 9, "bold"),
         )
         self.match_label.pack(side="right")
 
@@ -354,7 +362,50 @@ class IREnrollmentApp(tk.Tk):
             relief="flat",
             font=("Segoe UI", 10),
         )
-        user_entry.pack(fill="x", pady=(4, 12), ipady=5)
+        user_entry.pack(fill="x", pady=(4, 10), ipady=5)
+
+        thresh_row = tk.Frame(right, bg=_BG_PANEL)
+        thresh_row.pack(fill="x", pady=(0, 6))
+
+        tk.Label(
+            thresh_row,
+            text="Match Threshold (0.45-0.85):",
+            bg=_BG_PANEL,
+            fg=_FG_MUTED,
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+
+        self.threshold_spin = tk.Spinbox(
+            thresh_row,
+            from_=0.45,
+            to=0.85,
+            increment=0.01,
+            format="%.2f",
+            textvariable=self.threshold_var,
+            width=6,
+            bg=_BG_CARD,
+            fg=_FG_PRIMARY,
+            buttonbackground=_BG_CARD,
+            insertbackground=_FG_PRIMARY,
+            relief="flat",
+            font=("Consolas", 9, "bold"),
+        )
+        self.threshold_spin.pack(side="right")
+
+        self.motion_check = tk.Checkbutton(
+            right,
+            text="Require Blink / 3D Motion",
+            variable=self.require_motion_var,
+            command=self._on_motion_toggle,
+            bg=_BG_PANEL,
+            fg=_FG_PRIMARY,
+            selectcolor=_BG_CARD,
+            activebackground=_BG_PANEL,
+            activeforeground=_FG_PRIMARY,
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        self.motion_check.pack(fill="x", pady=(0, 10))
 
         self.btn_enroll = tk.Button(
             right,
@@ -440,7 +491,7 @@ class IREnrollmentApp(tk.Tk):
             selectforeground="white",
             relief="flat",
             font=("Consolas", 9),
-            height=10,
+            height=6,
         )
         self.profile_list.pack(fill="both", expand=True)
         self.profile_list.bind("<<ListboxSelect>>", self._on_profile_selected)
@@ -489,8 +540,18 @@ class IREnrollmentApp(tk.Tk):
             for c in self.cameras
         ]
         self.cam_combo["values"] = labels
-        self.cam_combo.current(0)
-        self._start_camera_by_index(0)
+        default_idx = 0
+        for idx, c in enumerate(self.cameras):
+            if getattr(c, "is_ir", False) and not getattr(c, "is_virtual", False):
+                default_idx = idx
+                break
+        else:
+            for idx, c in enumerate(self.cameras):
+                if getattr(c, "is_ir", False):
+                    default_idx = idx
+                    break
+        self.cam_combo.current(default_idx)
+        self._start_camera_by_index(default_idx)
 
     def _stop_worker(self) -> None:
         if self.worker is not None:
@@ -615,23 +676,46 @@ class IREnrollmentApp(tk.Tk):
         self.prompt_var.set(_POSE_PROMPTS[0])
         self.status_var.set(f"Enrolling '{username}'...")
 
+    def _get_match_threshold(self) -> float:
+        try:
+            val = float(self.threshold_var.get())
+        except (tk.TclError, ValueError):
+            val = DEFAULT_MATCH_THRESHOLD
+        return max(0.45, min(0.85, val))
+
+    def _on_motion_toggle(self) -> None:
+        self._motion_tracker.reset()
+
     def _on_toggle_live_match(self) -> None:
-        if not self._try_load_recognizer():
-            messagebox.showwarning(
-                "Models Required",
-                "Please download the YuNet and SFace models first.",
-                parent=self,
-            )
-            return
+        if not self._live_match_enabled:
+            if not self._try_load_recognizer():
+                messagebox.showwarning(
+                    "Models Required",
+                    "Please download the YuNet and SFace models first.",
+                    parent=self,
+                )
+                return
+            if not self.current_cam_is_ir:
+                messagebox.showwarning(
+                    "IR Camera Required",
+                    "Select an active IR camera before testing live match.",
+                    parent=self,
+                )
+                return
         self._enrolling = False
         self.btn_enroll.configure(text="Enroll User (8 Samples)")
+        self._motion_tracker.reset()
         self._live_match_enabled = not self._live_match_enabled
         if self._live_match_enabled:
             self.btn_live_test.configure(text="Stop Live Match")
-            self.prompt_var.set("Live IR match active — look at the IR camera.")
+            if self.require_motion_var.get():
+                self.prompt_var.set("Live IR match active — blink or slightly turn your head.")
+            else:
+                self.prompt_var.set("Live IR match active — look at the IR camera.")
         else:
             self.btn_live_test.configure(text="Test Live Match")
             self.match_var.set("Match: Idle")
+            self.match_label.configure(fg=_ACCENT_BLUE)
             self.prompt_var.set("Ready to enroll or test live IR matching.")
 
     def _on_set_password(self) -> None:
@@ -713,10 +797,13 @@ class IREnrollmentApp(tk.Tk):
                     self.ae_badge.configure(fg=_ACCENT_AMBER)
 
                 self.liveness_var.set(
-                    f"IR Δ: {liveness.delta:5.1f}  |  Ratio: {liveness.ratio:4.2f}  |  {liveness.reason}"
+                    f"IR Δ: {liveness.delta:5.1f}  |  BG: {liveness.bg_ratio:.2f}  |  "
+                    f"3D: {liveness.relief_3d:+.2f}  |  {liveness.reason}"
                 )
             else:
-                self.liveness_var.set("IR Δ: --  |  Ratio: --  |  No face")
+                self.liveness_var.set("IR Δ: --  |  BG: --  |  3D: --  |  No face")
+        elif not self.current_cam_is_ir:
+            self.liveness_var.set("IR Δ: --  |  BG: --  |  3D: --  |  Non-IR camera")
 
         # Handle enrollment sample capture on new IR pairs
         if (
@@ -752,20 +839,49 @@ class IREnrollmentApp(tk.Tk):
             and self.recognizer is not None
             and det is not None
         ):
+            thresh = self._get_match_threshold()
             emb = self.recognizer.extract_embedding(eval_src, det)
             best_user = ""
             best_score = 0.0
             for profile in self.store.list_users():
                 if not profile.embeddings:
                     continue
-                _, score = self.recognizer.match_against(emb, profile.embedding_arrays())
+                _, score = self.recognizer.match_against(
+                    emb,
+                    profile.embedding_arrays(),
+                    threshold=thresh,
+                )
                 if score > best_score:
                     best_score = score
                     best_user = profile.username
 
-            live_ok = True if not self.current_cam_is_ir else bool(liveness and liveness.passed)
-            if best_user and best_score >= 0.42 and live_ok:
-                self.match_var.set(f"Match: {best_user} ({best_score:.3f})")
+            live_ok = self.current_cam_is_ir and bool(liveness and liveness.passed)
+            motion_ok = True
+            motion_reason = ""
+            if live_ok and self.require_motion_var.get():
+                motion_src = (
+                    pair.diff_bgr if (pair is not None and pair.dark_bgr is not None) else eval_src
+                )
+                motion_ts = pair.timestamp if pair is not None else None
+                motion_ok, motion_reason = self._motion_tracker.update(
+                    motion_src,
+                    det,
+                    timestamp=motion_ts,
+                )
+
+            if not live_ok:
+                reason_tag = liveness.reason if liveness is not None else "no_ir"
+                if best_user:
+                    self.match_var.set(f"Match: No ({best_user}? {best_score:.3f}, {reason_tag})")
+                else:
+                    self.match_var.set(f"Match: Blocked ({reason_tag})")
+                self.match_label.configure(fg=_ACCENT_RED)
+            elif not motion_ok:
+                self.match_var.set("Match: Blink / move head (3D)")
+                self.match_label.configure(fg=_ACCENT_AMBER)
+            elif best_user and best_score >= thresh:
+                suffix = f", {motion_reason}" if motion_reason else ""
+                self.match_var.set(f"Match: {best_user} ({best_score:.3f}{suffix})")
                 self.match_label.configure(fg=_ACCENT_GREEN)
             elif best_user:
                 self.match_var.set(f"Match: No ({best_user}? {best_score:.3f})")

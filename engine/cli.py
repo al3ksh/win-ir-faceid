@@ -13,7 +13,7 @@ from typing import Sequence
 from engine import __version__
 from engine.liveness import check_ir_liveness
 from engine.models import ensure_models
-from engine.recognizer import FaceRecognizer, enhance_ir_bgr
+from engine.recognizer import DEFAULT_MATCH_THRESHOLD, FaceRecognizer, enhance_ir_bgr
 from engine.store import ProfileStore
 
 
@@ -30,16 +30,14 @@ _POSE_HINTS = (
 
 
 def _select_enrollment_camera(cameras: list) -> object | None:
+    """Select an active IR camera only (real IR first, then any IR; never RGB)."""
     for cam in cameras:
-        if cam.is_ir and not cam.is_virtual:
+        if getattr(cam, "is_ir", False) and not getattr(cam, "is_virtual", False):
             return cam
     for cam in cameras:
-        if cam.is_ir:
+        if getattr(cam, "is_ir", False):
             return cam
-    for cam in cameras:
-        if not cam.is_virtual:
-            return cam
-    return cameras[0] if cameras else None
+    return None
 
 
 def _cmd_download_models(args: argparse.Namespace) -> int:
@@ -164,7 +162,11 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
     ensure_models()
     store = ProfileStore()
-    verifier = IRFaceVerifier(store, threshold=args.threshold)
+    verifier = IRFaceVerifier(
+        store,
+        threshold=args.threshold,
+        require_motion=args.require_motion,
+    )
     result = verifier.verify(username=args.user or "", timeout_ms=args.timeout)
 
     if result.get("status") == "matched":
@@ -228,7 +230,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     ensure_models()
     store = ProfileStore(local_machine=args.service)
-    verifier = IRFaceVerifier(store, threshold=args.threshold)
+    verifier = IRFaceVerifier(
+        store,
+        threshold=args.threshold,
+        require_motion=args.require_motion,
+    )
     server = NamedPipeServer(
         pipe_name=args.pipe,
         store=store,
@@ -285,7 +291,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify = sub.add_parser("verify", help="Verify a live IR face against enrolled profiles")
     p_verify.add_argument("--user", default="", help="Optional username filter")
     p_verify.add_argument("--timeout", type=int, default=8000, help="Verification timeout in ms (default: 8000)")
-    p_verify.add_argument("--threshold", type=float, default=0.42, help="Cosine similarity threshold (default: 0.42)")
+    p_verify.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_MATCH_THRESHOLD,
+        help=f"Cosine similarity threshold (default: {DEFAULT_MATCH_THRESHOLD})",
+    )
+    p_verify.add_argument(
+        "--require-motion",
+        action="store_true",
+        help="Require live blink or 3D head micro-motion during verification",
+    )
     p_verify.set_defaults(func=_cmd_verify)
 
     p_pw = sub.add_parser("set-password", help="Store DPAPI-encrypted Windows logon password for a user")
@@ -303,7 +319,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("serve", help="Run the Named Pipe IPC server")
     p_serve.add_argument("--pipe", default=r"\\.\pipe\WinIRFaceID", help="Named pipe path")
     p_serve.add_argument("--service", action="store_true", help="Use LocalSystem pipe ACL and machine DPAPI store")
-    p_serve.add_argument("--threshold", type=float, default=0.42, help="Cosine similarity threshold (default: 0.42)")
+    p_serve.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_MATCH_THRESHOLD,
+        help=f"Cosine similarity threshold (default: {DEFAULT_MATCH_THRESHOLD})",
+    )
+    p_serve.add_argument(
+        "--require-motion",
+        action="store_true",
+        help="Require live blink or 3D head micro-motion during verification",
+    )
     p_serve.set_defaults(func=_cmd_serve)
 
     p_gui = sub.add_parser("gui", help="Launch the dark-mode IR Face ID Enrollment GUI")

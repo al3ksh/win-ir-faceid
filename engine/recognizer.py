@@ -12,6 +12,10 @@ import numpy as np
 from engine.models import get_model_paths
 
 
+DEFAULT_MATCH_THRESHOLD = 0.65
+DEFAULT_DET_SCORE_THRESHOLD = 0.78
+
+
 @dataclass(frozen=True)
 class FaceDetection:
     """Detected face bounding box, confidence score, 5-point landmarks, and raw YuNet row."""
@@ -71,7 +75,7 @@ class FaceRecognizer:
         yunet_path: str | Path | None = None,
         sface_path: str | Path | None = None,
         *,
-        score_threshold: float = 0.65,
+        score_threshold: float = DEFAULT_DET_SCORE_THRESHOLD,
         nms_threshold: float = 0.3,
         top_k: int = 5000,
     ) -> None:
@@ -156,7 +160,7 @@ class FaceRecognizer:
         cls,
         emb: np.ndarray,
         gallery: Sequence[np.ndarray | Sequence[float]],
-        threshold: float = 0.42,
+        threshold: float = DEFAULT_MATCH_THRESHOLD,
     ) -> tuple[bool, float]:
         """Match *emb* against a gallery of embeddings, returning ``(matched, best_score)``."""
         if not gallery:

@@ -19,15 +19,24 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from engine import __version__
+from engine.cli import _select_enrollment_camera
 from engine.ipc_server import (
+    DEFAULT_THRESHOLD,
     IRFaceVerifier,
     NamedPipeServer,
+    _select_camera,
     handle_raw_message,
     handle_request,
 )
-from engine.liveness import check_ir_liveness
+from engine.liveness import TemporalLivenessTracker, check_ir_liveness
 from engine.models import ModelPaths, get_model_paths, models_exist
-from engine.recognizer import FaceDetection, FaceRecognizer, enhance_ir_bgr
+from engine.recognizer import (
+    DEFAULT_DET_SCORE_THRESHOLD,
+    DEFAULT_MATCH_THRESHOLD,
+    FaceDetection,
+    FaceRecognizer,
+    enhance_ir_bgr,
+)
 from engine.store import ProfileStore
 
 
@@ -44,21 +53,36 @@ class DummyIRFramePair:
 
 def _make_pair(
     *,
-    face_bright: int = 130,
-    face_dark: int = 50,
-    bg_bright: int = 40,
-    bg_dark: int = 35,
+    face_bright: int = 180,
+    face_dark: int = 20,
+    bg_bright: int = 5,
+    bg_dark: int = 5,
+    shape: tuple[int, int] = (120, 120),
+    bbox: tuple[int, int, int, int] = (20, 20, 60, 60),
+    radial_shading: bool = True,
     bright_mean_override: float | None = None,
     illuminator_active: bool = True,
     with_dark: bool = True,
     timestamp: float = 1.0,
 ) -> DummyIRFramePair:
-    bright = np.full((120, 120, 3), bg_bright, dtype=np.uint8)
-    bright[20:80, 20:80] = face_bright
+    h_img, w_img = shape
+    x, y, w, h = bbox
+    bright = np.full((h_img, w_img, 3), bg_bright, dtype=np.uint8)
+
+    if radial_shading:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        nx = (xx - (w - 1) / 2.0) / max(w / 2.0, 1.0)
+        ny = (yy - (h - 1) / 2.0) / max(h / 2.0, 1.0)
+        r2 = np.clip(0.5 * (nx * nx + ny * ny), 0.0, 1.0)
+        shading = 1.0 - 0.70 * r2
+        face_b = np.clip(face_dark + (face_bright - face_dark) * shading, 0, 255).astype(np.uint8)
+        bright[y : y + h, x : x + w] = face_b[:, :, None]
+    else:
+        bright[y : y + h, x : x + w] = face_bright
 
     if with_dark:
-        dark = np.full((120, 120, 3), bg_dark, dtype=np.uint8)
-        dark[20:80, 20:80] = face_dark
+        dark = np.full((h_img, w_img, 3), bg_dark, dtype=np.uint8)
+        dark[y : y + h, x : x + w] = face_dark
         diff = np.clip(bright.astype(np.int16) - dark.astype(np.int16), 0, 255).astype(np.uint8)
         dark_mean = float(np.mean(dark))
     else:
@@ -84,17 +108,20 @@ def _make_pair(
 
 
 def test_liveness_passes_active_ir_skin_delta() -> None:
-    pair = _make_pair(face_bright=140, face_dark=45)
+    pair = _make_pair(face_bright=200, face_dark=30, bg_bright=5, bg_dark=5)
     res = check_ir_liveness(pair, (20, 20, 60, 60))
     assert res.passed is True
     assert res.reason == "ok"
-    assert res.delta == pytest.approx(95.0)
-    assert res.ratio == pytest.approx(140.0 / 45.0)
+    assert res.delta > 12.0
+    assert res.ratio > 1.30
+    assert res.bg_ratio < 0.10
+    assert res.relief_3d > 0.30
+    assert res.face_height_ratio == pytest.approx(0.50)
 
 
 def test_liveness_rejects_phone_screen_low_delta() -> None:
     # Phone OLED/LCD screen emits constant light with virtually no 850/940nm IR reflection delta
-    pair = _make_pair(face_bright=92, face_dark=88)
+    pair = _make_pair(face_bright=92, face_dark=88, radial_shading=False)
     res = check_ir_liveness(pair, (20, 20, 60, 60))
     assert res.passed is False
     assert res.reason == "low_ir_delta"
@@ -102,7 +129,7 @@ def test_liveness_rejects_phone_screen_low_delta() -> None:
 
 
 def test_liveness_rejects_low_ratio_under_high_ambient() -> None:
-    pair = _make_pair(face_bright=135, face_dark=115)
+    pair = _make_pair(face_bright=135, face_dark=115, radial_shading=False)
     res = check_ir_liveness(pair, (20, 20, 60, 60))
     assert res.passed is False
     assert res.reason == "low_ir_ratio"
@@ -111,7 +138,7 @@ def test_liveness_rejects_low_ratio_under_high_ambient() -> None:
 
 
 def test_liveness_rejects_flashbang_overexposure() -> None:
-    pair_face_hot = _make_pair(face_bright=248, face_dark=60, bright_mean_override=120.0)
+    pair_face_hot = _make_pair(face_bright=248, face_dark=60, radial_shading=False, bright_mean_override=120.0)
     res1 = check_ir_liveness(pair_face_hot, (20, 20, 60, 60))
     assert res1.passed is False
     assert res1.reason == "overexposed_ae_settling"
@@ -131,6 +158,190 @@ def test_liveness_rejects_inactive_illuminator_and_missing_dark() -> None:
 
     pair_valid = _make_pair()
     assert check_ir_liveness(pair_valid, (500, 500, 20, 20)).reason == "invalid_bbox"
+
+
+def test_liveness_rejects_face_too_small() -> None:
+    pair = _make_pair(
+        face_bright=190,
+        face_dark=25,
+        bg_bright=5,
+        bg_dark=5,
+        shape=(360, 640),
+        bbox=(280, 140, 60, 60),
+    )
+    res = check_ir_liveness(pair, (280, 140, 60, 60))
+    assert res.passed is False
+    assert res.reason == "face_too_small"
+    assert res.face_height_ratio == pytest.approx(60.0 / 360.0)
+
+    # Also reject overly narrow face bbox (< 11% image width)
+    pair_narrow = _make_pair(
+        face_bright=190,
+        face_dark=25,
+        bg_bright=5,
+        bg_dark=5,
+        shape=(360, 640),
+        bbox=(280, 100, 60, 120),
+    )
+    res_narrow = check_ir_liveness(pair_narrow, (280, 100, 60, 120))
+    assert res_narrow.passed is False
+    assert res_narrow.reason == "face_too_small"
+
+
+def test_liveness_rejects_flat_background_spoof() -> None:
+    # Bright reflective card/wall surround around the head (bg_ratio > 0.48)
+    pair = _make_pair(
+        face_bright=180,
+        face_dark=20,
+        bg_bright=135,
+        bg_dark=15,
+        shape=(360, 640),
+        bbox=(220, 80, 180, 200),
+        radial_shading=True,
+    )
+    res = check_ir_liveness(pair, (220, 80, 180, 200))
+    assert res.passed is False
+    assert res.reason == "flat_background_spoof"
+    assert res.bg_ratio > 0.48
+
+
+def test_liveness_rejects_flat_plane_spoof() -> None:
+    # Flat polycarbonate ID card photo: uniform high IR reflection inside bbox with dark surround
+    pair = _make_pair(
+        face_bright=170,
+        face_dark=20,
+        bg_bright=5,
+        bg_dark=5,
+        shape=(360, 640),
+        bbox=(220, 80, 180, 200),
+        radial_shading=False,
+    )
+    res = check_ir_liveness(pair, (220, 80, 180, 200))
+    assert res.passed is False
+    assert res.reason == "flat_plane_spoof"
+    assert res.bg_ratio < 0.10
+    assert res.relief_3d < 0.12
+
+
+def _make_face_det(
+    *,
+    eye_left: tuple[float, float] = (270.0, 150.0),
+    eye_right: tuple[float, float] = (330.0, 150.0),
+    nose: tuple[float, float] = (300.0, 185.0),
+    bbox: tuple[int, int, int, int] = (220, 90, 160, 180),
+    score: float = 0.95,
+) -> FaceDetection:
+    landmarks = np.array(
+        [
+            eye_left,
+            eye_right,
+            nose,
+            (275.0, 225.0),
+            (325.0, 225.0),
+        ],
+        dtype=np.float32,
+    )
+    raw = np.zeros(15, dtype=np.float32)
+    raw[0:4] = bbox
+    raw[4:14] = landmarks.reshape(-1)
+    raw[14] = score
+    return FaceDetection(bbox=bbox, score=score, landmarks=landmarks, raw_row=raw)
+
+
+def _make_eye_patch_frame(
+    *,
+    eye_intensity: int = 110,
+    bridge_intensity: int = 180,
+    shape: tuple[int, int] = (360, 640),
+    eye_left: tuple[int, int] = (270, 150),
+    eye_right: tuple[int, int] = (330, 150),
+    nose: tuple[int, int] = (300, 185),
+) -> np.ndarray:
+    frame = np.full((shape[0], shape[1], 3), bridge_intensity, dtype=np.uint8)
+    for ex, ey in (eye_left, eye_right):
+        frame[ey - 12 : ey + 13, ex - 12 : ex + 13] = eye_intensity
+    # Keep nose bridge at bridge_intensity explicitly
+    bx = int(round(0.7 * 0.5 * (eye_left[0] + eye_right[0]) + 0.3 * nose[0]))
+    by = int(round(0.7 * 0.5 * (eye_left[1] + eye_right[1]) + 0.3 * nose[1]))
+    frame[by - 12 : by + 13, bx - 12 : bx + 13] = bridge_intensity
+    return frame
+
+
+def test_temporal_liveness_tracker_static_photo_stays_unverified() -> None:
+    tracker = TemporalLivenessTracker(window_seconds=3.0)
+    frame1 = _make_eye_patch_frame(eye_intensity=100, bridge_intensity=180)
+    det1 = _make_face_det()
+
+    # Frame 1..3: static photo
+    for i in range(3):
+        ok, reason = tracker.update(frame1, det1, timestamp=1.0 + i * 0.2)
+        assert ok is False
+        assert reason == "waiting_blink_or_motion"
+
+    # In-plane translation + uniform brightness scaling of flat photo must stay unverified
+    frame_shifted = _make_eye_patch_frame(
+        eye_intensity=120,
+        bridge_intensity=216,  # exact same 100/180 = 120/216 ratio
+        eye_left=(290, 160),
+        eye_right=(350, 160),
+        nose=(320, 195),
+    )
+    det_shifted = _make_face_det(
+        eye_left=(290.0, 160.0),
+        eye_right=(350.0, 160.0),
+        nose=(320.0, 195.0),
+        bbox=(240, 100, 160, 180),
+    )
+    ok, reason = tracker.update(frame_shifted, det_shifted, timestamp=1.6)
+    assert ok is False
+    assert reason == "waiting_blink_or_motion"
+
+
+def test_temporal_liveness_tracker_blink_verifies() -> None:
+    tracker = TemporalLivenessTracker(window_seconds=3.0)
+    det = _make_face_det()
+
+    frame_open = _make_eye_patch_frame(eye_intensity=140, bridge_intensity=180)
+    frame_closed = _make_eye_patch_frame(eye_intensity=85, bridge_intensity=180)
+
+    assert tracker.update(frame_open, det, timestamp=1.0) == (False, "waiting_blink_or_motion")
+    ok, reason = tracker.update(frame_closed, det, timestamp=1.2)
+    assert ok is True
+    assert reason == "ok_blink"
+    # Recovery frame inside window remains verified
+    ok_rec, reason_rec = tracker.update(frame_open, det, timestamp=1.4)
+    assert ok_rec is True
+    assert reason_rec == "ok_blink"
+
+    tracker.reset()
+    assert tracker.update(frame_open, det, timestamp=2.0) == (False, "waiting_blink_or_motion")
+
+
+def test_temporal_liveness_tracker_3d_nose_parallax_verifies() -> None:
+    tracker = TemporalLivenessTracker(window_seconds=3.0)
+    frame = _make_eye_patch_frame(eye_intensity=120, bridge_intensity=180)
+
+    det_center = _make_face_det(
+        eye_left=(270.0, 150.0),
+        eye_right=(330.0, 150.0),
+        nose=(300.0, 185.0),
+    )
+    # 3D yaw turn: nose shifts relative to eye_mid by 6px / 60px inter-eye = 0.10 >= 0.055
+    det_turned = _make_face_det(
+        eye_left=(270.0, 150.0),
+        eye_right=(330.0, 150.0),
+        nose=(306.0, 185.0),
+    )
+
+    assert tracker.update(frame, det_center, timestamp=1.0) == (False, "waiting_blink_or_motion")
+    ok, reason = tracker.update(frame, det_turned, timestamp=1.4)
+    assert ok is True
+    assert reason == "ok_3d_motion"
+
+    # After the 3.0s window expires without further motion, returns to waiting
+    ok_expired, reason_expired = tracker.update(frame, det_turned, timestamp=5.0)
+    assert ok_expired is False
+    assert reason_expired == "waiting_blink_or_motion"
 
 
 # ---------------------------------------------------------------------------
@@ -202,26 +413,30 @@ def test_recognizer_cosine_similarity_and_gallery_matching() -> None:
         FaceRecognizer.cosine_similarity(v1, np.ones(64, dtype=np.float32))
 
     # Empty gallery
-    matched_empty, score_empty = FaceRecognizer.match_against(v1, [], threshold=0.42)
+    matched_empty, score_empty = FaceRecognizer.match_against(v1, [])
     assert matched_empty is False
     assert score_empty == 0.0
 
-    # Above threshold
-    close = v1.copy()
-    close[1] = 0.5
-    close /= np.linalg.norm(close)
-    matched, score = FaceRecognizer.match_against(close, [v2, v1], threshold=0.42)
-    assert matched is True
-    assert score > 0.85
+    # Default threshold constants
+    assert DEFAULT_MATCH_THRESHOLD == pytest.approx(0.65)
+    assert DEFAULT_DET_SCORE_THRESHOLD == pytest.approx(0.78)
+    assert DEFAULT_THRESHOLD == pytest.approx(0.65)
 
-    # Below threshold
-    far = np.zeros(128, dtype=np.float32)
-    far[1] = 0.99
-    far[0] = 0.1
-    far /= np.linalg.norm(far)
-    matched_low, score_low = FaceRecognizer.match_against(far, [v1], threshold=0.42)
-    assert matched_low is False
-    assert score_low < 0.42
+    # Real full-face similarity (~0.897) passes default threshold (0.65)
+    full_face = np.zeros(128, dtype=np.float32)
+    full_face[0] = 0.897
+    full_face[1] = float(np.sqrt(1.0 - 0.897**2))
+    matched, score = FaceRecognizer.match_against(full_face, [v2, v1])
+    assert matched is True
+    assert score == pytest.approx(0.897, abs=1e-4)
+
+    # Half-covered face similarity (~0.546) is rejected by default threshold (0.65)
+    half_covered = np.zeros(128, dtype=np.float32)
+    half_covered[0] = 0.546
+    half_covered[1] = float(np.sqrt(1.0 - 0.546**2))
+    matched_half, score_half = FaceRecognizer.match_against(half_covered, [v1])
+    assert matched_half is False
+    assert score_half == pytest.approx(0.546, abs=1e-4)
 
 
 def test_recognizer_detect_and_extract_with_mocked_opencv(tmp_path: Path) -> None:
@@ -355,10 +570,10 @@ def test_ir_face_verifier_consecutive_match_and_cleanup(tmp_path: Path) -> None:
     worker.error = None
     # Frame 1: match, Frame 2: non-match (resets streak), Frame 3 & 4: two consecutive matches
     worker.get_ir_pair.side_effect = [
-        _make_pair(face_bright=150, face_dark=40, timestamp=1.0),
-        _make_pair(face_bright=150, face_dark=40, timestamp=2.0),
-        _make_pair(face_bright=150, face_dark=40, timestamp=3.0),
-        _make_pair(face_bright=150, face_dark=40, timestamp=4.0),
+        _make_pair(face_bright=190, face_dark=30, bg_bright=5, bg_dark=5, timestamp=1.0),
+        _make_pair(face_bright=190, face_dark=30, bg_bright=5, bg_dark=5, timestamp=2.0),
+        _make_pair(face_bright=190, face_dark=30, bg_bright=5, bg_dark=5, timestamp=3.0),
+        _make_pair(face_bright=190, face_dark=30, bg_bright=5, bg_dark=5, timestamp=4.0),
     ]
 
     det = FaceDetection(
@@ -386,9 +601,117 @@ def test_ir_face_verifier_consecutive_match_and_cleanup(tmp_path: Path) -> None:
     assert res["domain"] == "."
     assert res["password"] == "WinPassword99"
     assert res["score"] == pytest.approx(1.0)
-    assert res["liveness_delta"] == pytest.approx(110.0)
+    assert res["liveness_delta"] > 12.0
     worker.start.assert_called_once()
     worker.stop.assert_called_once()
+
+
+def test_strict_ir_only_camera_selection(tmp_path: Path) -> None:
+    rgb_cam = MagicMock(group="g_rgb", source_id="s_rgb", is_ir=False, is_virtual=False)
+    virt_ir = MagicMock(group="g_vir", source_id="s_vir", is_ir=True, is_virtual=True)
+    real_ir = MagicMock(group="g_rir", source_id="s_rir", is_ir=True, is_virtual=False)
+
+    assert _select_camera([]) is None
+    assert _select_camera([rgb_cam]) is None
+    assert _select_camera([rgb_cam, virt_ir]) is virt_ir
+    assert _select_camera([rgb_cam, virt_ir, real_ir]) is real_ir
+
+    assert _select_enrollment_camera([]) is None
+    assert _select_enrollment_camera([rgb_cam]) is None
+    assert _select_enrollment_camera([rgb_cam, virt_ir]) is virt_ir
+    assert _select_enrollment_camera([rgb_cam, virt_ir, real_ir]) is real_ir
+
+    # IRFaceVerifier with RGB-only system fails with camera_error
+    store = ProfileStore(tmp_path / "profiles.enc")
+    vec = np.ones(128, dtype=np.float32) / np.sqrt(128.0)
+    store.upsert_embeddings("Alice", [vec])
+    verifier = IRFaceVerifier(
+        store,
+        recognizer=MagicMock(),
+        camera_discoverer=lambda: [rgb_cam],
+    )
+    assert verifier.verify(timeout_ms=1000) == {"status": "failed", "reason": "camera_error"}
+
+
+def test_ir_face_verifier_require_motion_blocks_static_and_passes_on_motion(tmp_path: Path) -> None:
+    store = ProfileStore(tmp_path / "profiles.enc")
+    alice_vec = np.zeros(128, dtype=np.float32)
+    alice_vec[0] = 1.0
+    store.upsert_embeddings("Alice", [alice_vec], domain=".")
+
+    dummy_cam = MagicMock(group="g1", source_id="s1", is_ir=True, is_virtual=False)
+    pair1 = _make_pair(
+        face_bright=200,
+        face_dark=20,
+        bg_bright=5,
+        bg_dark=5,
+        shape=(360, 640),
+        bbox=(220, 90, 160, 180),
+        timestamp=1.0,
+    )
+    pair2 = _make_pair(
+        face_bright=200,
+        face_dark=20,
+        bg_bright=5,
+        bg_dark=5,
+        shape=(360, 640),
+        bbox=(220, 90, 160, 180),
+        timestamp=1.2,
+    )
+    pair3 = _make_pair(
+        face_bright=200,
+        face_dark=20,
+        bg_bright=5,
+        bg_dark=5,
+        shape=(360, 640),
+        bbox=(220, 90, 160, 180),
+        timestamp=1.4,
+    )
+
+    det_center = _make_face_det(nose=(300.0, 185.0))
+    det_turned = _make_face_det(nose=(306.0, 185.0))
+
+    # First verify static sequence fails (times out after exhausting frames)
+    worker_static = MagicMock()
+    worker_static.error = None
+    worker_static.get_ir_pair.side_effect = [pair1, pair2, pair3] + [None] * 50
+
+    rec_static = MagicMock()
+    rec_static.detect_largest.return_value = det_center
+    rec_static.extract_embedding.return_value = alice_vec
+    rec_static.match_against.side_effect = FaceRecognizer.match_against
+
+    verifier_static = IRFaceVerifier(
+        store,
+        recognizer=rec_static,
+        required_consecutive=2,
+        require_motion=True,
+        camera_discoverer=lambda: [dummy_cam],
+        worker_factory=lambda **_kw: worker_static,
+    )
+    assert verifier_static.verify(timeout_ms=150) == {"status": "failed", "reason": "timeout"}
+
+    # Now verify 3D head motion triggers consecutive matches
+    worker_motion = MagicMock()
+    worker_motion.error = None
+    worker_motion.get_ir_pair.side_effect = [pair1, pair2, pair3]
+
+    rec_motion = MagicMock()
+    rec_motion.detect_largest.side_effect = [det_center, det_turned, det_turned]
+    rec_motion.extract_embedding.return_value = alice_vec
+    rec_motion.match_against.side_effect = FaceRecognizer.match_against
+
+    verifier_motion = IRFaceVerifier(
+        store,
+        recognizer=rec_motion,
+        required_consecutive=2,
+        require_motion=True,
+        camera_discoverer=lambda: [dummy_cam],
+        worker_factory=lambda **_kw: worker_motion,
+    )
+    res = verifier_motion.verify(timeout_ms=2000)
+    assert res["status"] == "matched"
+    assert res["username"] == "Alice"
 
 
 def test_ir_face_verifier_no_enrolled_cancel_and_camera_error(tmp_path: Path) -> None:
