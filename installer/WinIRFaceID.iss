@@ -55,3 +55,14 @@ Type: filesandordirs; Name: "{app}\.venv"
 Type: filesandordirs; Name: "{app}\models"
 Type: filesandordirs; Name: "{app}\engine\__pycache__"
 Type: filesandordirs; Name: "{app}\engine\ui\__pycache__"
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  { Stop any running WinIRFaceIDService before overwriting bin\WinIRFaceIDService.exe on upgrade }
+  Exec('sc.exe', 'stop WinIRFaceIDService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1200);
+  Result := '';
+end;
