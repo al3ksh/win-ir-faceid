@@ -11,13 +11,14 @@
 #include <wincodec.h>
 
 #include <cstring>
+#include <vector>
 
 namespace
 {
 
-constexpr wchar_t kStatusScanning[] = L"Scanning infrared face...";
-constexpr wchar_t kStatusRecognized[] = L"Recognized!";
-constexpr wchar_t kStatusFailed[] = L"Face not recognized - use Fingerprint or PIN";
+constexpr wchar_t kStatusScanning[] = L"Looking for you...";
+constexpr wchar_t kStatusRecognized[] = L"Welcome back!";
+constexpr wchar_t kStatusFailed[] = L"Couldn't recognize you - try again or use Fingerprint / PIN";
 constexpr wchar_t kStatusNoPassword[] = L"Face recognized, but no saved credential - use Fingerprint or PIN";
 constexpr wchar_t kStatusSignInFailed[] = L"Sign-in failed - use Fingerprint or PIN";
 
@@ -149,6 +150,24 @@ private:
     T* _ptr = nullptr;
 };
 
+void FillBitmapV5Header(BITMAPV5HEADER& hdr, UINT width, UINT height)
+{
+    ZeroMemory(&hdr, sizeof(hdr));
+    hdr.bV5Size = sizeof(BITMAPV5HEADER);
+    hdr.bV5Width = static_cast<LONG>(width);
+    hdr.bV5Height = -static_cast<LONG>(height); // top-down
+    hdr.bV5Planes = 1;
+    hdr.bV5BitCount = 32;
+    hdr.bV5Compression = BI_BITFIELDS;
+    hdr.bV5SizeImage = width * height * 4U;
+    hdr.bV5RedMask = 0x00FF0000;
+    hdr.bV5GreenMask = 0x0000FF00;
+    hdr.bV5BlueMask = 0x000000FF;
+    hdr.bV5AlphaMask = 0xFF000000;
+    hdr.bV5CSType = LCS_sRGB;
+    hdr.bV5Intent = LCS_GM_IMAGES;
+}
+
 HBITMAP CreateTopDown32BppDib(int width, int height, void** outBits)
 {
     if (outBits == nullptr || width <= 0 || height <= 0)
@@ -157,16 +176,17 @@ HBITMAP CreateTopDown32BppDib(int width, int height, void** outBits)
     }
     *outBits = nullptr;
 
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -height; // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+    BITMAPV5HEADER bV5{};
+    FillBitmapV5Header(bV5, static_cast<UINT>(width), static_cast<UINT>(height));
 
     HDC screenDc = GetDC(nullptr);
-    HBITMAP hBmp = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, outBits, nullptr, 0);
+    HBITMAP hBmp = CreateDIBSection(
+        screenDc,
+        reinterpret_cast<const BITMAPINFO*>(&bV5),
+        DIB_RGB_COLORS,
+        outBits,
+        nullptr,
+        0);
     if (screenDc != nullptr)
     {
         ReleaseDC(nullptr, screenDc);
@@ -186,41 +206,49 @@ HBITMAP CreateTopDown32BppDib(int width, int height, void** outBits)
     return hBmp;
 }
 
-HBITMAP DecodePngResourceToBitmap(UINT resourceId)
+bool DecodePngResourceToPbgra(
+    UINT resourceId,
+    UINT& outWidth,
+    UINT& outHeight,
+    std::vector<BYTE>& outPixels)
 {
+    outWidth = 0;
+    outHeight = 0;
+    outPixels.clear();
+
     HINSTANCE hInst = GetModuleInstance();
     if (hInst == nullptr)
     {
-        return nullptr;
+        return false;
     }
 
     HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
     if (hRes == nullptr)
     {
-        return nullptr;
+        return false;
     }
 
     const DWORD pngSize = SizeofResource(hInst, hRes);
     HGLOBAL hResData = LoadResource(hInst, hRes);
     if (hResData == nullptr || pngSize == 0)
     {
-        return nullptr;
+        return false;
     }
 
     const void* pngBytes = LockResource(hResData);
     if (pngBytes == nullptr)
     {
-        return nullptr;
+        return false;
     }
 
     const HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (FAILED(hrCom) && hrCom != RPC_E_CHANGED_MODE)
     {
-        return nullptr;
+        return false;
     }
     const bool shouldUninit = (hrCom == S_OK || hrCom == S_FALSE);
 
-    HBITMAP hBmp = nullptr;
+    bool decoded = false;
     {
         ComRef<IWICImagingFactory> factory;
         ComRef<IWICStream> stream;
@@ -280,18 +308,19 @@ HBITMAP DecodePngResourceToBitmap(UINT resourceId)
 
         if (SUCCEEDED(hr) && width > 0 && height > 0 && width <= 4096 && height <= 4096)
         {
-            void* bits = nullptr;
-            hBmp = CreateTopDown32BppDib(static_cast<int>(width), static_cast<int>(height), &bits);
-            if (hBmp != nullptr)
+            const UINT stride = width * 4U;
+            const UINT bufferSize = stride * height;
+            outPixels.resize(bufferSize);
+            hr = converter->CopyPixels(nullptr, stride, bufferSize, outPixels.data());
+            if (SUCCEEDED(hr))
             {
-                const UINT stride = width * 4U;
-                const UINT bufferSize = stride * height;
-                hr = converter->CopyPixels(nullptr, stride, bufferSize, static_cast<BYTE*>(bits));
-                if (FAILED(hr))
-                {
-                    DeleteObject(hBmp);
-                    hBmp = nullptr;
-                }
+                outWidth = width;
+                outHeight = height;
+                decoded = true;
+            }
+            else
+            {
+                outPixels.clear();
             }
         }
     }
@@ -301,27 +330,27 @@ HBITMAP DecodePngResourceToBitmap(UINT resourceId)
         CoUninitialize();
     }
 
-    return hBmp;
+    return decoded;
 }
 
-HBITMAP CreateFallbackIRFaceTileBitmap()
+void CreateFallbackIRFacePixels(
+    UINT& outWidth,
+    UINT& outHeight,
+    std::vector<BYTE>& outPixels)
 {
-    constexpr int kSize = 64;
-    void* bits = nullptr;
-    HBITMAP hBmp = CreateTopDown32BppDib(kSize, kSize, &bits);
-    if (hBmp == nullptr)
-    {
-        return nullptr;
-    }
+    constexpr UINT kSize = 64;
+    outWidth = kSize;
+    outHeight = kSize;
+    outPixels.assign(static_cast<size_t>(kSize) * kSize * 4U, 0);
 
     // Minimalist pure-white (0xFFFFFFFF premultiplied BGRA) face brackets on 100% transparent background
-    auto* pixels = static_cast<uint32_t*>(bits);
-    auto fillRect = [pixels, kSize](int x0, int y0, int x1, int y1) {
-        for (int y = y0; y < y1; ++y)
+    auto* pixels = reinterpret_cast<uint32_t*>(outPixels.data());
+    auto fillRect = [pixels, kSize](UINT x0, UINT y0, UINT x1, UINT y1) {
+        for (UINT y = y0; y < y1; ++y)
         {
-            for (int x = x0; x < x1; ++x)
+            for (UINT x = x0; x < x1; ++x)
             {
-                if (x >= 0 && x < kSize && y >= 0 && y < kSize)
+                if (x < kSize && y < kSize)
                 {
                     pixels[y * kSize + x] = 0xFFFFFFFFU;
                 }
@@ -338,18 +367,78 @@ HBITMAP CreateFallbackIRFaceTileBitmap()
     fillRect(23, 24, 26, 30);
     fillRect(38, 24, 41, 30);
     fillRect(24, 40, 40, 43);
+}
 
-    return hBmp;
+void GetIRFaceTilePbgra(
+    UINT& outWidth,
+    UINT& outHeight,
+    std::vector<BYTE>& outPixels)
+{
+    if (!DecodePngResourceToPbgra(IDR_IR_FACEID_PNG, outWidth, outHeight, outPixels))
+    {
+        CreateFallbackIRFacePixels(outWidth, outHeight, outPixels);
+    }
 }
 
 HBITMAP CreateIRFaceTileBitmap()
 {
-    HBITMAP hBmp = DecodePngResourceToBitmap(IDR_IR_FACEID_PNG);
-    if (hBmp != nullptr)
+    UINT width = 0;
+    UINT height = 0;
+    std::vector<BYTE> pixels;
+    GetIRFaceTilePbgra(width, height, pixels);
+    if (width == 0 || height == 0 || pixels.empty())
     {
-        return hBmp;
+        return nullptr;
     }
-    return CreateFallbackIRFaceTileBitmap();
+
+    void* bits = nullptr;
+    HBITMAP hBmp = CreateTopDown32BppDib(static_cast<int>(width), static_cast<int>(height), &bits);
+    if (hBmp == nullptr)
+    {
+        return nullptr;
+    }
+
+    std::memcpy(bits, pixels.data(), pixels.size());
+    return hBmp;
+}
+
+HRESULT CreateIRFaceTileBitmapBuffer(DWORD* outSize, BYTE** outBuffer)
+{
+    if (outSize == nullptr || outBuffer == nullptr)
+    {
+        return E_POINTER;
+    }
+    *outSize = 0;
+    *outBuffer = nullptr;
+
+    UINT width = 0;
+    UINT height = 0;
+    std::vector<BYTE> pixels;
+    GetIRFaceTilePbgra(width, height, pixels);
+    if (width == 0 || height == 0 || pixels.empty())
+    {
+        return E_FAIL;
+    }
+
+    const size_t totalBytes = sizeof(BITMAPV5HEADER) + pixels.size();
+    if (totalBytes > MAXDWORD)
+    {
+        return E_OUTOFMEMORY;
+    }
+
+    auto* buffer = static_cast<BYTE*>(CoTaskMemAlloc(totalBytes));
+    if (buffer == nullptr)
+    {
+        return E_OUTOFMEMORY;
+    }
+
+    auto* hdr = reinterpret_cast<BITMAPV5HEADER*>(buffer);
+    FillBitmapV5Header(*hdr, width, height);
+    std::memcpy(buffer + sizeof(BITMAPV5HEADER), pixels.data(), pixels.size());
+
+    *outSize = static_cast<DWORD>(totalBytes);
+    *outBuffer = buffer;
+    return S_OK;
 }
 
 } // namespace
@@ -422,8 +511,9 @@ bool WinIRFaceIDCredential::HasVerifiedCredential()
 IFACEMETHODIMP WinIRFaceIDCredential::QueryInterface(REFIID riid, void** ppv)
 {
     static const QITAB qit[] = {
-        QITABENT(WinIRFaceIDCredential, ICredentialProviderCredential2),
-        QITABENTMULTI(WinIRFaceIDCredential, ICredentialProviderCredential, ICredentialProviderCredential2),
+        QITABENT(WinIRFaceIDCredential, ICredentialProviderCredential3),
+        QITABENTMULTI(WinIRFaceIDCredential, ICredentialProviderCredential2, ICredentialProviderCredential3),
+        QITABENTMULTI(WinIRFaceIDCredential, ICredentialProviderCredential, ICredentialProviderCredential3),
         { 0 }
     };
     return QISearch(this, qit, riid, ppv);
@@ -539,6 +629,15 @@ IFACEMETHODIMP WinIRFaceIDCredential::GetFieldState(
     switch (dwFieldID)
     {
     case FID_TILE_IMAGE:
+        *pcpfs = CPFS_DISPLAY_IN_DESELECTED_TILE;
+        *pcpfis = CPFIS_NONE;
+        return S_OK;
+
+    case FID_HERO_IMAGE:
+        *pcpfs = CPFS_DISPLAY_IN_SELECTED_TILE;
+        *pcpfis = CPFIS_NONE;
+        return S_OK;
+
     case FID_LABEL:
         *pcpfs = CPFS_DISPLAY_IN_BOTH;
         *pcpfis = CPFIS_NONE;
@@ -550,7 +649,7 @@ IFACEMETHODIMP WinIRFaceIDCredential::GetFieldState(
         return S_OK;
 
     case FID_RETRY_SUBMIT:
-        *pcpfs = CPFS_DISPLAY_IN_SELECTED_TILE;
+        *pcpfs = scanning ? CPFS_HIDDEN : CPFS_DISPLAY_IN_SELECTED_TILE;
         *pcpfis = scanning ? CPFIS_DISABLED : CPFIS_FOCUSED;
         return S_OK;
 
@@ -596,13 +695,33 @@ IFACEMETHODIMP WinIRFaceIDCredential::GetBitmapValue(DWORD dwFieldID, HBITMAP* p
     }
     *phbmp = nullptr;
 
-    if (dwFieldID != FID_TILE_IMAGE)
+    if (dwFieldID != FID_TILE_IMAGE && dwFieldID != FID_HERO_IMAGE)
     {
         return E_INVALIDARG;
     }
 
     *phbmp = CreateIRFaceTileBitmap();
     return (*phbmp != nullptr) ? S_OK : E_FAIL;
+}
+
+IFACEMETHODIMP WinIRFaceIDCredential::GetBitmapBufferValue(
+    DWORD dwFieldID,
+    DWORD* pImageBufferSize,
+    BYTE** ppImageBuffer)
+{
+    if (pImageBufferSize == nullptr || ppImageBuffer == nullptr)
+    {
+        return E_POINTER;
+    }
+    *pImageBufferSize = 0;
+    *ppImageBuffer = nullptr;
+
+    if (dwFieldID != FID_TILE_IMAGE && dwFieldID != FID_HERO_IMAGE)
+    {
+        return E_INVALIDARG;
+    }
+
+    return CreateIRFaceTileBitmapBuffer(pImageBufferSize, ppImageBuffer);
 }
 
 IFACEMETHODIMP WinIRFaceIDCredential::GetCheckboxValue(
@@ -929,6 +1048,10 @@ void WinIRFaceIDCredential::UpdateStatusText(const std::wstring& newText, bool u
         pEvents->SetFieldString(this, FID_STATUS, newText.c_str());
         if (updateButtonState)
         {
+            pEvents->SetFieldState(
+                this,
+                FID_RETRY_SUBMIT,
+                scanning ? CPFS_HIDDEN : CPFS_DISPLAY_IN_SELECTED_TILE);
             pEvents->SetFieldInteractiveState(
                 this,
                 FID_RETRY_SUBMIT,

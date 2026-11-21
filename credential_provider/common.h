@@ -20,6 +20,16 @@ inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\WinIRFaceID";
 inline constexpr DWORD kMaxPipeMessageBytes = 65536; // 64 KB per IPC_PROTOCOL.md
 inline constexpr DWORD kDefaultVerifyTimeoutMs = 8000;
 
+enum WinIRFieldId : DWORD
+{
+    FID_TILE_IMAGE = 0,
+    FID_HERO_IMAGE = 1,
+    FID_LABEL = 2,
+    FID_STATUS = 3,
+    FID_RETRY_SUBMIT = 4,
+    FID_NUM_FIELDS = 5
+};
+
 // COM DLL reference counting and module handle (implemented in dllmain.cpp)
 void DllAddRef();
 void DllRelease();

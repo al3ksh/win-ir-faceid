@@ -79,6 +79,7 @@ void WinIRFaceIDProvider::ClearCredentials()
     std::vector<WinIRFaceIDCredential*> toRelease;
     EnterCriticalSection(&_cs);
     toRelease.swap(_credentials);
+    _autoScanTriggered = false;
     LeaveCriticalSection(&_cs);
 
     for (WinIRFaceIDCredential* cred : toRelease)
@@ -88,6 +89,31 @@ void WinIRFaceIDProvider::ClearCredentials()
             cred->DetachProvider();
             cred->Release();
         }
+    }
+}
+
+void WinIRFaceIDProvider::MaybeStartBackgroundAutoScan()
+{
+    WinIRFaceIDCredential* targetCred = nullptr;
+
+    EnterCriticalSection(&_cs);
+    if (_pEvents != nullptr && !_autoScanTriggered && _credentials.size() == 1)
+    {
+        targetCred = _credentials[0];
+        if (targetCred != nullptr)
+        {
+            targetCred->AddRef();
+            _autoScanTriggered = true;
+        }
+    }
+    LeaveCriticalSection(&_cs);
+
+    if (targetCred != nullptr)
+    {
+        // Mimic native Windows Hello Fingerprint by scanning in the background
+        // immediately on lock screen activation even while PIN is selected.
+        targetCred->StartScan();
+        targetCred->Release();
     }
 }
 
@@ -161,11 +187,18 @@ IFACEMETHODIMP WinIRFaceIDProvider::Advise(
     }
     _upAdviseContext = upAdviseContext;
     LeaveCriticalSection(&_cs);
+
+    if (pcpe != nullptr)
+    {
+        MaybeStartBackgroundAutoScan();
+    }
     return S_OK;
 }
 
 IFACEMETHODIMP WinIRFaceIDProvider::UnAdvise()
 {
+    std::vector<WinIRFaceIDCredential*> snapshot;
+
     EnterCriticalSection(&_cs);
     if (_pEvents != nullptr)
     {
@@ -173,7 +206,26 @@ IFACEMETHODIMP WinIRFaceIDProvider::UnAdvise()
         _pEvents = nullptr;
     }
     _upAdviseContext = 0;
+    _autoScanTriggered = false;
+    snapshot = _credentials;
+    for (WinIRFaceIDCredential* cred : snapshot)
+    {
+        if (cred != nullptr)
+        {
+            cred->AddRef();
+        }
+    }
     LeaveCriticalSection(&_cs);
+
+    // Stop any background IR scan immediately when LogonUI tears down (e.g. user signed in via PIN/Fingerprint).
+    for (WinIRFaceIDCredential* cred : snapshot)
+    {
+        if (cred != nullptr)
+        {
+            cred->CancelScanAndWait();
+            cred->Release();
+        }
+    }
     return S_OK;
 }
 
@@ -199,6 +251,7 @@ IFACEMETHODIMP WinIRFaceIDProvider::GetFieldDescriptorAt(
 
     const FieldDescTemplate fields[FID_NUM_FIELDS] = {
         { FID_TILE_IMAGE,   CPFT_TILE_IMAGE,    L"IR Face ID",    CPFG_CREDENTIAL_PROVIDER_LOGO },
+        { FID_HERO_IMAGE,   CPFT_TILE_IMAGE,    L"IR Face ID",    GUID_NULL },
         { FID_LABEL,        CPFT_LARGE_TEXT,    L"IR Face ID",    CPFG_CREDENTIAL_PROVIDER_LABEL },
         { FID_STATUS,       CPFT_SMALL_TEXT,    L"Status",        GUID_NULL },
         { FID_RETRY_SUBMIT, CPFT_SUBMIT_BUTTON, L"Retry IR Scan", GUID_NULL },
@@ -323,6 +376,8 @@ IFACEMETHODIMP WinIRFaceIDProvider::SetUserArray(ICredentialProviderUserArray* u
     EnterCriticalSection(&_cs);
     _credentials.swap(created);
     LeaveCriticalSection(&_cs);
+
+    MaybeStartBackgroundAutoScan();
 
     return S_OK;
 }

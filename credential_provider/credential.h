@@ -1,23 +1,28 @@
 #pragma once
 
+#include "common.h"
 #include "pipe_client.h"
 
 #include <windows.h>
 #include <credentialprovider.h>
 #include <string>
 
+#ifndef __ICredentialProviderCredential3_INTERFACE_DEFINED__
+#define __ICredentialProviderCredential3_INTERFACE_DEFINED__
+MIDL_INTERFACE("64a5010e-4363-41f8-9738-19045c20dabc")
+ICredentialProviderCredential3 : public ICredentialProviderCredential2
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE GetBitmapBufferValue(
+        DWORD dwFieldID,
+        DWORD* pImageBufferSize,
+        BYTE** ppImageBuffer) = 0;
+};
+#endif
+
 class WinIRFaceIDProvider;
 
-enum WinIRFieldId : DWORD
-{
-    FID_TILE_IMAGE = 0,
-    FID_LABEL = 1,
-    FID_STATUS = 2,
-    FID_RETRY_SUBMIT = 3,
-    FID_NUM_FIELDS = 4
-};
-
-class WinIRFaceIDCredential final : public ICredentialProviderCredential2
+class WinIRFaceIDCredential final : public ICredentialProviderCredential3
 {
 public:
     WinIRFaceIDCredential(
@@ -74,15 +79,21 @@ public:
     // ICredentialProviderCredential2
     IFACEMETHODIMP GetUserSid(LPWSTR* sid) override;
 
+    // ICredentialProviderCredential3
+    IFACEMETHODIMP GetBitmapBufferValue(
+        DWORD dwFieldID,
+        DWORD* pImageBufferSize,
+        BYTE** ppImageBuffer) override;
+
     // Helpers used by WinIRFaceIDProvider
     bool HasVerifiedCredential();
     void DetachProvider();
+    void StartScan();
+    void CancelScanAndWait();
 
 private:
     ~WinIRFaceIDCredential();
 
-    void StartScan();
-    void CancelScanAndWait();
     void UpdateStatusText(const std::wstring& newText, bool updateButtonState);
     void WipeVerifiedCredentialsLocked();
 
@@ -105,7 +116,7 @@ private:
     bool _selected = false;
     bool _scanning = false;
     bool _hasVerifiedCred = false;
-    std::wstring _statusText = L"Scanning infrared face...";
+    std::wstring _statusText = L"Looking for you...";
 
     std::wstring _verifiedUsername;
     std::wstring _verifiedDomain;

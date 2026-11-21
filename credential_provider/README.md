@@ -13,7 +13,7 @@ Thin C++17 Windows Credential Provider V2 COM DLL (`WinIRFaceIDProvider.dll`) an
 ## Build (x64, CMake + Visual Studio)
 
 ```powershell
-cd C:\Users\DELL\.gemini\antigravity\scratch\win-ir-faceid\credential_provider
+cd <repo-root>\credential_provider
 # Using Visual Studio 18's bundled CMake (recommended when VS 18 / 2026 is installed):
 & "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -B build -A x64
 & "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" --build build --config Release
@@ -39,20 +39,20 @@ Never register a Credential Provider before verifying IPC end-to-end with `pipe_
 
 1. Run an **Administrator** PowerShell prompt:
    ```powershell
-   cd C:\Users\DELL\.gemini\antigravity\scratch\win-ir-faceid\credential_provider
+   cd <repo-root>\credential_provider
    .\install.ps1
    ```
    This copies `WinIRFaceIDProvider.dll` to `C:\Windows\System32\WinIRFaceIDProvider.dll` and imports `register.reg` (`CLSID {49C8AEC3-2A43-4BED-987D-DE31E44DF41D}`).
 
 2. Verify before logging out:
    - Lock the workstation (`Win + L`) while keeping another sign-in method (PIN, Fingerprint, or Password) available.
-   - Select **IR Face ID** under **Sign-in options** on your user tile.
+   - Select **IR Face ID** under **Sign-in options** on your user tile (background auto-scan also starts immediately on lock).
 
 ## Uninstallation
 
 Run in an **Administrator** PowerShell prompt:
 ```powershell
-cd C:\Users\DELL\.gemini\antigravity\scratch\win-ir-faceid\credential_provider
+cd <repo-root>\credential_provider
 .\uninstall.ps1
 ```
 

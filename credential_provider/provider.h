@@ -49,11 +49,13 @@ public:
 private:
     ~WinIRFaceIDProvider();
     void ClearCredentials();
+    void MaybeStartBackgroundAutoScan();
 
     LONG _refCount = 1;
     CRITICAL_SECTION _cs{};
     CREDENTIAL_PROVIDER_USAGE_SCENARIO _cpus = CPUS_INVALID;
     ICredentialProviderEvents* _pEvents = nullptr;
     UINT_PTR _upAdviseContext = 0;
+    bool _autoScanTriggered = false;
     std::vector<WinIRFaceIDCredential*> _credentials;
 };
