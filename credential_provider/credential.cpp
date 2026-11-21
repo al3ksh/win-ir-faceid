@@ -544,7 +544,8 @@ IFACEMETHODIMP_(ULONG) WinIRFaceIDCredential::Release()
 
 IFACEMETHODIMP WinIRFaceIDCredential::Advise(ICredentialProviderCredentialEvents* pcpce)
 {
-    bool shouldStart = false;
+    bool canStart = false;
+    bool isSelected = false;
     WinIRFaceIDProvider* provider = nullptr;
 
     EnterCriticalSection(&_cs);
@@ -558,21 +559,29 @@ IFACEMETHODIMP WinIRFaceIDCredential::Advise(ICredentialProviderCredentialEvents
     {
         _pCredEvents->AddRef();
     }
-    shouldStart = _selected && !_scanning && !_hasVerifiedCred;
-    if (shouldStart && _pProvider != nullptr)
+    canStart = (pcpce != nullptr) && !_scanning && !_hasVerifiedCred;
+    isSelected = _selected;
+    if (canStart && _pProvider != nullptr)
     {
         provider = _pProvider;
         provider->AddRef();
     }
     LeaveCriticalSection(&_cs);
 
-    if (shouldStart)
+    if (canStart)
     {
-        if (provider != nullptr && provider->ShouldDeferInitialUnlockScan())
+        if (isSelected)
         {
-            UpdateStatusText(kStatusReadyDeferred, true);
+            if (provider != nullptr && provider->ShouldDeferInitialUnlockScan())
+            {
+                UpdateStatusText(kStatusReadyDeferred, true);
+            }
+            else
+            {
+                StartScan();
+            }
         }
-        else
+        else if (provider != nullptr && !provider->ShouldDeferInitialUnlockScan())
         {
             StartScan();
         }

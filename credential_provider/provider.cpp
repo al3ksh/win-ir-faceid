@@ -230,16 +230,15 @@ bool WinIRFaceIDProvider::ShouldDeferInitialUnlockScan()
     {
         return false;
     }
-    if ((GetTickCount64() - adviseTickMs) >= 1200ULL &&
-        IsSignInScreenActive() &&
-        HasDeliberateKeyOrClick())
+    if ((GetTickCount64() - adviseTickMs) < 800ULL)
     {
-        EnterCriticalSection(&_cs);
-        _unlockArmed = true;
-        LeaveCriticalSection(&_cs);
-        return false;
+        return true;
     }
-    return true;
+
+    EnterCriticalSection(&_cs);
+    _unlockArmed = true;
+    LeaveCriticalSection(&_cs);
+    return false;
 }
 
 DWORD WINAPI WinIRFaceIDProvider::AutoScanWatcherThreadProc(LPVOID param)
@@ -298,10 +297,18 @@ void WinIRFaceIDProvider::RunAutoScanWatcher(
     bool behindCurtain = !IsSignInScreenActive();
     DrainMonitoredKeys();
 
-    // Phase 3 (poll every 80ms): keep IR LED off behind the lock curtain; start scan
-    // immediately when the curtain is dismissed or on deliberate key/click if uncurtained.
+    // Phase 3 (poll every 80ms): keep IR LED off behind the lock curtain; exit quietly
+    // if already armed, or start scan on curtain dismissal / deliberate key/click.
     while (WaitForSingleObject(stopEvent, 80) == WAIT_TIMEOUT)
     {
+        EnterCriticalSection(&_cs);
+        const bool alreadyArmed = _unlockArmed;
+        LeaveCriticalSection(&_cs);
+        if (alreadyArmed)
+        {
+            return;
+        }
+
         const bool activeNow = IsSignInScreenActive();
         if (!activeNow)
         {
@@ -311,7 +318,7 @@ void WinIRFaceIDProvider::RunAutoScanWatcher(
         }
 
         // Trigger A (curtain just dismissed) or Trigger B (deliberate key/click while active).
-        if (behindCurtain || HasDeliberateKeyOrClick())
+        if ((behindCurtain && activeNow) || (activeNow && HasDeliberateKeyOrClick()))
         {
             EnterCriticalSection(&_cs);
             _unlockArmed = true;
