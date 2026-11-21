@@ -3,14 +3,18 @@
     Creates a Windows Start Menu (and optionally Desktop) shortcut for WinIRFaceID.
 .DESCRIPTION
     Creates %APPDATA%\Microsoft\Windows\Start Menu\Programs\WinIRFaceID.lnk
+    (or %ProgramData%\Microsoft\Windows\Start Menu\Programs\WinIRFaceID.lnk when -AllUsers is set)
     pointing to .venv\Scripts\pythonw.exe -m engine.cli gui with engine\ui\app.ico.
     If engine\ui\app.ico is missing, runs engine\ui\generate_app_icon.py first.
 .PARAMETER Desktop
-    Also create a WinIRFaceID.lnk shortcut on the current user's Desktop.
+    Also create a WinIRFaceID.lnk shortcut on the Desktop.
+.PARAMETER AllUsers
+    Create shortcuts in the machine-wide ProgramData Start Menu (and Public Desktop if -Desktop is set).
 #>
 [CmdletBinding()]
 param(
-    [switch]$Desktop
+    [switch]$Desktop,
+    [switch]$AllUsers
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,12 +71,22 @@ function New-WinIRFaceIDShortcut {
     Write-Host "Created shortcut: $ShortcutPath"
 }
 
-$StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+if ($AllUsers) {
+    $StartMenuDir = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs"
+}
+else {
+    $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+}
 $StartMenuShortcut = Join-Path $StartMenuDir "WinIRFaceID.lnk"
 New-WinIRFaceIDShortcut -ShortcutPath $StartMenuShortcut
 
 if ($Desktop) {
-    $DesktopDir = [Environment]::GetFolderPath("Desktop")
+    if ($AllUsers) {
+        $DesktopDir = [Environment]::GetFolderPath("CommonDesktopDirectory")
+    }
+    else {
+        $DesktopDir = [Environment]::GetFolderPath("Desktop")
+    }
     $DesktopShortcut = Join-Path $DesktopDir "WinIRFaceID.lnk"
     New-WinIRFaceIDShortcut -ShortcutPath $DesktopShortcut
 }

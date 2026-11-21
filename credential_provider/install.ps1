@@ -7,7 +7,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$DllPath = (Join-Path $PSScriptRoot "build\Release\WinIRFaceIDProvider.dll")
+    [string]$DllPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,7 +17,22 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Administrator privileges are required. Re-run this script from an elevated PowerShell prompt."
 }
 
-if (-not (Test-Path -LiteralPath $DllPath)) {
+if ([string]::IsNullOrWhiteSpace($DllPath)) {
+    $candidates = @(
+        (Join-Path $PSScriptRoot "..\bin\WinIRFaceIDProvider.dll"),
+        (Join-Path $PSScriptRoot "build\Release\WinIRFaceIDProvider.dll")
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            $DllPath = (Resolve-Path -LiteralPath $candidate).Path
+            break
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($DllPath)) {
+        throw "WinIRFaceIDProvider.dll not found in '..\bin' or 'build\Release'. Download a prebuilt release or build the project first: cmake -B build -A x64 && cmake --build build --config Release"
+    }
+}
+elseif (-not (Test-Path -LiteralPath $DllPath)) {
     throw "DLL not found at '$DllPath'. Build the project first: cmake -B build -A x64 && cmake --build build --config Release"
 }
 

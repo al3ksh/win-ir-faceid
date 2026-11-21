@@ -77,14 +77,21 @@ win-ir-faceid/
 │   ├── install.ps1 / uninstall.ps1
 │   └── CMakeLists.txt
 ├── scripts/
+│   ├── setup.ps1             # One-click installer (Python, venv, ACLs, models, service & DLL)
 │   ├── install_service.ps1   # Migrates store to machine DPAPI, installs & verifies WinIRFaceIDService
 │   ├── uninstall_service.ps1 # Stops & removes WinIRFaceIDService
-│   └── create_shortcut.ps1   # Creates Start Menu (and optional -Desktop) shortcut
+│   ├── create_shortcut.ps1   # Creates Start Menu (and optional -Desktop / -AllUsers) shortcut
+│   └── build_release.ps1     # Stages & packages ZIP, Inno Setup EXE, and SHA256SUMS.txt
+├── installer/
+│   └── WinIRFaceID.iss       # Inno Setup 6 native Windows x64 wizard installer script
 ├── tools/
 │   └── ir_camera_tester/     # Standalone IR/RGB diagnostic tool with illuminator toggle & recording
-└── docs/
-    ├── IPC_PROTOCOL.md       # Named Pipe JSON protocol specification
-    └── screenshots/          # Desktop UI screenshots & app icon
+├── docs/
+│   ├── IPC_PROTOCOL.md       # Named Pipe JSON protocol specification
+│   └── screenshots/          # Desktop UI screenshots & app icon
+├── Install.bat               # Double-click self-elevating setup launcher
+├── Uninstall.bat             # Double-click self-elevating uninstaller
+└── launch_gui.bat            # Launches the desktop GUI
 ```
 
 ---
@@ -92,15 +99,30 @@ win-ir-faceid/
 ## Requirements
 
 - **OS:** Windows 11 x64 with a Windows Hello IR camera (hardware IR sensor + 850nm illuminator)
-- **Python:** 3.11 or newer (`x64`)
-- **Build Tools:** Visual Studio 2022 / 2026 (Desktop development with C++ + CMake) to build the C++ Credential Provider and Service Host
 - **Runtime:** Microsoft Edge WebView2 Runtime (pre-installed on Windows 11)
+- **Python (auto-installed by setup if missing):** 3.11 or newer (`x64`)
+- **Build Tools (Source Build only):** Visual Studio 2022 / 2026 (Desktop development with C++ + CMake) to compile the C++ Credential Provider and Service Host
 
 ---
 
 ## Installation & Setup
 
-### 1. Clone & Install Python Dependencies
+### Option 1: Plug & Play Installer (Recommended)
+
+Zero Visual Studio, CMake, or manual Python steps required — download from [GitHub Releases](https://github.com/al3ksh/win-ir-faceid/releases):
+
+- **Wizard Installer (`WinIRFaceID-Setup-vX.Y.Z-x64.exe`):** Run the installer and follow the setup wizard. It installs into `Program Files\WinIRFaceID`, automatically ensures Python 3.11+ x64 (via `winget` if missing), sets up `.venv`, downloads the ONNX models (~37 MB), installs `WinIRFaceIDService`, registers the lock screen Credential Provider, creates your Start Menu shortcut, and launches **WinIRFaceID**.
+- **Portable Release ZIP (`WinIRFaceID-vX.Y.Z-win64.zip`):** Extract the archive to a permanent folder and double-click **`Install.bat`** (requests Administrator UAC once and configures everything automatically).
+
+Once the **WinIRFaceID** desktop window opens:
+1. Verify your Windows username is filled in under **Account** and click **Enroll Face** (8 active-IR captures). If you wear glasses, click **Add Appearance** afterwards to enroll an additional look with glasses on.
+2. Click **Password** and save your Windows logon password (encrypted locally via DPAPI). For a Microsoft Account, enter your Microsoft Account password and keep **Domain** set to `.`.
+3. Click **Test Live** to verify active-IR detection, anti-spoofing, and match score.
+4. Press **`Win + L`** to lock your workstation and test pure-IR unlock (keep Windows Hello PIN or Password enabled as your fallback).
+
+### Option 2: Build from Source (Developers)
+
+#### 1. Clone & Install Python Dependencies
 
 ```powershell
 git clone https://github.com/al3ksh/win-ir-faceid.git
@@ -111,7 +133,9 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Launch the App, Download Models & Enroll Your Face
+*(Tip: After cloning, you can also double-click `Install.bat` or run `.\scripts\setup.ps1` as Administrator — if CMake and Visual Studio Build Tools are on `PATH`, it builds the C++ targets and completes the full setup automatically.)*
+
+#### 2. Launch the App, Download Models & Enroll Your Face
 
 Launch the desktop app via `launch_gui.bat` (or create a Start Menu shortcut first):
 
@@ -126,7 +150,7 @@ Inside the **WinIRFaceID** window:
 3. Click **Password** and save your Windows logon password (encrypted locally via DPAPI). For a Microsoft Account, enter your Microsoft Account password and keep **Domain** set to `.`.
 4. Click **Test Live** to verify active-IR detection, anti-spoofing, and match score before enabling lock screen integration.
 
-### 3. Build the C++ Credential Provider & Service Host (`x64 Release`)
+#### 3. Build the C++ Credential Provider & Service Host (`x64 Release`)
 
 ```powershell
 cmake -S credential_provider -B credential_provider/build -A x64
@@ -140,7 +164,7 @@ This produces:
 - `credential_provider\build\Release\WinIRFaceIDService.exe`
 - `credential_provider\build\Release\pipe_client_test.exe`
 
-### 4. Install & Verify `WinIRFaceIDService` (Administrator PowerShell)
+#### 4. Install & Verify `WinIRFaceIDService` (Administrator PowerShell)
 
 Run the following from an **elevated (Administrator) PowerShell** prompt at the repository root:
 
@@ -151,7 +175,7 @@ Run the following from an **elevated (Administrator) PowerShell** prompt at the 
 
 `install_service.ps1` migrates `data\profiles.enc` to machine-scoped DPAPI with a hardened NTFS DACL, installs `WinIRFaceIDService` as `LocalSystem`, starts it, and runs `pipe_client_test.exe ping`. Confirm `pipe_client_test.exe verify <your-windows-username>` matches your face cleanly before registering the lock screen DLL.
 
-### 5. Register the Credential Provider (Administrator PowerShell)
+#### 5. Register the Credential Provider (Administrator PowerShell)
 
 Still in an **elevated PowerShell** prompt (keep Windows Hello PIN or Password enabled as your fallback):
 
@@ -187,7 +211,8 @@ Press **`Win + L`** to lock your workstation and test pure-IR unlock.
 
 ## Clean Uninstall & Safe Mode Recovery
 
-To unregister the Credential Provider and remove the background service, run in an **Administrator PowerShell** prompt:
+- **Wizard Installer:** Uninstall **WinIRFaceID** from **Windows Settings -> Apps -> Installed apps** (automatically unregisters the Credential Provider, removes `WinIRFaceIDService`, and cleans up `.venv` and `models`).
+- **Portable ZIP / Source Clone:** Double-click **`Uninstall.bat`**, or run in an **Administrator PowerShell** prompt:
 
 ```powershell
 .\credential_provider\uninstall.ps1

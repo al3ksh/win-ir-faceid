@@ -24,7 +24,7 @@ if ($null -eq $existing) {
 
 if ($existing.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
     Write-Host "Stopping '$ServiceName'..."
-    & sc.exe stop $ServiceName
+    & sc.exe stop $ServiceName | Out-Null
     $stopDeadline = (Get-Date).AddSeconds(10)
     while ((Get-Date) -lt $stopDeadline) {
         Start-Sleep -Milliseconds 300
@@ -37,8 +37,9 @@ if ($existing.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stoppe
 
 Write-Host "Deleting '$ServiceName'..."
 & sc.exe delete $ServiceName
-if ($LASTEXITCODE -ne 0) {
-    throw "sc.exe delete failed with exit code $LASTEXITCODE"
+$deleteExit = $LASTEXITCODE
+if ($deleteExit -ne 0 -and $deleteExit -ne 1060 -and $deleteExit -ne 1072) {
+    throw "sc.exe delete failed with exit code $deleteExit"
 }
 
 $deleteDeadline = (Get-Date).AddSeconds(5)
@@ -50,3 +51,4 @@ while ((Get-Date) -lt $deleteDeadline) {
 }
 
 Write-Host "Service '$ServiceName' stopped and deleted."
+exit 0

@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version without v prefix (e.g. 0.1.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build-release:
+    name: Build Windows x64 Release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 (x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+
+      - name: Install Python dependencies and run tests
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+          pytest -v
+
+      - name: Build Credential Provider & Service Host (x64 Release)
+        shell: pwsh
+        run: |
+          cmake -S credential_provider -B credential_provider/build -A x64
+          cmake --build credential_provider/build --config Release
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Package release artifacts
+        shell: pwsh
+        run: |
+          $ver = "${{ github.event.inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($ver) -and $env:GITHUB_REF -like "refs/tags/v*") {
+            $ver = $env:GITHUB_REF.Substring("refs/tags/v".Length)
+          }
+          if ([string]::IsNullOrWhiteSpace($ver)) {
+            $initContent = Get-Content -LiteralPath "engine\__init__.py" -Raw
+            if ($initContent -match '__version__\s*=\s*"([^"]+)"') {
+              $ver = $Matches[1]
+            }
+            else {
+              $ver = "0.1.0"
+            }
+          }
+          $ver = $ver.TrimStart('v')
+          Write-Host "Packaging release version: $ver"
+          .\scripts\build_release.ps1 -Version $ver -SkipBuild
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinIRFaceID-release
+          path: |
+            dist/WinIRFaceID-Setup-v*.exe
+            dist/WinIRFaceID-v*-win64.zip
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/WinIRFaceID-Setup-v*.exe
+            dist/WinIRFaceID-v*-win64.zip
+            dist/SHA256SUMS.txt

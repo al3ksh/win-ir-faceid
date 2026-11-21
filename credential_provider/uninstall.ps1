@@ -37,3 +37,4 @@ else {
 }
 
 Write-Host "WinIRFaceIDProvider unregistered."
+exit 0

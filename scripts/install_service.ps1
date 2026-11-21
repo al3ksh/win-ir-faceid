@@ -9,7 +9,9 @@
     4. Starts the service and verifies the LocalSystem Named Pipe with pipe_client_test.exe ping.
 #>
 [CmdletBinding()]
-param()
+param(
+    [string]$BinDir = ""
+)
 
 $ErrorActionPreference = "Stop"
 $ServiceName = "WinIRFaceIDService"
@@ -23,17 +25,39 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $PythonExe = Join-Path $RepoRoot ".venv\Scripts\python.exe"
-$ServiceExe = Join-Path $RepoRoot "credential_provider\build\Release\WinIRFaceIDService.exe"
-$PipeTestExe = Join-Path $RepoRoot "credential_provider\build\Release\pipe_client_test.exe"
+
+function Resolve-ServiceBinary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FileName
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($BinDir)) {
+        $candidate = Join-Path $BinDir $FileName
+        if (Test-Path -LiteralPath $candidate) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+        throw "$FileName not found in specified BinDir '$BinDir'."
+    }
+
+    $candidates = @(
+        (Join-Path $RepoRoot "bin\$FileName"),
+        (Join-Path $RepoRoot "credential_provider\build\Release\$FileName")
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+
+    throw "$FileName not found in '$RepoRoot\bin' or '$RepoRoot\credential_provider\build\Release'. Download a prebuilt release or build credential_provider first (x64 Release)."
+}
+
+$ServiceExe = Resolve-ServiceBinary -FileName "WinIRFaceIDService.exe"
+$PipeTestExe = Resolve-ServiceBinary -FileName "pipe_client_test.exe"
 
 if (-not (Test-Path -LiteralPath $PythonExe)) {
     throw "Python virtualenv not found at '$PythonExe'."
-}
-if (-not (Test-Path -LiteralPath $ServiceExe)) {
-    throw "WinIRFaceIDService.exe not found at '$ServiceExe'. Build credential_provider first (x64 Release)."
-}
-if (-not (Test-Path -LiteralPath $PipeTestExe)) {
-    throw "pipe_client_test.exe not found at '$PipeTestExe'. Build credential_provider first (x64 Release)."
 }
 
 Write-Host "Migrating profile store to machine-scoped DPAPI..."
