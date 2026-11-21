@@ -21,6 +21,8 @@
     appShell: document.querySelector(".app-shell"),
     settingsPane: document.querySelector(".settings-pane"),
 
+    btnBrandRepo: $("btnBrandRepo"),
+    btnVersion: $("btnVersion"),
     headerServiceDot: $("headerServiceDot"),
     headerServiceText: $("headerServiceText"),
     btnHeaderRestart: $("btnHeaderRestart"),
@@ -122,6 +124,7 @@
     startupNoIrDismissed: false,
     currentErrorInfo: null,
     isRescanning: false,
+    updateReleaseUrl: "",
   };
 
   function api() {
@@ -851,6 +854,10 @@
     state.bootstrap = boot;
     state.profiles = boot.profiles || [];
 
+    if (els.btnVersion && boot.version) {
+      els.btnVersion.textContent = `v${boot.version}`;
+    }
+
     if (!els.usernameInput.value) {
       els.usernameInput.value = boot.active_user || "";
     }
@@ -1278,6 +1285,65 @@
     };
     els.btnHeaderRestart.addEventListener("click", handleRestart);
     els.btnPaneRestart.addEventListener("click", handleRestart);
+
+    if (els.btnBrandRepo) {
+      els.btnBrandRepo.addEventListener("click", async () => {
+        const a = api();
+        if (!a || typeof a.open_external_url !== "function") return;
+        const repoUrl = state.bootstrap && state.bootstrap.repo_url ? state.bootstrap.repo_url : null;
+        const res = await a.open_external_url(repoUrl);
+        if (res && !res.ok && res.error) {
+          showFeedback(res.error, "warn");
+        }
+      });
+    }
+
+    if (els.btnVersion) {
+      els.btnVersion.addEventListener("click", async () => {
+        const a = api();
+        if (!a) return;
+        if (state.updateReleaseUrl) {
+          const openRes = await a.open_external_url(state.updateReleaseUrl);
+          if (openRes && !openRes.ok && openRes.error) {
+            showFeedback(openRes.error, "warn");
+          }
+          return;
+        }
+        if (typeof a.check_for_updates !== "function") return;
+
+        const current = (state.bootstrap && state.bootstrap.version) || "0.1.0";
+        els.btnVersion.disabled = true;
+        els.btnVersion.textContent = "Checking...";
+        try {
+          const res = await a.check_for_updates();
+          if (res && res.ok && res.update_available) {
+            els.btnVersion.textContent = `Update v${res.latest_version}`;
+            els.btnVersion.dataset.state = "update";
+            els.btnVersion.title = "Open GitHub release page";
+            state.updateReleaseUrl = res.release_url || "";
+            showFeedback(
+              `Update available: v${res.latest_version} (click badge to download).`,
+              "ok",
+              6000
+            );
+          } else if (res && res.ok && res.no_releases) {
+            els.btnVersion.textContent = `v${current}`;
+            showFeedback("No GitHub releases published yet.", "neutral");
+          } else if (res && res.ok) {
+            els.btnVersion.textContent = `v${current}`;
+            showFeedback(`WinIRFaceID v${current} is up to date.`, "neutral");
+          } else {
+            els.btnVersion.textContent = `v${current}`;
+            showFeedback((res && res.error) || "Unable to check for updates.", "warn");
+          }
+        } catch (_err) {
+          els.btnVersion.textContent = `v${current}`;
+          showFeedback("Unable to check for updates.", "warn");
+        } finally {
+          els.btnVersion.disabled = false;
+        }
+      });
+    }
 
     window.addEventListener("resize", () => {
       positionSegThumb(false);

@@ -8,9 +8,13 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import threading
 import time
+import urllib.error
+import urllib.request
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -18,6 +22,8 @@ from urllib.parse import parse_qs, urlparse
 
 import cv2
 import numpy as np
+
+from engine import REPO_URL, RELEASES_API_URL, __version__
 
 from engine.liveness import (
     EyeOpenResult,
@@ -80,6 +86,126 @@ _APP_USER_MODEL_ID = "WinIRFaceID.Desktop.App"
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
+
+
+_SEMVER_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+
+
+def parse_semver(version_str: str) -> tuple[int, int, int] | None:
+    """Parse a semantic version string (e.g. 'v0.1.0', '1.0.0-rc1') into (major, minor, patch)."""
+    if not isinstance(version_str, str):
+        return None
+    cleaned = version_str.strip()
+    if not cleaned:
+        return None
+    match = _SEMVER_RE.fullmatch(cleaned)
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def is_newer_version(latest: str, current: str) -> bool:
+    """Return True if *latest* represents a strictly newer semantic version than *current*."""
+    latest_tuple = parse_semver(latest)
+    current_tuple = parse_semver(current)
+    if latest_tuple is None or current_tuple is None:
+        return False
+    return latest_tuple > current_tuple
+
+
+def check_github_latest_release(
+    current_version: str = __version__,
+    api_url: str = RELEASES_API_URL,
+    timeout: float = 4.0,
+) -> dict[str, Any]:
+    """Query GitHub Releases API once on explicit user action for a newer release."""
+    fallback_url = f"{REPO_URL}/releases"
+    req = urllib.request.Request(
+        api_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"WinIRFaceID/{current_version}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            if status == 404:
+                return {
+                    "ok": True,
+                    "current_version": current_version,
+                    "latest_version": current_version,
+                    "update_available": False,
+                    "release_url": fallback_url,
+                    "no_releases": True,
+                    "error": None,
+                }
+            if status is not None and status >= 400:
+                return {
+                    "ok": False,
+                    "current_version": current_version,
+                    "latest_version": "",
+                    "update_available": False,
+                    "release_url": fallback_url,
+                    "error": "Unable to reach GitHub.",
+                }
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return {
+                "ok": True,
+                "current_version": current_version,
+                "latest_version": current_version,
+                "update_available": False,
+                "release_url": fallback_url,
+                "no_releases": True,
+                "error": None,
+            }
+        return {
+            "ok": False,
+            "current_version": current_version,
+            "latest_version": "",
+            "update_available": False,
+            "release_url": fallback_url,
+            "error": "Unable to reach GitHub.",
+        }
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError):
+        return {
+            "ok": False,
+            "current_version": current_version,
+            "latest_version": "",
+            "update_available": False,
+            "release_url": fallback_url,
+            "error": "Unable to reach GitHub.",
+        }
+
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "current_version": current_version,
+            "latest_version": "",
+            "update_available": False,
+            "release_url": fallback_url,
+            "error": "Unable to reach GitHub.",
+        }
+
+    raw_tag = str(payload.get("tag_name") or "").strip()
+    latest_clean = raw_tag[1:] if raw_tag.startswith(("v", "V")) else raw_tag
+    raw_html_url = str(payload.get("html_url") or "").strip()
+    safe_url = (
+        raw_html_url
+        if (raw_html_url == REPO_URL or raw_html_url.startswith(f"{REPO_URL}/"))
+        else fallback_url
+    )
+    update_available = is_newer_version(latest_clean, current_version)
+    return {
+        "ok": True,
+        "current_version": current_version,
+        "latest_version": latest_clean,
+        "update_available": update_available,
+        "release_url": safe_url,
+        "error": None,
+    }
 
 
 _ERROR_CLASSIFIERS: tuple[tuple[str, tuple[str, ...], str, list[str]], ...] = (
@@ -564,6 +690,8 @@ class WinIRFaceIDController:
         recognizer_factory: Callable[[], FaceRecognizer] | None = None,
         service_status_provider: Callable[[], str] | None = None,
         service_restarter: Callable[[], dict[str, Any]] | None = None,
+        url_opener: Callable[[str], Any] | None = None,
+        update_checker: Callable[[], dict[str, Any]] | None = None,
         auto_start_server: bool = True,
     ) -> None:
         self._store = store if store is not None else ProfileStore()
@@ -575,6 +703,8 @@ class WinIRFaceIDController:
         self._recognizer_factory = recognizer_factory
         self._service_status_provider = service_status_provider or get_service_status
         self._service_restarter = service_restarter or restart_service_uac
+        self._url_opener = url_opener or webbrowser.open
+        self._update_checker = update_checker or check_github_latest_release
 
         self._lock = threading.RLock()
         self._frame_cond = threading.Condition()
@@ -1192,6 +1322,8 @@ class WinIRFaceIDController:
             has_ir_camera = bool(any(getattr(c, "is_ir", False) for c in self._cameras))
 
         return {
+            "version": __version__,
+            "repo_url": REPO_URL,
             "stream_url": self.stream_url,
             "profiles": profiles,
             "active_user": active_user,
@@ -1533,6 +1665,23 @@ class WinIRFaceIDController:
             "config_dirty": dirty,
         }
 
+    def open_external_url(self, url: str | None = None) -> dict[str, Any]:
+        """Open a strictly validated GitHub repository or release URL in the default browser."""
+        target = str(url).strip() if url else REPO_URL
+        if not target:
+            target = REPO_URL
+        if not (target == REPO_URL or target.startswith(f"{REPO_URL}/")):
+            return {"ok": False, "error": "URL not allowed."}
+        try:
+            self._url_opener(target)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "url": target, "error": None}
+
+    def check_for_updates(self) -> dict[str, Any]:
+        """Manually check GitHub Releases for a newer version on user demand."""
+        return dict(self._update_checker())
+
     def shutdown(self) -> None:
         """Stop camera worker, processing loop, and loopback HTTP server cleanly."""
         self._shutting_down = True
@@ -1617,6 +1766,12 @@ class _JsApiBridge:
 
     def restart_service(self) -> dict[str, Any]:
         return self._ctrl.restart_service()
+
+    def open_external_url(self, url: str | None = None) -> dict[str, Any]:
+        return self._ctrl.open_external_url(url)
+
+    def check_for_updates(self) -> dict[str, Any]:
+        return self._ctrl.check_for_updates()
 
     def shutdown(self) -> None:
         self._ctrl.shutdown()

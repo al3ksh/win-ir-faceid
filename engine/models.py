@@ -9,6 +9,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, NamedTuple
 
+from engine import __version__
+
 logger = logging.getLogger(__name__)
 
 YUNET_FILENAME = "face_detection_yunet_2023mar.onnx"
@@ -66,7 +68,7 @@ def _download_file(
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "WinIRFaceID/0.1.0"},
+        headers={"User-Agent": f"WinIRFaceID/{__version__}"},
     )
 
     fd, tmp_name = tempfile.mkstemp(

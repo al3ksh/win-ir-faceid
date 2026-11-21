@@ -2,7 +2,7 @@
 .SYNOPSIS
     Stages and packages a WinIRFaceID Windows x64 release (ZIP, optional Inno Setup EXE, and SHA256SUMS.txt).
 .PARAMETER Version
-    Semantic version string without leading 'v' (default: 0.1.0).
+    Semantic version string without leading 'v' (defaults to __version__ in engine\__init__.py).
 .PARAMETER SkipBuild
     Skip running CMake to build credential_provider and use existing Release binaries.
 .PARAMETER SkipInstaller
@@ -10,7 +10,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = "0.1.0",
+    [string]$Version = "",
     [switch]$SkipBuild,
     [switch]$SkipInstaller
 )
@@ -18,6 +18,19 @@ param(
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $InitPy = Join-Path $RepoRoot "engine\__init__.py"
+    if (Test-Path -LiteralPath $InitPy) {
+        $initText = Get-Content -LiteralPath $InitPy -Raw -ErrorAction SilentlyContinue
+        if ($initText -match '__version__\s*=\s*["'']([^"'']+)["'']') {
+            $Version = $Matches[1].Trim()
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        $Version = "0.1.0"
+    }
+}
 $DistDir = Join-Path $RepoRoot "dist"
 $StageDir = Join-Path $DistDir "stage"
 $CpDir = Join-Path $RepoRoot "credential_provider"

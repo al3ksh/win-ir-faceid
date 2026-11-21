@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import io
+import json
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +21,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from engine import REPO_URL, __version__  # noqa: E402
 from engine.gui_app import (  # noqa: E402
     _MAX_EMBEDDINGS_PER_USER,
     WinIRFaceIDController,
@@ -26,7 +30,10 @@ from engine.gui_app import (  # noqa: E402
     _get_window_hwnd,
     _load_hicon,
     _resolve_window_icon_path,
+    check_github_latest_release,
     classify_error,
+    is_newer_version,
+    parse_semver,
 )
 from engine.recognizer import FaceDetection  # noqa: E402
 from engine.store import ProfileStore, ServiceConfig, save_service_config  # noqa: E402
@@ -393,3 +400,192 @@ def test_worker_error_in_processing_loop_stops_camera_with_error_info(tmp_path: 
         created_workers[0].stop.assert_called_once()
     finally:
         ctrl.shutdown()
+
+
+def test_parse_semver_and_is_newer_version() -> None:
+    assert parse_semver("0.1.0") == (0, 1, 0)
+    assert parse_semver("v0.2.0") == (0, 2, 0)
+    assert parse_semver("V1.2.3+build42") == (1, 2, 3)
+    assert parse_semver("v1.0.0-rc1") == (1, 0, 0)
+    assert parse_semver("  0.9.10-beta.2+sha  ") == (0, 9, 10)
+
+    for invalid in ("", "   ", "abc", "1.2", "1.2.3.4", "v1.2.x", "vv0.1.0", None):
+        assert parse_semver(invalid) is None  # type: ignore[arg-type]
+
+    assert is_newer_version("v0.2.0", "0.1.0") is True
+    assert is_newer_version("0.1.1", "0.1.0") is True
+    assert is_newer_version("v1.0.0-rc1", "0.9.0") is True
+    assert is_newer_version("0.1.0", "0.1.0") is False
+    assert is_newer_version("v0.1.0", "0.2.0") is False
+    assert is_newer_version("invalid", "0.1.0") is False
+    assert is_newer_version("0.2.0", "invalid") is False
+
+
+def test_open_external_url_allows_repo_and_rejects_arbitrary_urls(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    store = ProfileStore(tmp_path / "profiles.enc")
+    opened_urls: list[str] = []
+
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: [],
+        service_status_provider=lambda: "not_installed",
+        url_opener=opened_urls.append,
+        auto_start_server=False,
+    )
+    bridge = _JsApiBridge(ctrl)
+    try:
+        res_default = bridge.open_external_url()
+        assert res_default["ok"] is True
+        assert res_default["url"] == REPO_URL
+
+        res_repo = bridge.open_external_url(REPO_URL)
+        assert res_repo["ok"] is True
+        assert res_repo["url"] == REPO_URL
+
+        release_url = f"{REPO_URL}/releases/tag/v0.2.0"
+        res_rel = bridge.open_external_url(release_url)
+        assert res_rel["ok"] is True
+        assert res_rel["url"] == release_url
+
+        assert opened_urls == [REPO_URL, REPO_URL, release_url]
+
+        for bad_url in (
+            "https://evil.example",
+            "https://github.com/al3ksh/win-ir-faceid-evil",
+            "http://github.com/al3ksh/win-ir-faceid",
+            "javascript:alert(1)",
+        ):
+            bad_res = bridge.open_external_url(bad_url)
+            assert bad_res == {"ok": False, "error": "URL not allowed."}
+
+        assert len(opened_urls) == 3
+    finally:
+        ctrl.shutdown()
+
+
+def test_bootstrap_version_and_injected_check_for_updates(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    store = ProfileStore(tmp_path / "profiles.enc")
+
+    mock_payload = {
+        "ok": True,
+        "current_version": __version__,
+        "latest_version": "0.2.0",
+        "update_available": True,
+        "release_url": f"{REPO_URL}/releases/tag/v0.2.0",
+        "error": None,
+    }
+    checker = MagicMock(return_value=mock_payload)
+
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: [],
+        service_status_provider=lambda: "not_installed",
+        update_checker=checker,
+        auto_start_server=False,
+    )
+    bridge = _JsApiBridge(ctrl)
+    try:
+        boot = bridge.get_bootstrap()
+        assert boot["version"] == __version__
+        assert boot["repo_url"] == REPO_URL
+        checker.assert_not_called()
+
+        res = bridge.check_for_updates()
+        assert res == mock_payload
+        checker.assert_called_once()
+    finally:
+        ctrl.shutdown()
+
+
+def test_check_github_latest_release_handles_200_404_and_network_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeResp:
+        def __init__(self, status: int, body: dict[str, object]) -> None:
+            self.status = status
+            self._raw = json.dumps(body).encode("utf-8")
+
+        def read(self) -> bytes:
+            return self._raw
+
+        def __enter__(self) -> _FakeResp:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    # HTTP 200 with newer release and valid html_url
+    monkeypatch.setattr(
+        "engine.gui_app.urllib.request.urlopen",
+        lambda req, timeout=4.0: _FakeResp(
+            200,
+            {
+                "tag_name": "v0.2.0",
+                "html_url": f"{REPO_URL}/releases/tag/v0.2.0",
+            },
+        ),
+    )
+    ok_res = check_github_latest_release(current_version="0.1.0")
+    assert ok_res == {
+        "ok": True,
+        "current_version": "0.1.0",
+        "latest_version": "0.2.0",
+        "update_available": True,
+        "release_url": f"{REPO_URL}/releases/tag/v0.2.0",
+        "error": None,
+    }
+
+    # HTTP 200 with untrusted html_url falls back to REPO_URL/releases
+    monkeypatch.setattr(
+        "engine.gui_app.urllib.request.urlopen",
+        lambda req, timeout=4.0: _FakeResp(
+            200,
+            {
+                "tag_name": "v0.1.0",
+                "html_url": "https://evil.example/phish",
+            },
+        ),
+    )
+    same_res = check_github_latest_release(current_version="0.1.0")
+    assert same_res["ok"] is True
+    assert same_res["update_available"] is False
+    assert same_res["release_url"] == f"{REPO_URL}/releases"
+
+    # HTTP 404 returns no_releases
+    def _raise_404(req: object, timeout: float = 4.0) -> object:
+        raise urllib.error.HTTPError(str(req), 404, "Not Found", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr("engine.gui_app.urllib.request.urlopen", _raise_404)
+    not_found = check_github_latest_release(current_version="0.1.0")
+    assert not_found == {
+        "ok": True,
+        "current_version": "0.1.0",
+        "latest_version": "0.1.0",
+        "update_available": False,
+        "release_url": f"{REPO_URL}/releases",
+        "no_releases": True,
+        "error": None,
+    }
+
+    # Network error returns clean failure payload
+    def _raise_net(req: object, timeout: float = 4.0) -> object:
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr("engine.gui_app.urllib.request.urlopen", _raise_net)
+    err_res = check_github_latest_release(current_version="0.1.0")
+    assert err_res == {
+        "ok": False,
+        "current_version": "0.1.0",
+        "latest_version": "",
+        "update_available": False,
+        "release_url": f"{REPO_URL}/releases",
+        "error": "Unable to reach GitHub.",
+    }

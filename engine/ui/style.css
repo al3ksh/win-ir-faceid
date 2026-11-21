@@ -145,7 +145,33 @@ body {
 .brand {
   display: flex;
   align-items: center;
+  gap: 8px;
+}
+
+.brand-link {
+  display: inline-flex;
+  align-items: center;
   gap: 10px;
+  padding: 4px 6px;
+  margin-left: -6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  opacity: 0.92;
+  transition:
+    opacity 140ms ease,
+    color 140ms ease,
+    transform 120ms var(--ease-fluid);
+}
+
+.brand-link:hover:not(:disabled) {
+  opacity: 1;
+  color: #ffffff;
+}
+
+.brand-link:active:not(:disabled) {
+  transform: scale(0.975);
 }
 
 .brand-icon {
@@ -159,7 +185,40 @@ body {
   font-size: 14px;
   font-weight: 600;
   letter-spacing: -0.01em;
-  color: var(--text-primary);
+  color: inherit;
+}
+
+.version-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.version-pill:hover:not(:disabled) {
+  border-color: var(--border);
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.version-pill[data-state="update"] {
+  color: var(--emerald);
+  border-color: rgba(52, 211, 153, 0.32);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.version-pill[data-state="update"]:hover:not(:disabled) {
+  border-color: rgba(52, 211, 153, 0.5);
+  background: rgba(52, 211, 153, 0.14);
 }
 
 .header-right {
