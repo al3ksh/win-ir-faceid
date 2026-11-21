@@ -13,7 +13,13 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from engine.liveness import LivenessResult, TemporalLivenessTracker, check_ir_liveness
+from engine.liveness import (
+    EyeOpenResult,
+    LivenessResult,
+    TemporalLivenessTracker,
+    check_eyes_open_ir,
+    check_ir_liveness,
+)
 from engine.models import ensure_models, models_exist
 from engine.recognizer import (
     DEFAULT_MATCH_THRESHOLD,
@@ -33,6 +39,9 @@ _ACCENT_BLUE = "#3b82f6"
 _ACCENT_GREEN = "#22c55e"
 _ACCENT_RED = "#ef4444"
 _ACCENT_AMBER = "#f59e0b"
+
+_STANDBY_VIDEO_TEXT = "IR Camera Standby — click Enroll, Test Live Match, or Start Preview"
+_STANDBY_LIVENESS_TEXT = "IR Δ: -- | BG: -- | 3D: -- | Standby"
 
 _POSE_PROMPTS = [
     "1/8: Look straight at the IR camera",
@@ -192,6 +201,7 @@ class IREnrollmentApp(tk.Tk):
         self.current_cam_is_ir = False
 
         self._photo_ref: ImageTk.PhotoImage | None = None
+        self._preview_enabled = False
         self._live_match_enabled = False
         self._enrolling = False
         self._enroll_embeddings: list[np.ndarray] = []
@@ -206,16 +216,18 @@ class IREnrollmentApp(tk.Tk):
         self.camera_var = tk.StringVar(value="")
         self.threshold_var = tk.DoubleVar(value=DEFAULT_MATCH_THRESHOLD)
         self.require_motion_var = tk.BooleanVar(value=False)
+        self.require_open_eyes_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Initializing...")
-        self.liveness_var = tk.StringVar(value="IR Δ: --  |  BG: --  |  3D: --  |  --")
+        self.liveness_var = tk.StringVar(value=_STANDBY_LIVENESS_TEXT)
         self.match_var = tk.StringVar(value="Match: Idle")
-        self.ae_var = tk.StringVar(value="AE Status: Normal")
+        self.ae_var = tk.StringVar(value="AE Status: Standby")
         self.prompt_var = tk.StringVar(value="Ready to enroll or test live IR matching.")
 
         self._build_ui()
         self._refresh_profiles_list()
         self._try_load_recognizer()
-        self._discover_and_start_camera()
+        self._discover_cameras()
+        self._enter_standby()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.deiconify()
@@ -248,7 +260,7 @@ class IREnrollmentApp(tk.Tk):
             top_bar,
             textvariable=self.ae_var,
             bg=_BG_CARD,
-            fg=_ACCENT_GREEN,
+            fg=_FG_MUTED,
             font=("Segoe UI", 9, "bold"),
             padx=10,
             pady=4,
@@ -302,7 +314,7 @@ class IREnrollmentApp(tk.Tk):
 
         self.video_label = tk.Label(
             left,
-            text="Waiting for IR camera frames...",
+            text=_STANDBY_VIDEO_TEXT,
             bg="#0b0d12",
             fg=_FG_MUTED,
             font=("Segoe UI", 11),
@@ -405,7 +417,21 @@ class IREnrollmentApp(tk.Tk):
             font=("Segoe UI", 9),
             anchor="w",
         )
-        self.motion_check.pack(fill="x", pady=(0, 10))
+        self.motion_check.pack(fill="x", pady=(0, 2))
+
+        self.open_eyes_check = tk.Checkbutton(
+            right,
+            text="Require Open Eyes",
+            variable=self.require_open_eyes_var,
+            bg=_BG_PANEL,
+            fg=_FG_PRIMARY,
+            selectcolor=_BG_CARD,
+            activebackground=_BG_PANEL,
+            activeforeground=_FG_PRIMARY,
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        self.open_eyes_check.pack(fill="x", pady=(0, 10))
 
         self.btn_enroll = tk.Button(
             right,
@@ -434,6 +460,20 @@ class IREnrollmentApp(tk.Tk):
             pady=8,
         )
         self.btn_live_test.pack(fill="x", pady=4)
+
+        self.btn_preview = tk.Button(
+            right,
+            text="Start Preview",
+            command=self._on_toggle_preview,
+            bg=_BG_CARD,
+            fg=_FG_PRIMARY,
+            activebackground="#2f3749",
+            activeforeground=_FG_PRIMARY,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            pady=7,
+        )
+        self.btn_preview.pack(fill="x", pady=4)
 
         tk.Button(
             right,
@@ -522,7 +562,7 @@ class IREnrollmentApp(tk.Tk):
             self.status_var.set(f"Model load error: {exc}")
             return False
 
-    def _discover_and_start_camera(self) -> None:
+    def _discover_cameras(self) -> None:
         try:
             from engine.ir_camera import discover_cameras
 
@@ -551,7 +591,8 @@ class IREnrollmentApp(tk.Tk):
                     default_idx = idx
                     break
         self.cam_combo.current(default_idx)
-        self._start_camera_by_index(default_idx)
+        self.current_cam_is_ir = bool(self.cameras[default_idx].is_ir)
+        self.status_var.set(f"Camera ready (standby): {self.cameras[default_idx].label}")
 
     def _stop_worker(self) -> None:
         if self.worker is not None:
@@ -561,10 +602,34 @@ class IREnrollmentApp(tk.Tk):
                 pass
             self.worker = None
 
-    def _start_camera_by_index(self, idx: int) -> None:
+    def _enter_standby(self) -> None:
+        self._stop_worker()
+        self._last_processed_pair_ts = None
+        self._photo_ref = None
+        self.video_label.configure(image="", text=_STANDBY_VIDEO_TEXT)
+        self.ae_var.set("AE Status: Standby")
+        self.ae_badge.configure(fg=_FG_MUTED)
+        self.liveness_var.set(_STANDBY_LIVENESS_TEXT)
+        self.match_var.set("Match: Idle")
+        self.match_label.configure(fg=_ACCENT_BLUE)
+
+    def _stop_camera_if_idle(self) -> None:
+        if not self._preview_enabled and not self._enrolling and not self._live_match_enabled:
+            self._enter_standby()
+
+    def _ensure_selected_camera_started(self) -> bool:
+        if self.worker is not None:
+            return True
+        idx = self.cam_combo.current()
+        if idx < 0 or idx >= len(self.cameras):
+            self.status_var.set("No camera available.")
+            return False
+        return self._start_camera_by_index(idx)
+
+    def _start_camera_by_index(self, idx: int) -> bool:
         self._stop_worker()
         if idx < 0 or idx >= len(self.cameras):
-            return
+            return False
         cam = self.cameras[idx]
         self.current_cam_is_ir = bool(cam.is_ir)
         try:
@@ -580,14 +645,24 @@ class IREnrollmentApp(tk.Tk):
             worker.anti_flicker_mode = mode
             worker.start()
             self.worker = worker
+            if self._photo_ref is None:
+                self.video_label.configure(text="Starting IR camera...")
+            self.ae_var.set("AE Status: Normal")
+            self.ae_badge.configure(fg=_ACCENT_GREEN)
             self.status_var.set(f"Camera active: {cam.label}")
+            return True
         except Exception as exc:
             self.status_var.set(f"Failed to start camera: {exc}")
+            return False
 
     def _on_camera_selected(self, _event: Any = None) -> None:
         idx = self.cam_combo.current()
-        if idx >= 0:
-            self._start_camera_by_index(idx)
+        if 0 <= idx < len(self.cameras):
+            self.current_cam_is_ir = bool(self.cameras[idx].is_ir)
+            if self.worker is not None:
+                self._start_camera_by_index(idx)
+            else:
+                self.status_var.set(f"Selected camera (standby): {self.cameras[idx].label}")
 
     def _on_feed_mode_changed(self, _event: Any = None) -> None:
         if self.worker is not None:
@@ -644,6 +719,9 @@ class IREnrollmentApp(tk.Tk):
             self._enroll_embeddings.clear()
             self.btn_enroll.configure(text="Enroll User (8 Samples)")
             self.prompt_var.set("Enrollment cancelled.")
+            self._stop_camera_if_idle()
+            if self.worker is None:
+                self.status_var.set("Enrollment cancelled. IR camera in standby.")
             return
 
         if not self._try_load_recognizer():
@@ -659,6 +737,12 @@ class IREnrollmentApp(tk.Tk):
             messagebox.showwarning("Username Required", "Enter a Windows username.", parent=self)
             return
 
+        idx = self.cam_combo.current()
+        if 0 <= idx < len(self.cameras):
+            self.current_cam_is_ir = bool(self.cameras[idx].is_ir)
+        else:
+            self.current_cam_is_ir = False
+
         if not self.current_cam_is_ir:
             messagebox.showwarning(
                 "IR Camera Required",
@@ -669,6 +753,15 @@ class IREnrollmentApp(tk.Tk):
 
         self._live_match_enabled = False
         self.btn_live_test.configure(text="Test Live Match")
+        self.match_var.set("Match: Idle")
+        self.match_label.configure(fg=_ACCENT_BLUE)
+        if not self._ensure_selected_camera_started():
+            messagebox.showerror(
+                "Camera Error",
+                "Failed to start the selected IR camera.",
+                parent=self,
+            )
+            return
         self._enroll_embeddings = []
         self._last_enroll_capture_ts = 0.0
         self._enrolling = True
@@ -686,6 +779,35 @@ class IREnrollmentApp(tk.Tk):
     def _on_motion_toggle(self) -> None:
         self._motion_tracker.reset()
 
+    def _on_toggle_preview(self) -> None:
+        if not self._preview_enabled:
+            idx = self.cam_combo.current()
+            if idx < 0 or idx >= len(self.cameras):
+                messagebox.showwarning(
+                    "No Camera",
+                    "No camera available to preview.",
+                    parent=self,
+                )
+                return
+            if not self._ensure_selected_camera_started():
+                messagebox.showerror(
+                    "Camera Error",
+                    "Failed to start the selected camera.",
+                    parent=self,
+                )
+                return
+            self._preview_enabled = True
+            self.btn_preview.configure(text="Stop Preview", bg=_ACCENT_AMBER, fg="#09150d")
+            if not self._enrolling and not self._live_match_enabled:
+                self.prompt_var.set("IR camera preview active.")
+        else:
+            self._preview_enabled = False
+            self.btn_preview.configure(text="Start Preview", bg=_BG_CARD, fg=_FG_PRIMARY)
+            self._stop_camera_if_idle()
+            if self.worker is None:
+                self.prompt_var.set("Ready to enroll or test live IR matching.")
+                self.status_var.set("IR camera in standby.")
+
     def _on_toggle_live_match(self) -> None:
         if not self._live_match_enabled:
             if not self._try_load_recognizer():
@@ -695,6 +817,11 @@ class IREnrollmentApp(tk.Tk):
                     parent=self,
                 )
                 return
+            idx = self.cam_combo.current()
+            if 0 <= idx < len(self.cameras):
+                self.current_cam_is_ir = bool(self.cameras[idx].is_ir)
+            else:
+                self.current_cam_is_ir = False
             if not self.current_cam_is_ir:
                 messagebox.showwarning(
                     "IR Camera Required",
@@ -702,21 +829,33 @@ class IREnrollmentApp(tk.Tk):
                     parent=self,
                 )
                 return
-        self._enrolling = False
-        self.btn_enroll.configure(text="Enroll User (8 Samples)")
-        self._motion_tracker.reset()
-        self._live_match_enabled = not self._live_match_enabled
-        if self._live_match_enabled:
+            self._enrolling = False
+            self._enroll_embeddings.clear()
+            self.btn_enroll.configure(text="Enroll User (8 Samples)")
+            if not self._ensure_selected_camera_started():
+                messagebox.showerror(
+                    "Camera Error",
+                    "Failed to start the selected IR camera.",
+                    parent=self,
+                )
+                return
+            self._motion_tracker.reset()
+            self._live_match_enabled = True
             self.btn_live_test.configure(text="Stop Live Match")
             if self.require_motion_var.get():
                 self.prompt_var.set("Live IR match active — blink or slightly turn your head.")
             else:
                 self.prompt_var.set("Live IR match active — look at the IR camera.")
         else:
+            self._live_match_enabled = False
+            self._motion_tracker.reset()
             self.btn_live_test.configure(text="Test Live Match")
             self.match_var.set("Match: Idle")
             self.match_label.configure(fg=_ACCENT_BLUE)
             self.prompt_var.set("Ready to enroll or test live IR matching.")
+            self._stop_camera_if_idle()
+            if self.worker is None:
+                self.status_var.set("Live match stopped. IR camera in standby.")
 
     def _on_set_password(self) -> None:
         username = self.username_var.get().strip()
@@ -830,6 +969,9 @@ class IREnrollmentApp(tk.Tk):
                     self.prompt_var.set(f"Enrollment complete for '{username}'!")
                     self.status_var.set(f"Saved {captured} IR samples for '{username}'.")
                     self._refresh_profiles_list()
+                    self._stop_camera_if_idle()
+                    if self.worker is None:
+                        return None, None, None, None
                 else:
                     self.prompt_var.set(_POSE_PROMPTS[captured])
 
@@ -858,16 +1000,27 @@ class IREnrollmentApp(tk.Tk):
             live_ok = self.current_cam_is_ir and bool(liveness and liveness.passed)
             motion_ok = True
             motion_reason = ""
+            motion_src = (
+                pair.diff_bgr if (pair is not None and pair.dark_bgr is not None) else eval_src
+            )
             if live_ok and self.require_motion_var.get():
-                motion_src = (
-                    pair.diff_bgr if (pair is not None and pair.dark_bgr is not None) else eval_src
-                )
                 motion_ts = pair.timestamp if pair is not None else None
                 motion_ok, motion_reason = self._motion_tracker.update(
                     motion_src,
                     det,
                     timestamp=motion_ts,
                 )
+
+            eye_res: EyeOpenResult | None = None
+            if live_ok and self.require_open_eyes_var.get():
+                eye_res = check_eyes_open_ir(motion_src, det)
+                if liveness is not None:
+                    self.liveness_var.set(
+                        f"IR Δ: {liveness.delta:5.1f}  |  BG: {liveness.bg_ratio:.2f}  |  "
+                        f"3D: {liveness.relief_3d:+.2f}  |  "
+                        f"Eyes: {eye_res.left_score:.2f}/{eye_res.right_score:.2f}  |  "
+                        f"{liveness.reason}"
+                    )
 
             if not live_ok:
                 reason_tag = liveness.reason if liveness is not None else "no_ir"
@@ -878,6 +1031,9 @@ class IREnrollmentApp(tk.Tk):
                 self.match_label.configure(fg=_ACCENT_RED)
             elif not motion_ok:
                 self.match_var.set("Match: Blink / move head (3D)")
+                self.match_label.configure(fg=_ACCENT_AMBER)
+            elif eye_res is not None and not eye_res.passed:
+                self.match_var.set(f"Match: Eyes closed ({eye_res.min_score:.2f})")
                 self.match_label.configure(fg=_ACCENT_AMBER)
             elif best_user and best_score >= thresh:
                 suffix = f", {motion_reason}" if motion_reason else ""
@@ -943,6 +1099,7 @@ class IREnrollmentApp(tk.Tk):
         self.after(30, self._update_loop)
 
     def _on_close(self) -> None:
+        self._preview_enabled = False
         self._enrolling = False
         self._live_match_enabled = False
         self._stop_worker()

@@ -19,7 +19,7 @@ import win32security
 import winerror
 
 from engine import __version__
-from engine.liveness import TemporalLivenessTracker, check_ir_liveness
+from engine.liveness import TemporalLivenessTracker, check_eyes_open_ir, check_ir_liveness
 from engine.recognizer import DEFAULT_MATCH_THRESHOLD, FaceRecognizer, enhance_ir_bgr
 from engine.store import ProfileStore, UserProfile
 
@@ -87,6 +87,8 @@ class IRFaceVerifier:
         min_liveness_delta: float = 12.0,
         min_liveness_ratio: float = 1.30,
         require_motion: bool = False,
+        require_open_eyes: bool = False,
+        min_eye_open_score: float = 0.28,
         camera_discoverer: Callable[[], list[Any]] | None = None,
         worker_factory: Callable[..., Any] | None = None,
     ) -> None:
@@ -97,6 +99,8 @@ class IRFaceVerifier:
         self.min_liveness_delta = min_liveness_delta
         self.min_liveness_ratio = min_liveness_ratio
         self.require_motion = bool(require_motion)
+        self.require_open_eyes = bool(require_open_eyes)
+        self.min_eye_open_score = float(min_eye_open_score)
         self._camera_discoverer = camera_discoverer
         self._worker_factory = worker_factory
 
@@ -230,14 +234,25 @@ class IRFaceVerifier:
                     consecutive_count = 0
                     continue
 
+                motion_frame = pair.diff_bgr if pair.dark_bgr is not None else pair.bright_bgr
                 if motion_tracker is not None:
-                    motion_frame = pair.diff_bgr if pair.dark_bgr is not None else pair.bright_bgr
                     motion_ok, _motion_reason = motion_tracker.update(
                         motion_frame,
                         det,
                         timestamp=pair.timestamp,
                     )
                     if not motion_ok:
+                        consecutive_user = None
+                        consecutive_count = 0
+                        continue
+
+                if self.require_open_eyes:
+                    eye_res = check_eyes_open_ir(
+                        motion_frame,
+                        det,
+                        min_open_score=self.min_eye_open_score,
+                    )
+                    if not eye_res.passed:
                         consecutive_user = None
                         consecutive_count = 0
                         continue

@@ -19,7 +19,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from engine import __version__
-from engine.cli import _select_enrollment_camera
+from engine.cli import _select_enrollment_camera, build_parser
 from engine.ipc_server import (
     DEFAULT_THRESHOLD,
     IRFaceVerifier,
@@ -28,7 +28,12 @@ from engine.ipc_server import (
     handle_raw_message,
     handle_request,
 )
-from engine.liveness import TemporalLivenessTracker, check_ir_liveness
+from engine.liveness import (
+    EyeOpenResult,
+    TemporalLivenessTracker,
+    check_eyes_open_ir,
+    check_ir_liveness,
+)
 from engine.models import ModelPaths, get_model_paths, models_exist
 from engine.recognizer import (
     DEFAULT_DET_SCORE_THRESHOLD,
@@ -342,6 +347,80 @@ def test_temporal_liveness_tracker_3d_nose_parallax_verifies() -> None:
     ok_expired, reason_expired = tracker.update(frame, det_turned, timestamp=5.0)
     assert ok_expired is False
     assert reason_expired == "waiting_blink_or_motion"
+
+
+def _make_ir_eyes_frame(
+    *,
+    skin_intensity: int = 180,
+    left_pupil_intensity: int = 35,
+    right_pupil_intensity: int = 35,
+    shape: tuple[int, int] = (360, 640),
+    bbox: tuple[int, int, int, int] = (220, 90, 160, 180),
+    eye_left: tuple[int, int] = (270, 150),
+    eye_right: tuple[int, int] = (330, 150),
+) -> np.ndarray:
+    """Create a synthetic active-IR diff frame with radial 3D shading and controllable eye pupils."""
+    h_img, w_img = shape
+    x, y, w, h = bbox
+    frame = np.full((h_img, w_img, 3), 5, dtype=np.uint8)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    nx = (xx - (w - 1) / 2.0) / max(w / 2.0, 1.0)
+    ny = (yy - (h - 1) / 2.0) / max(h / 2.0, 1.0)
+    r2 = np.clip(0.5 * (nx * nx + ny * ny), 0.0, 1.0)
+    shading = 1.0 - 0.70 * r2
+    face_vals = np.clip(skin_intensity * shading, 0, 255).astype(np.uint8)
+    frame[y : y + h, x : x + w] = face_vals[:, :, None]
+
+    # Ensure skin reference patches (nose bridge + upper cheeks) are bright skin_intensity
+    # and stamp dark pupils (or bright closed eyelids) at each eye center.
+    for (ex, ey), pupil_val in (
+        (eye_left, left_pupil_intensity),
+        (eye_right, right_pupil_intensity),
+    ):
+        frame[ey - 5 : ey + 6, ex - 5 : ex + 6] = pupil_val
+    return frame
+
+
+def test_check_eyes_open_ir_open_closed_and_single_eye() -> None:
+    det = _make_face_det()
+
+    # Open dark pupils pass
+    frame_open = _make_ir_eyes_frame(
+        skin_intensity=180,
+        left_pupil_intensity=30,
+        right_pupil_intensity=30,
+    )
+    res_open = check_eyes_open_ir(frame_open, det)
+    assert isinstance(res_open, EyeOpenResult)
+    assert res_open.passed is True
+    assert res_open.reason == "ok"
+    assert res_open.left_score > 0.28
+    assert res_open.right_score > 0.28
+    assert res_open.min_score > 0.28
+
+    # Both eyelids closed (bright IR reflection) fail with eyes_closed
+    frame_closed = _make_ir_eyes_frame(
+        skin_intensity=180,
+        left_pupil_intensity=165,
+        right_pupil_intensity=165,
+    )
+    res_closed = check_eyes_open_ir(frame_closed, det)
+    assert res_closed.passed is False
+    assert res_closed.reason == "eyes_closed"
+    assert res_closed.min_score < 0.28
+
+    # Single closed eye (left open, right closed) fails with eyes_closed
+    frame_single = _make_ir_eyes_frame(
+        skin_intensity=180,
+        left_pupil_intensity=30,
+        right_pupil_intensity=165,
+    )
+    res_single = check_eyes_open_ir(frame_single, det)
+    assert res_single.passed is False
+    assert res_single.reason == "eyes_closed"
+    assert res_single.left_score > 0.28
+    assert res_single.right_score < 0.28
+    assert res_single.min_score == pytest.approx(res_single.right_score)
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +793,94 @@ def test_ir_face_verifier_require_motion_blocks_static_and_passes_on_motion(tmp_
     assert res["username"] == "Alice"
 
 
+def _make_pair_from_diff(diff_bgr: np.ndarray, *, timestamp: float) -> DummyIRFramePair:
+    dark = np.full_like(diff_bgr, 15)
+    bright = np.clip(diff_bgr.astype(np.int16) + dark.astype(np.int16), 0, 235).astype(np.uint8)
+    return DummyIRFramePair(
+        bright_bgr=bright,
+        dark_bgr=dark,
+        diff_bgr=diff_bgr,
+        bright_mean=float(np.mean(bright)),
+        dark_mean=float(np.mean(dark)),
+        illuminator_active=True,
+        timestamp=timestamp,
+    )
+
+
+def test_ir_face_verifier_require_open_eyes_rejects_closed_and_matches_open(tmp_path: Path) -> None:
+    store = ProfileStore(tmp_path / "profiles.enc")
+    alice_vec = np.zeros(128, dtype=np.float32)
+    alice_vec[0] = 1.0
+    store.upsert_embeddings("Alice", [alice_vec], domain=".")
+
+    dummy_cam = MagicMock(group="g1", source_id="s1", is_ir=True, is_virtual=False)
+    det = _make_face_det()
+
+    closed_diff = _make_ir_eyes_frame(
+        skin_intensity=180,
+        left_pupil_intensity=165,
+        right_pupil_intensity=165,
+    )
+    open_diff = _make_ir_eyes_frame(
+        skin_intensity=180,
+        left_pupil_intensity=30,
+        right_pupil_intensity=30,
+    )
+
+    # Closed-eye frames must be rejected
+    worker_closed = MagicMock()
+    worker_closed.error = None
+    worker_closed.get_ir_pair.side_effect = [
+        _make_pair_from_diff(closed_diff, timestamp=1.0),
+        _make_pair_from_diff(closed_diff, timestamp=1.2),
+        _make_pair_from_diff(closed_diff, timestamp=1.4),
+    ] + [None] * 50
+
+    rec_closed = MagicMock()
+    rec_closed.detect_largest.return_value = det
+    rec_closed.extract_embedding.return_value = alice_vec
+    rec_closed.match_against.side_effect = FaceRecognizer.match_against
+
+    verifier_closed = IRFaceVerifier(
+        store,
+        recognizer=rec_closed,
+        required_consecutive=2,
+        require_open_eyes=True,
+        camera_discoverer=lambda: [dummy_cam],
+        worker_factory=lambda **_kw: worker_closed,
+    )
+    assert verifier_closed.verify(timeout_ms=150) == {"status": "failed", "reason": "timeout"}
+
+    # Combined require_motion + require_open_eyes: blink (open -> closed -> open -> open)
+    # registers motion on the closed frame and unlocks once eyes reopen!
+    worker_open = MagicMock()
+    worker_open.error = None
+    worker_open.get_ir_pair.side_effect = [
+        _make_pair_from_diff(open_diff, timestamp=1.0),
+        _make_pair_from_diff(closed_diff, timestamp=1.2),
+        _make_pair_from_diff(open_diff, timestamp=1.4),
+        _make_pair_from_diff(open_diff, timestamp=1.6),
+    ]
+
+    rec_open = MagicMock()
+    rec_open.detect_largest.return_value = det
+    rec_open.extract_embedding.return_value = alice_vec
+    rec_open.match_against.side_effect = FaceRecognizer.match_against
+
+    verifier_open = IRFaceVerifier(
+        store,
+        recognizer=rec_open,
+        required_consecutive=2,
+        require_motion=True,
+        require_open_eyes=True,
+        camera_discoverer=lambda: [dummy_cam],
+        worker_factory=lambda **_kw: worker_open,
+    )
+    res = verifier_open.verify(timeout_ms=2000)
+    assert res["status"] == "matched"
+    assert res["username"] == "Alice"
+
+
 def test_ir_face_verifier_no_enrolled_cancel_and_camera_error(tmp_path: Path) -> None:
     store = ProfileStore(tmp_path / "profiles.enc")
     verifier = IRFaceVerifier(store, recognizer=MagicMock())
@@ -798,3 +965,121 @@ def test_named_pipe_server_live_roundtrip(tmp_path: Path) -> None:
     finally:
         server.close()
         srv_thread.join(timeout=2.0)
+
+
+def test_cli_require_open_eyes_flags() -> None:
+    parser = build_parser()
+    args_verify = parser.parse_args(["verify", "--require-open-eyes", "--require-motion"])
+    assert args_verify.require_open_eyes is True
+    assert args_verify.require_motion is True
+
+    args_serve = parser.parse_args(["serve", "--require-open-eyes"])
+    assert args_serve.require_open_eyes is True
+    assert args_serve.require_motion is False
+
+
+def test_gui_on_demand_camera_standby_and_open_eyes(tmp_path: Path) -> None:
+    from engine.gui_enroll import IREnrollmentApp, _STANDBY_LIVENESS_TEXT, _STANDBY_VIDEO_TEXT
+
+    cam_ir = MagicMock(group="g1", source_id="s1", label="IR Cam", is_ir=True, is_virtual=False)
+    cam_rgb = MagicMock(group="g2", source_id="s2", label="RGB Cam", is_ir=False, is_virtual=False)
+    created_workers: list[MagicMock] = []
+
+    def _make_worker(**_kw: Any) -> MagicMock:
+        w = MagicMock()
+        w.error = None
+        w.get_ir_pair.return_value = None
+        w.get_frame.return_value = None
+        created_workers.append(w)
+        return w
+
+    store = ProfileStore(tmp_path / "profiles.enc")
+    mock_rec = MagicMock()
+
+    with (
+        patch("engine.gui_enroll.ProfileStore", return_value=store),
+        patch("engine.gui_enroll.models_exist", return_value=True),
+        patch("engine.gui_enroll.FaceRecognizer", return_value=mock_rec),
+        patch("engine.ir_camera.discover_cameras", return_value=[cam_rgb, cam_ir]),
+        patch("engine.ir_camera.WinRTCameraWorker", side_effect=_make_worker),
+    ):
+        app = IREnrollmentApp()
+        try:
+            # Startup stays in standby without starting any camera worker
+            assert app.worker is None
+            assert len(created_workers) == 0
+            assert app.ae_var.get() == "AE Status: Standby"
+            assert app.liveness_var.get() == _STANDBY_LIVENESS_TEXT
+            assert app.match_var.get() == "Match: Idle"
+            assert app.video_label.cget("text") == _STANDBY_VIDEO_TEXT
+            assert app.require_open_eyes_var.get() is False
+
+            # Switching camera in standby does NOT start camera
+            app.cam_combo.current(0)
+            app._on_camera_selected()
+            assert app.worker is None
+            assert len(created_workers) == 0
+
+            # Switch back to IR camera and start Preview -> starts worker
+            app.cam_combo.current(1)
+            app._on_camera_selected()
+            assert app.worker is None
+            app._on_toggle_preview()
+            assert app._preview_enabled is True
+            assert app.worker is not None
+            assert len(created_workers) == 1
+
+            # Stopping Preview returns to standby and resets badges
+            app._on_toggle_preview()
+            assert app._preview_enabled is False
+            assert app.worker is None
+            created_workers[0].stop.assert_called_once()
+            assert app.ae_var.get() == "AE Status: Standby"
+            assert app.liveness_var.get() == _STANDBY_LIVENESS_TEXT
+            assert app.match_var.get() == "Match: Idle"
+
+            # Clicking Test Live Match starts camera on demand, Stop returns to standby
+            app._on_toggle_live_match()
+            assert app._live_match_enabled is True
+            assert app.worker is not None
+            assert len(created_workers) == 2
+
+            # Verify open-eyes check blocks closed eyes during Live Match
+            alice_vec = np.zeros(128, dtype=np.float32)
+            alice_vec[0] = 1.0
+            store.upsert_embeddings("Alice", [alice_vec])
+            det = _make_face_det()
+            closed_diff = _make_ir_eyes_frame(
+                skin_intensity=180,
+                left_pupil_intensity=165,
+                right_pupil_intensity=165,
+            )
+            closed_pair = _make_pair_from_diff(closed_diff, timestamp=2.0)
+            app.worker.get_ir_pair.return_value = closed_pair
+            app.worker.get_frame.return_value = closed_diff
+            mock_rec.detect_largest.return_value = det
+            mock_rec.extract_embedding.return_value = alice_vec
+            mock_rec.match_against.side_effect = FaceRecognizer.match_against
+            app.require_open_eyes_var.set(True)
+            app._evaluate_frame()
+            assert app.match_var.get().startswith("Match: Eyes closed (")
+            assert "Eyes:" in app.liveness_var.get()
+
+            app._on_toggle_live_match()
+            assert app._live_match_enabled is False
+            assert app.worker is None
+            assert app.ae_var.get() == "AE Status: Standby"
+
+            # Clicking Enroll starts camera on demand, cancelling returns to standby
+            app.username_var.set("Alice")
+            app._on_enroll_click()
+            assert app._enrolling is True
+            assert app.worker is not None
+            assert len(created_workers) == 3
+
+            app._on_enroll_click()
+            assert app._enrolling is False
+            assert app.worker is None
+            assert app.ae_var.get() == "AE Status: Standby"
+        finally:
+            app._on_close()

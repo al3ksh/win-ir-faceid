@@ -166,6 +166,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         store,
         threshold=args.threshold,
         require_motion=args.require_motion,
+        require_open_eyes=args.require_open_eyes,
     )
     result = verifier.verify(username=args.user or "", timeout_ms=args.timeout)
 
@@ -234,6 +235,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         store,
         threshold=args.threshold,
         require_motion=args.require_motion,
+        require_open_eyes=args.require_open_eyes,
     )
     server = NamedPipeServer(
         pipe_name=args.pipe,
@@ -302,6 +304,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Require live blink or 3D head micro-motion during verification",
     )
+    p_verify.add_argument(
+        "--require-open-eyes",
+        action="store_true",
+        help="Require both eyes to be open in active IR during verification",
+    )
     p_verify.set_defaults(func=_cmd_verify)
 
     p_pw = sub.add_parser("set-password", help="Store DPAPI-encrypted Windows logon password for a user")
@@ -329,6 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-motion",
         action="store_true",
         help="Require live blink or 3D head micro-motion during verification",
+    )
+    p_serve.add_argument(
+        "--require-open-eyes",
+        action="store_true",
+        help="Require both eyes to be open in active IR during verification",
     )
     p_serve.set_defaults(func=_cmd_serve)
 

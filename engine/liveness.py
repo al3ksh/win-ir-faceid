@@ -49,6 +49,17 @@ class LivenessResult:
     face_height_ratio: float = 0.0
 
 
+@dataclass(frozen=True)
+class EyeOpenResult:
+    """Result of evaluating active IR open-eye pupil absorption vs eyelid reflection."""
+
+    passed: bool
+    reason: str
+    left_score: float
+    right_score: float
+    min_score: float
+
+
 def _extract_clamped_roi(
     frame: np.ndarray | None,
     x0: int,
@@ -387,3 +398,152 @@ class TemporalLivenessTracker:
         if parallax_delta >= self.min_parallax:
             return True, "ok_3d_motion"
         return False, "waiting_blink_or_motion"
+
+
+def _clamped_patch(gray: np.ndarray, cx: float, cy: float, radius: int) -> np.ndarray | None:
+    """Extract a 2D slice centered at ``(cx, cy)`` with half-width *radius*."""
+    h_img, w_img = gray.shape[:2]
+    ix = int(round(float(cx)))
+    iy = int(round(float(cy)))
+    x0 = max(0, ix - radius)
+    y0 = max(0, iy - radius)
+    x1 = min(w_img, ix + radius + 1)
+    y1 = min(h_img, iy + radius + 1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return gray[y0:y1, x0:x1]
+
+
+def check_eyes_open_ir(
+    diff_bgr: np.ndarray,
+    det: FaceDetectionLike,
+    *,
+    min_open_score: float = 0.28,
+) -> EyeOpenResult:
+    """Check that both eyes appear open in an active-IR difference frame.
+
+    In 850/940nm active IR, open pupils and irises absorb near-IR light and
+    appear substantially darker than surrounding illuminated facial skin, whereas
+    closed eyelids reflect IR almost as brightly as skin.
+    """
+    if diff_bgr is None or diff_bgr.size == 0 or diff_bgr.ndim < 2:
+        return EyeOpenResult(
+            passed=False,
+            reason="invalid_landmarks",
+            left_score=0.0,
+            right_score=0.0,
+            min_score=0.0,
+        )
+
+    if det is None or getattr(det, "landmarks", None) is None:
+        return EyeOpenResult(
+            passed=False,
+            reason="invalid_landmarks",
+            left_score=0.0,
+            right_score=0.0,
+            min_score=0.0,
+        )
+
+    landmarks = np.asarray(det.landmarks, dtype=np.float32)
+    if (
+        landmarks.ndim != 2
+        or landmarks.shape[0] < 3
+        or landmarks.shape[1] < 2
+        or not np.all(np.isfinite(landmarks[:3, :2]))
+    ):
+        return EyeOpenResult(
+            passed=False,
+            reason="invalid_landmarks",
+            left_score=0.0,
+            right_score=0.0,
+            min_score=0.0,
+        )
+
+    eye_left = landmarks[0, :2]
+    eye_right = landmarks[1, :2]
+    nose = landmarks[2, :2]
+    inter_eye_dist = float(np.linalg.norm(eye_right - eye_left))
+    if inter_eye_dist < 6.0:
+        return EyeOpenResult(
+            passed=False,
+            reason="invalid_landmarks",
+            left_score=0.0,
+            right_score=0.0,
+            min_score=0.0,
+        )
+
+    if diff_bgr.ndim == 2:
+        gray = diff_bgr.astype(np.float32, copy=False)
+    else:
+        gray = np.mean(diff_bgr, axis=2, dtype=np.float32)
+
+    eye_mid = 0.5 * (eye_left + eye_right)
+    bridge = 0.65 * eye_mid + 0.35 * nose
+    left_cheek = (float(eye_left[0]), float(eye_left[1]) + 0.38 * inter_eye_dist)
+    right_cheek = (float(eye_right[0]), float(eye_right[1]) + 0.38 * inter_eye_dist)
+
+    r_skin = max(2, int(round(0.12 * inter_eye_dist)))
+    skin_means: list[float] = []
+    for sx, sy in (
+        (float(bridge[0]), float(bridge[1])),
+        left_cheek,
+        right_cheek,
+    ):
+        patch = _clamped_patch(gray, sx, sy, r_skin)
+        if patch is not None and patch.size > 0:
+            skin_means.append(float(np.mean(patch)))
+
+    if not skin_means:
+        return EyeOpenResult(
+            passed=False,
+            reason="invalid_landmarks",
+            left_score=0.0,
+            right_score=0.0,
+            min_score=0.0,
+        )
+
+    skin_ref = float(np.median(skin_means))
+    if skin_ref < 15.0:
+        return EyeOpenResult(
+            passed=False,
+            reason="too_dark",
+            left_score=0.0,
+            right_score=0.0,
+            min_score=0.0,
+        )
+
+    r_eye = max(3, int(round(0.13 * inter_eye_dist)))
+    left_patch = _clamped_patch(gray, float(eye_left[0]), float(eye_left[1]), r_eye)
+    right_patch = _clamped_patch(gray, float(eye_right[0]), float(eye_right[1]), r_eye)
+    if left_patch is None or right_patch is None or left_patch.size == 0 or right_patch.size == 0:
+        return EyeOpenResult(
+            passed=False,
+            reason="invalid_landmarks",
+            left_score=0.0,
+            right_score=0.0,
+            min_score=0.0,
+        )
+
+    left_p15 = float(np.percentile(left_patch, 15))
+    right_p15 = float(np.percentile(right_patch, 15))
+    denom = max(skin_ref, 1.0)
+    left_score = float((skin_ref - left_p15) / denom)
+    right_score = float((skin_ref - right_p15) / denom)
+    min_score = min(left_score, right_score)
+
+    if min_score < min_open_score:
+        return EyeOpenResult(
+            passed=False,
+            reason="eyes_closed",
+            left_score=left_score,
+            right_score=right_score,
+            min_score=min_score,
+        )
+
+    return EyeOpenResult(
+        passed=True,
+        reason="ok",
+        left_score=left_score,
+        right_score=right_score,
+        min_score=min_score,
+    )
