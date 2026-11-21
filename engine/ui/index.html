@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WinIRFaceID</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header (52px) -->
+    <header class="app-header">
+      <div class="brand">
+        <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 8V6.2A2.2 2.2 0 0 1 6.2 4H8"/>
+          <path d="M16 4h1.8A2.2 2.2 0 0 1 20 6.2V8"/>
+          <path d="M20 16v1.8a2.2 2.2 0 0 1-2.2 2.2H16"/>
+          <path d="M8 20H6.2A2.2 2.2 0 0 1 4 17.8V16"/>
+          <path d="M9.2 9.4v1.7"/>
+          <path d="M14.8 9.4v1.7"/>
+          <path d="M12 10.6v2.1"/>
+          <path d="M9.4 15.2a3.7 3.7 0 0 0 5.2 0"/>
+        </svg>
+        <span class="brand-name">WinIRFaceID</span>
+      </div>
+
+      <div class="header-right">
+        <div class="service-pill" id="headerServicePill" title="Windows Lock Screen Service Status">
+          <span class="status-dot" id="headerServiceDot"></span>
+          <span id="headerServiceText">Checking service</span>
+        </div>
+        <button class="btn-subtle btn-xs hidden" id="btnHeaderRestart" type="button">
+          Restart
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Split Workspace -->
+    <main class="workspace">
+      <!-- Left IR Stage -->
+      <section class="stage-pane">
+        <div class="viewport-frame">
+          <div class="viewport" id="viewport">
+            <img class="stream-img hidden" id="streamImg" alt="Active infrared camera feed">
+
+            <!-- Standby Placeholder -->
+            <div class="standby-overlay" id="standbyOverlay">
+              <svg class="standby-reticle" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M8 16v-3.5A4.5 4.5 0 0 1 12.5 8H16"/>
+                <path d="M32 8h3.5A4.5 4.5 0 0 1 40 12.5V16"/>
+                <path d="M40 32v3.5a4.5 4.5 0 0 1-4.5 4.5H32"/>
+                <path d="M16 40h-3.5A4.5 4.5 0 0 1 8 35.5V32"/>
+                <path d="M18.5 18.8v3.2"/>
+                <path d="M29.5 18.8v3.2"/>
+                <path d="M24 21.5v4.2"/>
+                <path d="M18.8 30.2a7.4 7.4 0 0 0 10.4 0"/>
+              </svg>
+              <div class="standby-title">IR sensor on standby</div>
+              <p class="standby-sub">Activates on demand during enrollment, testing, or preview.</p>
+            </div>
+
+            <!-- Vector SVG Corner-Bracket Face Reticle Overlay -->
+            <div class="reticle-layer" id="reticleLayer">
+              <div class="face-reticle hidden" id="faceReticle" data-tone="neutral">
+                <svg viewBox="0 0 100 100" preserveAspectRatio="none" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path vector-effect="non-scaling-stroke" d="M2 22V8a6 6 0 0 1 6-6h14"/>
+                  <path vector-effect="non-scaling-stroke" d="M78 2h14a6 6 0 0 1 6 6v14"/>
+                  <path vector-effect="non-scaling-stroke" d="M98 78v14a6 6 0 0 1-6 6H78"/>
+                  <path vector-effect="non-scaling-stroke" d="M22 98H8a6 6 0 0 1-6-6V78"/>
+                </svg>
+              </div>
+            </div>
+
+            <!-- Top Floating Status Pill (AE settling or Live Test result) -->
+            <div class="viewport-top-hud">
+              <div class="hud-pill hidden" id="aePill" data-tone="warn">
+                <span class="hud-dot"></span>
+                <span>Settling exposure</span>
+              </div>
+              <div class="hud-pill hidden" id="matchPill" data-tone="neutral">
+                <span class="hud-dot"></span>
+                <span id="matchPillText">Looking for face</span>
+              </div>
+            </div>
+
+            <!-- Bottom Enrollment Overlay (8-segment bar + single calm pose prompt) -->
+            <div class="enroll-hud hidden" id="enrollHud">
+              <div class="enroll-prompt-row">
+                <span class="enroll-prompt" id="enrollPrompt">Look straight at the camera</span>
+                <span class="enroll-counter tabular" id="enrollCounter">0 / 8</span>
+              </div>
+              <div class="enroll-segments" id="enrollSegments" aria-label="Enrollment progress">
+                <span class="seg"></span>
+                <span class="seg"></span>
+                <span class="seg"></span>
+                <span class="seg"></span>
+                <span class="seg"></span>
+                <span class="seg"></span>
+                <span class="seg"></span>
+                <span class="seg"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Stage Action Bar -->
+        <div class="action-bar">
+          <div class="action-primary-group">
+            <button class="btn-primary" id="btnEnroll" type="button">Enroll Face</button>
+            <button class="btn-secondary" id="btnLiveTest" type="button">Test Live</button>
+          </div>
+
+          <div class="action-quiet-group">
+            <button class="btn-ghost" id="btnPreview" type="button" aria-pressed="false">
+              <svg class="btn-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1.5 8s2.4-4.2 6.5-4.2S14.5 8 14.5 8s-2.4 4.2-6.5 4.2S1.5 8 1.5 8Z"/>
+                <circle cx="8" cy="8" r="1.9"/>
+              </svg>
+              <span>Preview</span>
+            </button>
+            <button class="btn-ghost" id="btnDiagnostics" type="button" aria-pressed="false">
+              <svg class="btn-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2 10.5h2.2l1.6-4.5 2.4 6.5 1.8-4.5 1.4 2.5H14"/>
+              </svg>
+              <span>Diagnostics</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Collapsible Monospace Diagnostics Strip -->
+        <div class="diagnostics-strip hidden" id="diagnosticsStrip">
+          <span class="diag-text" id="diagnosticsText">IR Δ -- · BG -- · 3D -- · Eyes --/--</span>
+        </div>
+
+        <!-- Quiet Inline Feedback Toast / Error Line -->
+        <div class="stage-feedback hidden" id="stageFeedback" data-tone="neutral">
+          <span id="stageFeedbackText"></span>
+        </div>
+      </section>
+
+      <!-- Right Settings Pane (336px, hairline-divided, NO nested cards) -->
+      <aside class="settings-pane">
+        <!-- Section: Account -->
+        <section class="settings-section">
+          <h2 class="section-title">Account</h2>
+
+          <div class="account-input-row">
+            <div class="user-field-wrap">
+              <input
+                type="text"
+                id="usernameInput"
+                class="text-input"
+                placeholder="Windows username"
+                autocomplete="off"
+                spellcheck="false"
+                list="profileSuggestions"
+              >
+              <datalist id="profileSuggestions"></datalist>
+            </div>
+            <button class="btn-subtle" id="btnPassword" type="button">Password</button>
+            <button class="btn-subtle btn-danger-ghost hidden" id="btnRemove" type="button">Remove</button>
+          </div>
+
+          <!-- Inline two-step confirm for profile deletion (no browser alert/confirm) -->
+          <div class="inline-confirm hidden" id="removeConfirmRow">
+            <span class="inline-confirm-text" id="removeConfirmText">Remove enrolled data?</span>
+            <div class="inline-confirm-actions">
+              <button class="btn-danger-solid btn-xs" id="btnRemoveConfirm" type="button">Confirm</button>
+              <button class="btn-subtle btn-xs" id="btnRemoveCancel" type="button">Cancel</button>
+            </div>
+          </div>
+
+          <div class="account-status-line" id="accountStatusLine">Not enrolled</div>
+
+          <!-- Inline Model Download Row (shown only when ONNX models are missing) -->
+          <div class="models-row hidden" id="modelsRow">
+            <div class="models-meta">
+              <span class="models-title">Face recognition models missing</span>
+              <span class="models-sub" id="modelsSub">YuNet &amp; SFace ONNX required (~37 MB)</span>
+            </div>
+            <button class="btn-subtle" id="btnDownloadModels" type="button">Download Models</button>
+          </div>
+        </section>
+
+        <!-- Section: Security -->
+        <section class="settings-section">
+          <h2 class="section-title">Security</h2>
+
+          <label class="toggle-row" for="toggleOpenEyes">
+            <div class="toggle-copy">
+              <span class="row-label">Require open eyes</span>
+              <span class="row-desc">Prevents unlocking while eyes are closed</span>
+            </div>
+            <span class="switch">
+              <input type="checkbox" id="toggleOpenEyes">
+              <span class="switch-track"></span>
+            </span>
+          </label>
+
+          <label class="toggle-row" for="toggleMotion">
+            <div class="toggle-copy">
+              <span class="row-label">Require blink or motion</span>
+              <span class="row-desc">Extra 3D check against printed cutouts</span>
+            </div>
+            <span class="switch">
+              <input type="checkbox" id="toggleMotion">
+              <span class="switch-track"></span>
+            </span>
+          </label>
+
+          <div class="slider-block">
+            <div class="slider-header">
+              <span class="row-label">Match strictness</span>
+              <span class="slider-value tabular" id="thresholdValue">0.65</span>
+            </div>
+            <input
+              type="range"
+              id="thresholdSlider"
+              class="range-slider"
+              min="0.50"
+              max="0.80"
+              step="0.01"
+              value="0.65"
+            >
+            <div class="slider-labels">
+              <span>Balanced</span>
+              <span>Strict</span>
+              <span>Max</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Section: Sensor & Service -->
+        <section class="settings-section">
+          <h2 class="section-title">Sensor &amp; Service</h2>
+
+          <div class="control-row">
+            <span class="row-label">IR mode</span>
+            <div class="segmented" role="group" aria-label="IR mode">
+              <button class="seg-btn active" id="btnFeedSubtract" type="button" data-mode="subtract">IR - Ambient</button>
+              <button class="seg-btn" id="btnFeedBright" type="button" data-mode="bright">Bright</button>
+            </div>
+          </div>
+
+          <div class="control-row hidden" id="cameraSelectRow">
+            <span class="row-label">Camera</span>
+            <select class="select-input" id="cameraSelect" aria-label="IR Camera"></select>
+          </div>
+
+          <div class="control-row service-control-row">
+            <div class="service-copy">
+              <span class="row-label">Lock screen service</span>
+              <span class="row-desc" id="paneServiceDesc">Checking status</span>
+            </div>
+            <button class="btn-subtle hidden" id="btnPaneRestart" type="button">Restart</button>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <!-- Minimalist DPAPI Password Modal -->
+  <div class="modal-backdrop hidden" id="passwordModal" role="dialog" aria-modal="true" aria-labelledby="pwModalTitle">
+    <div class="modal-sheet">
+      <div class="modal-header">
+        <h3 class="modal-title" id="pwModalTitle">Logon password</h3>
+        <button class="modal-close" id="btnPwClose" type="button" aria-label="Close">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 4l8 8M12 4l-8 8"/>
+          </svg>
+        </button>
+      </div>
+
+      <p class="modal-subtitle">
+        Stored locally with machine-scoped DPAPI encryption for <strong id="pwModalUser">User</strong>.
+      </p>
+
+      <form id="passwordForm" class="modal-form">
+        <div class="form-field">
+          <label class="field-label" for="pwDomainInput">Domain</label>
+          <input type="text" id="pwDomainInput" class="text-input" value="." autocomplete="off" spellcheck="false">
+        </div>
+
+        <div class="form-field">
+          <label class="field-label" for="pwInput">Windows password</label>
+          <input type="password" id="pwInput" class="text-input" autocomplete="current-password" required>
+        </div>
+
+        <div class="form-field">
+          <label class="field-label" for="pwConfirmInput">Confirm password</label>
+          <input type="password" id="pwConfirmInput" class="text-input" autocomplete="current-password" required>
+        </div>
+
+        <p class="modal-note">
+          For a Microsoft Account, enter your Microsoft Account password and keep Domain as <code>.</code>.
+        </p>
+
+        <div class="modal-error hidden" id="pwModalError"></div>
+
+        <div class="modal-actions">
+          <button class="btn-secondary" id="btnPwCancel" type="button">Cancel</button>
+          <button class="btn-primary" id="btnPwSave" type="submit">Save Encrypted</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

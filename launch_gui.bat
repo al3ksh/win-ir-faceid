@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-start "" ".venv\Scripts\pythonw.exe" -m engine.gui_enroll
+start "" ".venv\Scripts\pythonw.exe" -m engine.gui_app

@@ -296,7 +296,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_gui(_args: argparse.Namespace) -> int:
-    from engine.gui_enroll import main as gui_main
+    try:
+        import webview  # noqa: F401
+        from engine.gui_app import main as gui_main
+    except ImportError:
+        from engine.gui_enroll import main as gui_main
 
     gui_main()
     return 0

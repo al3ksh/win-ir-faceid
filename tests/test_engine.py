@@ -1280,3 +1280,225 @@ def test_winrt_persistent_loop_reuses_single_thread() -> None:
         assert running_id == info_seq[0]
         assert tid == info_seq[1]
         assert name == "WinRT-AsyncLoop"
+
+
+def test_gui_app_controller_headless_http_security_and_lifecycle(tmp_path: Path) -> None:
+    import urllib.error
+    import urllib.request
+
+    from engine.gui_app import WinIRFaceIDController
+
+    store = ProfileStore(tmp_path / "profiles.enc")
+    alice_vec = np.zeros(128, dtype=np.float32)
+    alice_vec[0] = 1.0
+    store.upsert_embeddings("Alice", [alice_vec], domain=".")
+    store.set_credentials("Alice", password="SuperSecretPassword123!", domain=".")
+
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(
+        ServiceConfig(threshold=0.65, require_motion=False, require_open_eyes=False),
+        cfg_path,
+    )
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "face_detection_yunet_2023mar.onnx").write_bytes(b"y" * 2048)
+    (models_dir / "face_recognition_sface_2021dec.onnx").write_bytes(b"s" * 2048)
+
+    cam_ir = MagicMock(group="g1", source_id="s1", label="IR Cam", is_ir=True, is_virtual=False)
+    created_workers: list[MagicMock] = []
+    open_diff = _make_ir_eyes_frame(
+        skin_intensity=180,
+        left_pupil_intensity=30,
+        right_pupil_intensity=30,
+    )
+    closed_diff = _make_ir_eyes_frame(
+        skin_intensity=180,
+        left_pupil_intensity=165,
+        right_pupil_intensity=165,
+    )
+
+    def _make_worker(**_kw: Any) -> MagicMock:
+        w = MagicMock()
+        w.error = None
+        w.get_ir_pair.return_value = None
+        w.get_frame.return_value = None
+        created_workers.append(w)
+        return w
+
+    det = _make_face_det()
+    mock_rec = MagicMock()
+    mock_rec.detect_largest.return_value = det
+    mock_rec.extract_embedding.return_value = alice_vec
+    mock_rec.match_against.side_effect = FaceRecognizer.match_against
+
+    svc_state = {"status": "running"}
+    restart_calls: list[bool] = []
+
+    def _restart_stub() -> dict[str, Any]:
+        restart_calls.append(True)
+        return {"ok": True, "code": 42, "error": None}
+
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=models_dir,
+        camera_discoverer=lambda: [cam_ir],
+        worker_factory=_make_worker,
+        recognizer_factory=lambda: mock_rec,
+        service_status_provider=lambda: svc_state["status"],
+        service_restarter=_restart_stub,
+    )
+
+    try:
+        # 1. Starts in standby with camera OFF
+        assert len(created_workers) == 0
+        st0 = ctrl.get_state()
+        assert st0["mode"] == "standby"
+        assert st0["camera_active"] is False
+
+        # 2. get_bootstrap() never leaks plaintext passwords
+        boot = ctrl.get_bootstrap()
+        boot_json = json.dumps(boot)
+        assert "SuperSecretPassword123!" not in boot_json
+        assert boot["models_ready"] is True
+        assert boot["service_status"] == "running"
+        assert boot["config_dirty"] is False
+        assert boot["profiles"][0]["username"] == "Alice"
+        assert boot["profiles"][0]["has_password"] is True
+        assert "password" not in boot["profiles"][0]
+
+        # 3. HTTP server serves UI assets + /health and rejects /stream without valid token
+        base = ctrl.ui_url.rstrip("/")
+        for asset, marker in (
+            ("/", "WinIRFaceID"),
+            ("/index.html", "WinIRFaceID"),
+            ("/style.css", "--bg-canvas"),
+            ("/app.js", "pywebviewready"),
+        ):
+            with urllib.request.urlopen(f"{base}{asset}", timeout=3.0) as resp:
+                assert resp.status == 200
+                body = resp.read().decode("utf-8")
+                assert marker in body
+
+        with urllib.request.urlopen(f"{base}/health", timeout=3.0) as resp:
+            assert resp.status == 200
+            assert json.loads(resp.read().decode("utf-8"))["camera_active"] is False
+
+        for bad_url in (f"{base}/stream", f"{base}/stream?token=invalid_token"):
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                urllib.request.urlopen(bad_url, timeout=3.0)
+            assert exc_info.value.code == 403
+
+        # Valid token on standby returns 503 (only streams while camera is active)
+        with pytest.raises(urllib.error.HTTPError) as exc_standby:
+            urllib.request.urlopen(ctrl.stream_url, timeout=3.0)
+        assert exc_standby.value.code == 503
+
+        # 4. update_config persists to service_config.json & marks config_dirty while running
+        upd = ctrl.update_config(0.72, True, True)
+        assert upd["ok"] is True
+        assert upd["config_dirty"] is True
+        reloaded = load_service_config(cfg_path)
+        assert reloaded.threshold == pytest.approx(0.72)
+        assert reloaded.require_motion is True
+        assert reloaded.require_open_eyes is True
+
+        rest_res = ctrl.restart_service()
+        assert rest_res["ok"] is True
+        assert len(restart_calls) == 1
+        assert rest_res["config_dirty"] is False
+
+        # 5. Live test + MJPEG stream + closed-eyes gating after motion
+        ctrl.update_config(0.65, False, True)
+        res_test = ctrl.toggle_live_test()
+        assert res_test["ok"] is True
+        assert len(created_workers) == 1
+        worker_test = created_workers[0]
+        worker_test.get_ir_pair.return_value = _make_pair_from_diff(closed_diff, timestamp=10.0)
+        worker_test.get_frame.return_value = closed_diff
+
+        # Wait briefly for loop to publish JPEG and evaluate closed eyes
+        deadline = time.monotonic() + 2.0
+        saw_closed = False
+        while time.monotonic() < deadline:
+            st = ctrl.get_state()
+            if st["bbox_norm"] is not None and st["match"]["state"] == "waiting":
+                saw_closed = st["match"]["detail"] == "eyes_closed"
+                if saw_closed:
+                    break
+            time.sleep(0.03)
+        assert saw_closed is True
+
+        # Switch to open eyes -> verified match + verify live /stream delivers JPEG frame
+        worker_test.get_ir_pair.return_value = _make_pair_from_diff(open_diff, timestamp=11.0)
+        worker_test.get_frame.return_value = open_diff
+        deadline = time.monotonic() + 2.0
+        saw_verified = False
+        while time.monotonic() < deadline:
+            st = ctrl.get_state()
+            if st["match"]["state"] == "verified":
+                saw_verified = st["match"]["username"] == "Alice"
+                break
+            time.sleep(0.03)
+        assert saw_verified is True
+
+        with urllib.request.urlopen(ctrl.stream_url, timeout=3.0) as stream_resp:
+            assert stream_resp.status == 200
+            chunk = stream_resp.read(512)
+            assert b"--frame" in chunk
+            assert b"image/jpeg" in chunk
+
+        # Stop live test -> back to standby
+        ctrl.toggle_live_test()
+        assert ctrl.get_state()["mode"] == "standby"
+        worker_test.stop.assert_called()
+
+        # 6. save_password & delete_profile via DPAPI store (never leaks password)
+        pw_res = ctrl.save_password("Bob", ".", "BobPass99!")
+        assert pw_res["ok"] is True
+        assert "BobPass99!" not in json.dumps(pw_res)
+        assert store.get_user("Bob").password == "BobPass99!"
+
+        del_res = ctrl.delete_profile("Bob")
+        assert del_res["ok"] is True
+        assert del_res["deleted"] is True
+        assert store.get_user("Bob") is None
+
+        # 7. Enrollment captures 8 samples and auto-returns to standby
+        ctrl._config.require_open_eyes = False
+        ctrl.start_enroll("Bob")
+        assert len(created_workers) == 2
+        worker_enroll = created_workers[1]
+
+        ts_counter = [100.0]
+
+        def _next_pair() -> DummyIRFramePair:
+            ts_counter[0] += 1.0
+            return _make_pair_from_diff(open_diff, timestamp=ts_counter[0])
+
+        worker_enroll.get_ir_pair.side_effect = _next_pair
+        worker_enroll.get_frame.return_value = open_diff
+
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            st_enr = ctrl.get_state()
+            if st_enr["mode"] == "standby" and st_enr["enroll"]["completed_user"] == "Bob":
+                break
+            time.sleep(0.05)
+
+        final_st = ctrl.get_state()
+        assert final_st["mode"] == "standby"
+        assert final_st["camera_active"] is False
+        assert final_st["enroll"]["completed_user"] == "Bob"
+        bob_profile = store.get_user("Bob")
+        assert bob_profile is not None
+        assert len(bob_profile.embeddings) == 8
+        port = ctrl.server_port
+    finally:
+        ctrl.shutdown()
+
+    # After shutdown, loopback HTTP server is closed
+    with pytest.raises(Exception):
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1.0)
+
