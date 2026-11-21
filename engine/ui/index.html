@@ -60,6 +60,26 @@
               <p class="standby-sub">Activates on demand during enrollment, testing, or preview.</p>
             </div>
 
+            <!-- In-Viewport Error & Recovery Overlay -->
+            <div class="stage-error-overlay" id="stageErrorOverlay" data-visible="false" data-code="" aria-hidden="true" role="alert">
+              <svg class="stage-error-icon" viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M6 12V9.5A3.5 3.5 0 0 1 9.5 6H12"/>
+                <path d="M24 6h2.5A3.5 3.5 0 0 1 30 9.5V12"/>
+                <path d="M30 24v2.5a3.5 3.5 0 0 1-3.5 3.5H24"/>
+                <path d="M12 30H9.5A3.5 3.5 0 0 1 6 26.5V24"/>
+                <path d="M18 12.5v6.5"/>
+                <circle cx="18" cy="22.8" r="0.9" fill="currentColor" stroke="none"/>
+              </svg>
+              <div class="stage-error-title" id="stageErrorTitle">IR sensor error</div>
+              <ul class="stage-error-causes" id="stageErrorCauses"></ul>
+              <div class="stage-error-detail hidden" id="stageErrorDetail"></div>
+              <div class="stage-error-actions">
+                <button class="btn-secondary" id="btnErrorRetry" type="button">Retry</button>
+                <button class="btn-ghost" id="btnErrorRescan" type="button">Rescan Cameras</button>
+                <button class="btn-ghost" id="btnErrorDismiss" type="button">Dismiss</button>
+              </div>
+            </div>
+
             <!-- Vector SVG Corner-Bracket Face Reticle Overlay -->
             <div class="reticle-layer" id="reticleLayer">
               <div class="face-reticle" id="faceReticle" data-tone="neutral" data-visible="false">

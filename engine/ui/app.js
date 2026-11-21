@@ -6,6 +6,17 @@
   const CHECK_SVG =
     '<svg class="dropdown-check" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.8 7.3 5.7 10.2 11.2 4.2"/></svg>';
 
+  const NO_IR_ERROR_INFO = {
+    code: "no_ir_camera",
+    title: "No infrared camera detected",
+    causes: [
+      "This device may not have a Windows Hello IR camera.",
+      "Check Device Manager -> Cameras and ensure the IR sensor is enabled.",
+      "Verify Windows Settings -> Privacy & security -> Camera allows desktop apps.",
+    ],
+    detail: "",
+  };
+
   const els = {
     appShell: document.querySelector(".app-shell"),
     settingsPane: document.querySelector(".settings-pane"),
@@ -18,6 +29,13 @@
     streamImg: $("streamImg"),
     standbyOverlay: $("standbyOverlay"),
     standbyTitle: $("standbyTitle"),
+    stageErrorOverlay: $("stageErrorOverlay"),
+    stageErrorTitle: $("stageErrorTitle"),
+    stageErrorCauses: $("stageErrorCauses"),
+    stageErrorDetail: $("stageErrorDetail"),
+    btnErrorRetry: $("btnErrorRetry"),
+    btnErrorRescan: $("btnErrorRescan"),
+    btnErrorDismiss: $("btnErrorDismiss"),
     faceReticle: $("faceReticle"),
     aePill: $("aePill"),
     matchPill: $("matchPill"),
@@ -96,8 +114,14 @@
     wasEnrolling: false,
     cameras: [],
     selectedCameraIdx: 0,
+    hasIrCamera: true,
     dropdownOpen: false,
     dropdownFocusIdx: -1,
+    lastAttemptedMode: null,
+    lastEnrollArgs: null,
+    startupNoIrDismissed: false,
+    currentErrorInfo: null,
+    isRescanning: false,
   };
 
   function api() {
@@ -497,7 +521,13 @@
     const res = await a.select_camera(idx);
     if (res && !res.ok) {
       updateDropdownSelectionUI(prevIdx);
-      if (res.error) showFeedback(res.error, "error");
+      if (res.state && res.state.error_info) {
+        renderLiveState(res.state);
+      } else if (res.error_info) {
+        renderStageErrorOverlay(res.error_info);
+      } else if (res.error) {
+        showFeedback(res.error, "error");
+      }
     }
   }
 
@@ -572,13 +602,56 @@
     els.standbyOverlay.dataset.starting = "false";
   }
 
+  function renderStageErrorOverlay(errorInfo) {
+    if (!errorInfo) {
+      state.currentErrorInfo = null;
+      els.stageErrorOverlay.dataset.code = "";
+      setVisible(els.stageErrorOverlay, false);
+      return;
+    }
+
+    state.currentErrorInfo = errorInfo;
+    const code = errorInfo.code || "sensor_error";
+    const title = (errorInfo.title || "IR sensor error").trim();
+    const detail = (errorInfo.detail || "").trim();
+    const causes = Array.isArray(errorInfo.causes) ? errorInfo.causes : [];
+
+    els.stageErrorOverlay.dataset.code = code;
+    els.stageErrorTitle.textContent = title;
+
+    els.stageErrorCauses.innerHTML = "";
+    for (const cause of causes) {
+      const li = document.createElement("li");
+      li.textContent = cause;
+      els.stageErrorCauses.appendChild(li);
+    }
+
+    if (detail && detail.toLowerCase() !== title.toLowerCase()) {
+      els.stageErrorDetail.textContent = detail;
+      els.stageErrorDetail.classList.remove("hidden");
+    } else {
+      els.stageErrorDetail.textContent = "";
+      els.stageErrorDetail.classList.add("hidden");
+    }
+
+    const showRetry = Boolean(state.lastAttemptedMode) || code !== "no_ir_camera";
+    els.btnErrorRetry.classList.toggle("hidden", !showRetry);
+    els.btnErrorRescan.classList.toggle("btn-secondary", !showRetry);
+    els.btnErrorRescan.classList.toggle("btn-ghost", showRetry);
+
+    els.standbyOverlay.dataset.starting = "false";
+    els.standbyOverlay.dataset.visible = "false";
+    setVisible(els.stageErrorOverlay, true);
+  }
+
   function renderLiveState(live) {
     state.live = live;
     const mode = live.mode || "standby";
     const active = Boolean(live.camera_active) && mode !== "standby";
 
-    // Stream image & standby cross-fade (wait for first real frame before revealing)
+    // Stream image & standby / error cross-fade (wait for first real frame before revealing)
     if (active) {
+      renderStageErrorOverlay(null);
       if (state.clearSrcTimer) {
         clearTimeout(state.clearSrcTimer);
         state.clearSrcTimer = null;
@@ -601,8 +674,16 @@
       els.streamImg.dataset.visible = "false";
       els.standbyTitle.textContent = "IR sensor on standby";
       els.standbyOverlay.dataset.starting = "false";
-      els.standbyOverlay.dataset.visible = "true";
       els.faceReticle.dataset.visible = "false";
+
+      if (live.error_info) {
+        renderStageErrorOverlay(live.error_info);
+      } else if (!state.hasIrCamera && !state.startupNoIrDismissed) {
+        renderStageErrorOverlay(NO_IR_ERROR_INFO);
+      } else {
+        renderStageErrorOverlay(null);
+        els.standbyOverlay.dataset.visible = "true";
+      }
 
       if (state.streamActiveUrl) {
         state.streamActiveUrl = "";
@@ -729,7 +810,7 @@
     }
     state.wasDownloading = Boolean(dl.active);
 
-    if (live.error) {
+    if (live.error && !live.error_info) {
       showFeedback(live.error, "error", 6000);
     }
 
@@ -787,6 +868,10 @@
     renderModelsRow(Boolean(boot.models_ready), null);
     renderServiceStatus(boot.service_status, boot.config_dirty);
     renderCameraDropdown(boot.cameras || [], boot.selected_camera ?? 0);
+    state.hasIrCamera =
+      boot.has_ir_camera !== undefined
+        ? Boolean(boot.has_ir_camera)
+        : state.cameras.some((c) => c.is_ir === true);
   }
 
   async function persistSecurityConfig() {
@@ -843,6 +928,126 @@
     els.passwordModal.setAttribute("aria-hidden", "true");
   }
 
+  async function runEnrollAction(user, append) {
+    const a = api();
+    if (!a) return;
+    state.lastAttemptedMode = "enroll";
+    state.lastEnrollArgs = { user, append };
+    const res = await a.start_enroll(user, append);
+    if (res && !res.ok) {
+      if (res.error_info || (res.state && res.state.error_info)) {
+        if (!res.state || !res.state.error_info) {
+          renderStageErrorOverlay(res.error_info);
+        }
+      } else {
+        showFeedback(res.error || "Unable to start enrollment.", "warn");
+      }
+    }
+    if (res && res.state) renderLiveState(res.state);
+  }
+
+  async function runLiveTestAction() {
+    const a = api();
+    if (!a) return;
+    state.lastAttemptedMode = "test";
+    const res = await a.toggle_live_test();
+    if (res && !res.ok) {
+      if (res.error_info || (res.state && res.state.error_info)) {
+        if (!res.state || !res.state.error_info) {
+          renderStageErrorOverlay(res.error_info);
+        }
+      } else {
+        showFeedback(res.error || "Unable to start live test.", "error");
+      }
+    }
+    if (res && res.state) renderLiveState(res.state);
+  }
+
+  async function runPreviewAction() {
+    const a = api();
+    if (!a) return;
+    state.lastAttemptedMode = "preview";
+    const res = await a.toggle_preview();
+    if (res && !res.ok) {
+      if (res.error_info || (res.state && res.state.error_info)) {
+        if (!res.state || !res.state.error_info) {
+          renderStageErrorOverlay(res.error_info);
+        }
+      } else {
+        showFeedback(res.error || "Unable to toggle preview.", "error");
+      }
+    }
+    if (res && res.state) renderLiveState(res.state);
+  }
+
+  async function handleRescanCameras() {
+    const a = api();
+    if (!a || state.isRescanning) return;
+    state.isRescanning = true;
+    els.btnErrorRescan.disabled = true;
+    els.btnErrorRescan.textContent = "Scanning...";
+    try {
+      const res = await a.rescan_cameras();
+      if (res && res.ok) {
+        const cams = res.cameras || [];
+        const hasIr =
+          res.has_ir_camera !== undefined
+            ? Boolean(res.has_ir_camera)
+            : cams.some((c) => c.is_ir === true);
+        state.hasIrCamera = hasIr;
+        state.startupNoIrDismissed = false;
+        renderCameraDropdown(cams, res.selected_camera ?? 0);
+        if (res.state) {
+          renderLiveState(res.state);
+        }
+        if (hasIr) {
+          showFeedback("IR camera detected.", "ok", 3500);
+        } else {
+          renderStageErrorOverlay(NO_IR_ERROR_INFO);
+        }
+      }
+    } finally {
+      state.isRescanning = false;
+      els.btnErrorRescan.disabled = false;
+      els.btnErrorRescan.textContent = "Rescan Cameras";
+    }
+  }
+
+  async function handleRetryError() {
+    const code = state.currentErrorInfo ? state.currentErrorInfo.code : "";
+    if (!state.hasIrCamera || code === "no_ir_camera") {
+      await handleRescanCameras();
+      if (!state.hasIrCamera || !state.lastAttemptedMode) {
+        return;
+      }
+    }
+    if (state.lastAttemptedMode === "enroll" && state.lastEnrollArgs) {
+      await runEnrollAction(state.lastEnrollArgs.user, state.lastEnrollArgs.append);
+    } else if (state.lastAttemptedMode === "test") {
+      await runLiveTestAction();
+    } else if (state.lastAttemptedMode === "preview") {
+      await runPreviewAction();
+    } else {
+      await handleRescanCameras();
+    }
+  }
+
+  async function handleDismissError() {
+    const a = api();
+    state.startupNoIrDismissed = true;
+    renderStageErrorOverlay(null);
+    if (a && typeof a.clear_error === "function") {
+      const res = await a.clear_error();
+      if (res && res.state) {
+        renderLiveState(res.state);
+        return;
+      }
+    }
+    if (state.live) {
+      renderLiveState({ ...state.live, error: null, error_info: null });
+    }
+  }
+
   function wireEvents() {
     els.streamImg.addEventListener("load", () => {
       revealStreamFrame();
@@ -869,32 +1074,14 @@
       }
       const prof = findProfile(user);
       const append = Boolean(prof && prof.sample_count > 0);
-      const res = await a.start_enroll(user, append);
-      if (!res.ok) {
-        showFeedback(res.error || "Unable to start enrollment.", "error");
-      }
-      if (res && res.state) renderLiveState(res.state);
+      await runEnrollAction(user, append);
     });
 
-    els.btnLiveTest.addEventListener("click", async () => {
-      const a = api();
-      if (!a) return;
-      const res = await a.toggle_live_test();
-      if (!res.ok) {
-        showFeedback(res.error || "Unable to start live test.", "error");
-      }
-      if (res && res.state) renderLiveState(res.state);
-    });
-
-    els.btnPreview.addEventListener("click", async () => {
-      const a = api();
-      if (!a) return;
-      const res = await a.toggle_preview();
-      if (!res.ok) {
-        showFeedback(res.error || "Unable to toggle preview.", "error");
-      }
-      if (res && res.state) renderLiveState(res.state);
-    });
+    els.btnLiveTest.addEventListener("click", runLiveTestAction);
+    els.btnPreview.addEventListener("click", runPreviewAction);
+    els.btnErrorRetry.addEventListener("click", handleRetryError);
+    els.btnErrorRescan.addEventListener("click", handleRescanCameras);
+    els.btnErrorDismiss.addEventListener("click", handleDismissError);
 
     els.btnDiagnostics.addEventListener("click", () => {
       state.diagnosticsVisible = !state.diagnosticsVisible;

@@ -26,6 +26,7 @@ from engine.gui_app import (  # noqa: E402
     _get_window_hwnd,
     _load_hicon,
     _resolve_window_icon_path,
+    classify_error,
 )
 from engine.recognizer import FaceDetection  # noqa: E402
 from engine.store import ProfileStore, ServiceConfig, save_service_config  # noqa: E402
@@ -257,5 +258,138 @@ def test_start_enroll_append_adds_appearance_and_enforces_cap(
         assert f"Maximum appearances reached ({_MAX_EMBEDDINGS_PER_USER} samples)" in cap_res["error"]
         assert len(created_workers) == worker_count_before
         assert ctrl.get_state()["mode"] == "standby"
+    finally:
+        ctrl.shutdown()
+
+
+def test_classify_error_mappings() -> None:
+    assert classify_error(None) is None
+    assert classify_error("") is None
+    assert classify_error("   ") is None
+
+    samples = [
+        ("No IR camera detected.", "no_ir_camera", "No infrared camera detected"),
+        ("No camera detected on this system.", "no_ir_camera", "No infrared camera detected"),
+        ("Active IR camera is required for enrollment.", "no_ir_camera", "No infrared camera detected"),
+        ("WinRT HRESULT 0x80070005: Access is denied.", "camera_privacy_denied", "Camera access blocked by Windows"),
+        ("Camera privacy setting disabled", "camera_privacy_denied", "Camera access blocked by Windows"),
+        ("Failed to open stream (0xC00D3704)", "camera_in_use", "IR camera is in use"),
+        ("Sensor is already open in exclusive mode", "camera_in_use", "IR camera is in use"),
+        ("IOCTL_KS_PROPERTY failed for FACEAUTH illuminator", "illuminator_error", "IR illuminator did not respond"),
+        ("Face models are not downloaded yet.", "models_error", "Face recognition models unavailable"),
+        ("Failed loading ONNX weights", "models_error", "Face recognition models unavailable"),
+        ("Unexpected USB disconnect timeout", "sensor_error", "IR sensor error"),
+    ]
+
+    for raw, expected_code, expected_title in samples:
+        info = classify_error(raw)
+        assert info is not None
+        assert info["code"] == expected_code
+        assert info["title"] == expected_title
+        assert isinstance(info["causes"], list) and len(info["causes"]) >= 2
+        assert info["detail"] == raw
+
+
+def test_rescan_cameras_updates_has_ir_and_clears_error(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    store = ProfileStore(tmp_path / "profiles.enc")
+
+    cam_rgb = MagicMock(group="g0", source_id="s0", label="RGB Cam", is_ir=False, is_virtual=False)
+    cam_ir = MagicMock(group="g1", source_id="s1", label="IR Cam", is_ir=True, is_virtual=False)
+    discovered = [[cam_rgb]]
+
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: list(discovered[0]),
+        service_status_provider=lambda: "not_installed",
+        auto_start_server=False,
+    )
+    bridge = _JsApiBridge(ctrl)
+
+    try:
+        boot0 = bridge.get_bootstrap()
+        assert boot0["has_ir_camera"] is False
+        assert len(boot0["cameras"]) == 1
+
+        # Trigger an IR-required failure via preview/enroll without models/IR
+        fail_res = bridge.toggle_live_test()
+        assert fail_res["ok"] is False
+        assert fail_res["error_info"]["code"] == "models_error"
+        assert ctrl.get_state()["error_info"]["code"] == "models_error"
+
+        # Clear error returns cleanly to standby
+        cleared = bridge.clear_error()
+        assert cleared["ok"] is True
+        assert cleared["state"]["error"] is None
+        assert cleared["state"]["error_info"] is None
+
+        # Simulate user enabling / plugging in IR sensor and rescanning
+        fail_again = bridge.toggle_live_test()
+        assert fail_again["ok"] is False
+        assert ctrl.get_state()["error_info"] is not None
+
+        discovered[0] = [cam_rgb, cam_ir]
+        rescan = bridge.rescan_cameras()
+        assert rescan["ok"] is True
+        assert rescan["has_ir_camera"] is True
+        assert rescan["selected_camera"] == 1
+        assert [c["label"] for c in rescan["cameras"]] == ["RGB Cam", "IR Cam"]
+        assert rescan["state"]["error"] is None
+        assert rescan["state"]["error_info"] is None
+        assert bridge.get_bootstrap()["has_ir_camera"] is True
+    finally:
+        ctrl.shutdown()
+
+
+def test_worker_error_in_processing_loop_stops_camera_with_error_info(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    store = ProfileStore(tmp_path / "profiles.enc")
+    cam_ir = MagicMock(group="g1", source_id="s1", label="IR Cam", is_ir=True, is_virtual=False)
+
+    created_workers: list[MagicMock] = []
+
+    def _make_worker(**_kw: object) -> MagicMock:
+        w = MagicMock()
+        w.error = "WinRT error 0xC00D3704: camera in use by another app"
+        w.get_ir_pair.return_value = None
+        w.get_frame.return_value = None
+        created_workers.append(w)
+        return w
+
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: [cam_ir],
+        worker_factory=_make_worker,
+        service_status_provider=lambda: "not_installed",
+        auto_start_server=False,
+    )
+    bridge = _JsApiBridge(ctrl)
+
+    try:
+        res = bridge.toggle_preview()
+        assert res["ok"] is True
+        assert len(created_workers) == 1
+
+        deadline = time.monotonic() + 3.0
+        st = ctrl.get_state()
+        while time.monotonic() < deadline:
+            st = ctrl.get_state()
+            if st["mode"] == "standby" and st["error_info"] is not None:
+                break
+            time.sleep(0.02)
+
+        assert st["mode"] == "standby"
+        assert st["camera_active"] is False
+        assert st["error"] == "WinRT error 0xC00D3704: camera in use by another app"
+        assert st["error_info"] is not None
+        assert st["error_info"]["code"] == "camera_in_use"
+        assert st["error_info"]["title"] == "IR camera is in use"
+        created_workers[0].stop.assert_called_once()
     finally:
         ctrl.shutdown()

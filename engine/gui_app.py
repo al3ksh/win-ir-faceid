@@ -82,6 +82,93 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
 
 
+_ERROR_CLASSIFIERS: tuple[tuple[str, tuple[str, ...], str, list[str]], ...] = (
+    (
+        "no_ir_camera",
+        ("no ir camera", "no camera detected", "active ir camera is required"),
+        "No infrared camera detected",
+        [
+            "This device may not have a Windows Hello IR camera.",
+            "Check Device Manager -> Cameras and ensure the IR sensor is enabled.",
+            "Verify Windows Settings -> Privacy & security -> Camera allows desktop apps.",
+        ],
+    ),
+    (
+        "camera_privacy_denied",
+        ("0x80070005", "access is denied", "privacy", "unauthorized"),
+        "Camera access blocked by Windows",
+        [
+            "Open Windows Settings -> Privacy & security -> Camera.",
+            "Enable 'Camera access' and 'Let desktop apps access your camera'.",
+        ],
+    ),
+    (
+        "camera_in_use",
+        (
+            "0xc00d3704",
+            "0xc00dabe0",
+            "0x80070020",
+            "in use",
+            "exclusive",
+            "already open",
+            "sharing violation",
+        ),
+        "IR camera is in use",
+        [
+            "Another app (such as Camera, Zoom, or Windows Hello settings) is holding the sensor.",
+            "Close other camera apps and click Retry.",
+        ],
+    ),
+    (
+        "illuminator_error",
+        ("ioctl", "ksproperty", "illuminator", "faceauth"),
+        "IR illuminator did not respond",
+        [
+            "Check that a physical camera privacy shutter is not closed.",
+            "Update your laptop's OEM camera / IR driver if the illuminator LED never pulses.",
+        ],
+    ),
+    (
+        "models_error",
+        ("model", "onnx", "download"),
+        "Face recognition models unavailable",
+        [
+            "Click Download Models in the Account section to fetch YuNet & SFace (~37 MB).",
+            "Verify internet access to GitHub, or place the ONNX files manually in models/.",
+        ],
+    ),
+)
+
+
+def classify_error(raw_message: str | None) -> dict[str, Any] | None:
+    """Map raw hardware, WinRT, or model error text into a structured UI error dict."""
+    if raw_message is None:
+        return None
+    detail = str(raw_message).strip()
+    if not detail:
+        return None
+
+    low = detail.lower()
+    for code, keywords, title, causes in _ERROR_CLASSIFIERS:
+        if any(kw in low for kw in keywords):
+            return {
+                "code": code,
+                "title": title,
+                "causes": list(causes),
+                "detail": detail,
+            }
+
+    return {
+        "code": "sensor_error",
+        "title": "IR sensor error",
+        "causes": [
+            "Check that the IR camera is connected and not in use by another app.",
+            "Try Rescan Cameras or restart the app.",
+        ],
+        "detail": detail,
+    }
+
+
 def _select_preferred_camera_index(cameras: list[Any]) -> int:
     """Return index of real IR camera first, any IR second, else 0."""
     for idx, cam in enumerate(cameras):
@@ -542,7 +629,11 @@ class WinIRFaceIDController:
         *,
         completed_user: str = "",
         completed_append: bool = False,
+        error_msg: str | None = None,
     ) -> dict[str, Any]:
+        clean_err = str(error_msg).strip() if error_msg else None
+        if not clean_err:
+            clean_err = None
         return {
             "mode": "standby",
             "camera_active": False,
@@ -571,7 +662,8 @@ class WinIRFaceIDController:
                 "completed_user": completed_user,
                 "completed_append": bool(completed_append),
             },
-            "error": None,
+            "error": clean_err,
+            "error_info": classify_error(clean_err),
         }
 
     def _start_http_server(self) -> None:
@@ -700,15 +792,30 @@ class WinIRFaceIDController:
             return True
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to load face recognizer: %s", exc)
+            err_msg = f"Model load error: {exc}"
             with self._lock:
-                self._state["error"] = f"Model load error: {exc}"
+                self._state["error"] = err_msg
+                self._state["error_info"] = classify_error(err_msg)
             return False
+
+    def _set_standby_error(self, error_msg: str) -> dict[str, Any]:
+        """Record a structured hardware or model error on standby state and return failure payload."""
+        clean = str(error_msg).strip()
+        with self._lock:
+            self._state = self._build_standby_state(error_msg=clean)
+        return {
+            "ok": False,
+            "error": clean,
+            "error_info": classify_error(clean),
+            "state": self.get_state(),
+        }
 
     def _stop_camera_and_loop(
         self,
         *,
         completed_user: str = "",
         completed_append: bool = False,
+        error_msg: str | None = None,
     ) -> None:
         self._proc_stop.set()
         proc_thread: threading.Thread | None
@@ -733,6 +840,7 @@ class WinIRFaceIDController:
             self._state = self._build_standby_state(
                 completed_user=completed_user,
                 completed_append=completed_append,
+                error_msg=error_msg,
             )
 
         with self._frame_cond:
@@ -824,10 +932,8 @@ class WinIRFaceIDController:
 
             worker_err = getattr(worker, "error", None)
             if worker_err:
-                with self._lock:
-                    self._state["error"] = str(worker_err)
-                time.sleep(0.05)
-                continue
+                self._stop_camera_and_loop(error_msg=str(worker_err))
+                break
 
             pair = worker.get_ir_pair() if is_ir else None
             display_frame = worker.get_frame()
@@ -1054,6 +1160,7 @@ class WinIRFaceIDController:
                         "append": self._enroll_append,
                     },
                     "error": None,
+                    "error_info": None,
                 }
 
             time.sleep(0.015)
@@ -1082,6 +1189,7 @@ class WinIRFaceIDController:
             config_dirty = self._config_dirty
             feed_mode = self._feed_mode
             selected_camera_idx = self._selected_camera_idx
+            has_ir_camera = bool(any(getattr(c, "is_ir", False) for c in self._cameras))
 
         return {
             "stream_url": self.stream_url,
@@ -1093,6 +1201,7 @@ class WinIRFaceIDController:
             "config_dirty": config_dirty,
             "cameras": self._serialize_cameras(),
             "selected_camera": selected_camera_idx,
+            "has_ir_camera": has_ir_camera,
             "feed_mode": feed_mode,
         }
 
@@ -1104,6 +1213,21 @@ class WinIRFaceIDController:
             snap["download"] = dict(self._download_state)
             snap["config_dirty"] = self._config_dirty
             return snap
+
+    def _require_ir_camera(self, action_label: str) -> str | None:
+        """Ensure an IR camera is selected; return an error string if unavailable."""
+        with self._lock:
+            if not self._cameras:
+                self._discover_cameras_safe()
+            if not self._cameras:
+                return "No IR camera detected."
+            idx = max(0, min(self._selected_camera_idx, len(self._cameras) - 1))
+            if not getattr(self._cameras[idx], "is_ir", False):
+                ir_idx = _select_preferred_camera_index(self._cameras)
+                if not getattr(self._cameras[ir_idx], "is_ir", False):
+                    return f"Active IR camera is required for {action_label}."
+                self._selected_camera_idx = ir_idx
+        return None
 
     def start_enroll(self, username: str, append: bool = False) -> dict[str, Any]:
         """Start 8-sample active-IR face enrollment for *username*."""
@@ -1125,32 +1249,18 @@ class WinIRFaceIDController:
                 }
 
         if not self._ensure_recognizer_loaded():
-            return {
-                "ok": False,
-                "error": "Face models are not downloaded yet.",
-                "state": self.get_state(),
-            }
+            with self._lock:
+                err_msg = self._state.get("error") or "Face models are not downloaded yet."
+            return self._set_standby_error(str(err_msg))
 
-        with self._lock:
-            if not self._cameras:
-                self._discover_cameras_safe()
-            if not self._cameras:
-                return {"ok": False, "error": "No IR camera detected.", "state": self.get_state()}
-            idx = max(0, min(self._selected_camera_idx, len(self._cameras) - 1))
-            if not getattr(self._cameras[idx], "is_ir", False):
-                ir_idx = _select_preferred_camera_index(self._cameras)
-                if not getattr(self._cameras[ir_idx], "is_ir", False):
-                    return {
-                        "ok": False,
-                        "error": "Active IR camera is required for enrollment.",
-                        "state": self.get_state(),
-                    }
-                self._selected_camera_idx = ir_idx
+        cam_err = self._require_ir_camera("enrollment")
+        if cam_err:
+            return self._set_standby_error(cam_err)
 
         self._stop_camera_and_loop()
         ok, err = self._start_camera_worker()
         if not ok:
-            return {"ok": False, "error": err or "Camera failed to start.", "state": self.get_state()}
+            return self._set_standby_error(err or "Camera failed to start.")
 
         with self._lock:
             self._mode = "enroll"
@@ -1189,32 +1299,18 @@ class WinIRFaceIDController:
             return {"ok": True, "error": None, "state": self.get_state()}
 
         if not self._ensure_recognizer_loaded():
-            return {
-                "ok": False,
-                "error": "Face models are not downloaded yet.",
-                "state": self.get_state(),
-            }
+            with self._lock:
+                err_msg = self._state.get("error") or "Face models are not downloaded yet."
+            return self._set_standby_error(str(err_msg))
 
-        with self._lock:
-            if not self._cameras:
-                self._discover_cameras_safe()
-            if not self._cameras:
-                return {"ok": False, "error": "No IR camera detected.", "state": self.get_state()}
-            idx = max(0, min(self._selected_camera_idx, len(self._cameras) - 1))
-            if not getattr(self._cameras[idx], "is_ir", False):
-                ir_idx = _select_preferred_camera_index(self._cameras)
-                if not getattr(self._cameras[ir_idx], "is_ir", False):
-                    return {
-                        "ok": False,
-                        "error": "Active IR camera is required for live testing.",
-                        "state": self.get_state(),
-                    }
-                self._selected_camera_idx = ir_idx
+        cam_err = self._require_ir_camera("live testing")
+        if cam_err:
+            return self._set_standby_error(cam_err)
 
         self._stop_camera_and_loop()
         ok, err = self._start_camera_worker()
         if not ok:
-            return {"ok": False, "error": err or "Camera failed to start.", "state": self.get_state()}
+            return self._set_standby_error(err or "Camera failed to start.")
 
         with self._lock:
             self._mode = "test"
@@ -1242,7 +1338,7 @@ class WinIRFaceIDController:
         self._stop_camera_and_loop()
         ok, err = self._start_camera_worker()
         if not ok:
-            return {"ok": False, "error": err or "Camera failed to start.", "state": self.get_state()}
+            return self._set_standby_error(err or "Camera failed to start.")
 
         with self._lock:
             self._mode = "preview"
@@ -1275,8 +1371,44 @@ class WinIRFaceIDController:
 
         if active:
             ok, err = self._start_camera_worker()
-            return {"ok": ok, "error": err, "selected_camera": int(index)}
+            if not ok:
+                err_msg = err or "Camera failed to start."
+                self._stop_camera_and_loop(error_msg=err_msg)
+                return {
+                    "ok": False,
+                    "error": err_msg,
+                    "error_info": classify_error(err_msg),
+                    "selected_camera": int(index),
+                    "state": self.get_state(),
+                }
+            return {"ok": True, "error": None, "selected_camera": int(index)}
         return {"ok": True, "error": None, "selected_camera": int(index)}
+
+    def rescan_cameras(self) -> dict[str, Any]:
+        """Stop any active session, re-run camera discovery, and clear stale errors."""
+        self._stop_camera_and_loop()
+        self._discover_cameras_safe()
+        with self._lock:
+            selected_camera = self._selected_camera_idx
+            has_ir_camera = bool(any(getattr(c, "is_ir", False) for c in self._cameras))
+            self._state = self._build_standby_state()
+        return {
+            "ok": True,
+            "cameras": self._serialize_cameras(),
+            "selected_camera": selected_camera,
+            "has_ir_camera": has_ir_camera,
+            "state": self.get_state(),
+        }
+
+    def clear_error(self) -> dict[str, Any]:
+        """Dismiss any active error state cleanly back to standby."""
+        with self._lock:
+            if self._mode == "standby" and not self._camera_active:
+                self._state = self._build_standby_state()
+            else:
+                self._state["error"] = None
+                self._state["error_info"] = None
+        return {"ok": True, "state": self.get_state()}
 
     def update_config(
         self,
@@ -1456,6 +1588,12 @@ class _JsApiBridge:
 
     def select_camera(self, index: int) -> dict[str, Any]:
         return self._ctrl.select_camera(index)
+
+    def rescan_cameras(self) -> dict[str, Any]:
+        return self._ctrl.rescan_cameras()
+
+    def clear_error(self) -> dict[str, Any]:
+        return self._ctrl.clear_error()
 
     def update_config(
         self,

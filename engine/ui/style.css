@@ -320,6 +320,107 @@ body {
   color: var(--text-secondary);
 }
 
+/* Minimalist In-Viewport Error & Recovery Overlay */
+.stage-error-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 20px 24px;
+  gap: 8px;
+  background: var(--bg-stage);
+  opacity: 0;
+  transform: scale(0.97);
+  pointer-events: none;
+  visibility: hidden;
+  transition:
+    opacity 240ms var(--ease-fluid),
+    transform 240ms var(--ease-fluid),
+    visibility 0s linear 240ms;
+}
+
+.stage-error-overlay[data-visible="true"] {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+  visibility: visible;
+  transition:
+    opacity 240ms var(--ease-fluid),
+    transform 240ms var(--ease-fluid),
+    visibility 0s linear 0s;
+}
+
+.stage-error-icon {
+  width: 36px;
+  height: 36px;
+  color: rgba(245, 158, 11, 0.84);
+  flex-shrink: 0;
+  margin-bottom: 2px;
+}
+
+.stage-error-overlay[data-code="no_ir_camera"] .stage-error-icon {
+  color: rgba(243, 244, 246, 0.74);
+}
+
+.stage-error-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.stage-error-causes {
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+  max-width: 420px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.stage-error-causes li {
+  position: relative;
+  padding-left: 14px;
+}
+
+.stage-error-causes li::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 7px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.stage-error-detail {
+  max-width: 420px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  word-break: break-word;
+  user-select: text;
+}
+
+.stage-error-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
 /* Vector SVG Corner-Bracket Reticle */
 .reticle-layer {
   position: absolute;
@@ -1472,6 +1573,7 @@ input::-ms-clear {
 
   .stream-img,
   .standby-overlay,
+  .stage-error-overlay,
   .hud-pill,
   .enroll-hud,
   .dropdown-menu,

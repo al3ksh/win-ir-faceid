@@ -172,6 +172,19 @@ Press **`Win + L`** to lock your workstation and test pure-IR unlock.
 
 ---
 
+## Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+| :--- | :--- | :--- |
+| **No IR camera detected / IR LED doesn't pulse** | Device lacks a Windows Hello IR sensor, driver is disabled, or a physical privacy shutter is closed. | Open **Device Manager -> Cameras** and confirm the IR sensor is enabled, open any camera privacy shutter, and update your laptop's OEM camera/IR driver. Run `tools\ir_camera_tester\run.bat` to inspect detected sensors and test the illuminator directly, then click **Rescan Cameras** in the app. |
+| **Camera access denied or in use** | Windows camera privacy blocks desktop apps (`0x80070005`), or another app holds exclusive sensor access (`0xC00D3704` / `0xC00DABE0`). | In **Windows Settings -> Privacy & security -> Camera**, enable **Camera access** and **Let desktop apps access your camera**. Close the Windows Camera app, Zoom/Teams, or **Windows Hello Face** settings, then click **Retry**. |
+| **Lock screen says `WinIRFaceID service is offline` or `pipe_client_test` fails (Win32 error 2 / 5)** | `WinIRFaceIDService` is stopped, not installed, or its named pipe ACL/process crashed. | Check `Get-Service WinIRFaceIDService` and inspect `data\service.log`. Re-run `.\scripts\install_service.ps1` from an **Administrator PowerShell** prompt to reinstall and verify the service. |
+| **Face matches in `pipe_client_test` but lock screen rejects password (Microsoft Account)** | A Windows Hello PIN or wrong domain was saved instead of the full Microsoft Account password. | Open **Password** in the desktop app, enter your actual **Microsoft Account password** (not your PIN), and keep **Domain** set to `.`. |
+| **Low match score / fails with glasses or in different lighting** | Enrolled embeddings only cover one appearance or lighting geometry. | Click **Add Appearance** in the desktop app to enroll an alternate look with glasses on, or adjust **Match strictness** slightly in **Security**. |
+| **Blocked as `Flat surface` / `Screen detected` / `Eyes closed`** | Face is too far/off-axis, ambient IR overwhelms the illuminator, or eyelids obscure IR pupil contrast. | Enable **Diagnostics** in the desktop app to inspect live `IR Δ`, `BG`, `3D`, and `Eyes` telemetry. Center your face roughly 40–65 cm from the sensor with eyes open; toggle **Require open eyes** only if needed for glasses glare. |
+
+---
+
 ## Clean Uninstall & Safe Mode Recovery
 
 To unregister the Credential Provider and remove the background service, run in an **Administrator PowerShell** prompt:
