@@ -13,7 +13,7 @@ add_compile_definitions(
 )
 
 if(MSVC)
-    add_compile_options(/W4 /EHsc /permissive-)
+    add_compile_options(/W4 /EHsc /permissive- /utf-8)
 endif()
 
 # Windows Credential Provider V2 COM DLL (thin IPC client for LogonUI.exe)
@@ -22,6 +22,8 @@ add_library(WinIRFaceIDProvider SHARED
     provider.cpp
     credential.cpp
     pipe_client.cpp
+    resource.h
+    resource.rc
     WinIRFaceIDProvider.def
 )
 
@@ -38,6 +40,7 @@ target_link_libraries(WinIRFaceIDProvider PRIVATE
     ole32
     user32
     gdi32
+    windowscodecs
 )
 
 # Standalone console test client to verify Named Pipe IPC without LogonUI.exe

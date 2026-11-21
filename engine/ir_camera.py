@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import concurrent.futures
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -177,28 +178,81 @@ def software_bitmap_to_bgr(sb: SoftwareBitmap) -> np.ndarray:
             converted.close()
 
 
+_winrt_loop_lock = threading.Lock()
+_winrt_loop: asyncio.AbstractEventLoop | None = None
+_winrt_loop_thread: threading.Thread | None = None
+
+
+def _get_winrt_loop() -> asyncio.AbstractEventLoop:
+    """Return the single process-wide persistent WinRT MTA asyncio event loop."""
+    global _winrt_loop, _winrt_loop_thread
+
+    with _winrt_loop_lock:
+        if (
+            _winrt_loop is not None
+            and _winrt_loop_thread is not None
+            and _winrt_loop_thread.is_alive()
+            and not _winrt_loop.is_closed()
+        ):
+            return _winrt_loop
+
+        ready = threading.Event()
+        loop_box: list[asyncio.AbstractEventLoop] = []
+        exc_box: list[BaseException] = []
+
+        def _loop_runner() -> None:
+            loop: asyncio.AbstractEventLoop | None = None
+            try:
+                try:
+                    from winrt.runtime import ApartmentType, init_apartment
+
+                    init_apartment(ApartmentType.MULTI_THREADED)
+                except Exception:  # noqa: BLE001
+                    pass
+
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop_box.append(loop)
+            except BaseException as exc:  # noqa: BLE001
+                exc_box.append(exc)
+                ready.set()
+                return
+
+            ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                try:
+                    loop.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        thread = threading.Thread(
+            target=_loop_runner,
+            name="WinRT-AsyncLoop",
+            daemon=True,
+        )
+        thread.start()
+        ready.wait()
+        if exc_box:
+            raise exc_box[0]
+
+        _winrt_loop = loop_box[0]
+        _winrt_loop_thread = thread
+        return _winrt_loop
+
+
 def _run_coro_sync(coro: Any) -> Any:
-    """Run an async coroutine from synchronous code, even if an event loop is already active."""
+    """Run an async coroutine on the persistent WinRT event loop and return its result."""
+    loop = _get_winrt_loop()
     try:
-        asyncio.get_running_loop()
+        running = asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
-
-    result: list[Any] = []
-    exc_box: list[BaseException] = []
-
-    def _runner() -> None:
-        try:
-            result.append(asyncio.run(coro))
-        except BaseException as exc:  # noqa: BLE001
-            exc_box.append(exc)
-
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
-    thread.join()
-    if exc_box:
-        raise exc_box[0]
-    return result[0]
+        running = None
+    if running is loop:
+        coro.close()
+        raise RuntimeError("_run_coro_sync() cannot be called from the WinRT event loop thread")
+    return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
 
 def discover_cameras() -> list[CameraDescriptor]:
@@ -267,17 +321,25 @@ class WinRTCameraWorker:
 
         self.error: str | None = None
         self.resolution: tuple[int, int] | None = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._future: concurrent.futures.Future[None] | None = None
 
     def start(self) -> None:
-        """Start the background capture thread."""
-        self._thread.start()
+        """Start background capture on the persistent WinRT event loop."""
+        if self._future is not None and not self._future.done():
+            return
+        loop = _get_winrt_loop()
+        self._future = asyncio.run_coroutine_threadsafe(self._async_loop(), loop)
 
     def stop(self) -> None:
-        """Stop capture and wait for the worker thread to turn off the IR LED and close WinRT objects."""
+        """Stop capture and wait for the worker to turn off the IR LED and close WinRT objects."""
         self._stop_event.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=3.0)
+        if self._future is not None:
+            try:
+                self._future.result(timeout=4.0)
+            except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
+                pass
+            except Exception:  # noqa: BLE001
+                pass
 
     def set_ir_led(self, enabled: bool) -> None:
         """Request turning the Windows Hello IR illuminator LED ON or OFF."""
@@ -304,9 +366,6 @@ class WinRTCameraWorker:
                 illuminator_active=p.illuminator_active,
                 timestamp=p.timestamp,
             )
-
-    def _run(self) -> None:
-        asyncio.run(self._async_loop())
 
     def _reset_ir_tracking(self) -> None:
         self._recent_means.clear()
@@ -486,3 +545,7 @@ class WinRTCameraWorker:
                     mc.close()
                 except Exception:  # noqa: BLE001
                     pass
+            try:
+                await asyncio.sleep(0.05)
+            except Exception:  # noqa: BLE001
+                pass

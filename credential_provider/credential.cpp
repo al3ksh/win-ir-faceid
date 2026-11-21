@@ -1,12 +1,14 @@
 #include "credential.h"
 #include "provider.h"
 #include "common.h"
+#include "resource.h"
 
 #define SECURITY_WIN32
 #include <ntsecapi.h>
 #include <security.h>
 #include <shlwapi.h>
 #include <strsafe.h>
+#include <wincodec.h>
 
 #include <cstring>
 
@@ -15,9 +17,9 @@ namespace
 
 constexpr wchar_t kStatusScanning[] = L"Scanning infrared face...";
 constexpr wchar_t kStatusRecognized[] = L"Recognized!";
-constexpr wchar_t kStatusFailed[] = L"Face not recognized — use Fingerprint or PIN";
-constexpr wchar_t kStatusNoPassword[] = L"Face recognized, but no saved credential — use Fingerprint or PIN";
-constexpr wchar_t kStatusSignInFailed[] = L"Sign-in failed — use Fingerprint or PIN";
+constexpr wchar_t kStatusFailed[] = L"Face not recognized - use Fingerprint or PIN";
+constexpr wchar_t kStatusNoPassword[] = L"Face recognized, but no saved credential - use Fingerprint or PIN";
+constexpr wchar_t kStatusSignInFailed[] = L"Sign-in failed - use Fingerprint or PIN";
 
 std::wstring GetLocalComputerNetbiosName()
 {
@@ -113,66 +115,241 @@ HRESULT PackKerbInteractiveUnlockLogon(
     return S_OK;
 }
 
-HBITMAP CreateIRFaceTileBitmap()
+template <typename T>
+class ComRef
 {
-    constexpr int kSize = 64;
+public:
+    ComRef() = default;
+    ~ComRef()
+    {
+        Reset();
+    }
+
+    ComRef(const ComRef&) = delete;
+    ComRef& operator=(const ComRef&) = delete;
+
+    T* Get() const { return _ptr; }
+    T** GetAddressOf()
+    {
+        Reset();
+        return &_ptr;
+    }
+    T* operator->() const { return _ptr; }
+
+    void Reset()
+    {
+        if (_ptr != nullptr)
+        {
+            _ptr->Release();
+            _ptr = nullptr;
+        }
+    }
+
+private:
+    T* _ptr = nullptr;
+};
+
+HBITMAP CreateTopDown32BppDib(int width, int height, void** outBits)
+{
+    if (outBits == nullptr || width <= 0 || height <= 0)
+    {
+        return nullptr;
+    }
+    *outBits = nullptr;
+
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = kSize;
-    bmi.bmiHeader.biHeight = -kSize; // top-down
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height; // top-down
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    void* bits = nullptr;
     HDC screenDc = GetDC(nullptr);
-    HDC memDc = CreateCompatibleDC(screenDc);
-    HBITMAP hBmp = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP hBmp = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, outBits, nullptr, 0);
     if (screenDc != nullptr)
     {
         ReleaseDC(nullptr, screenDc);
     }
 
-    if (hBmp == nullptr || memDc == nullptr)
+    if (hBmp == nullptr || *outBits == nullptr)
     {
-        if (memDc != nullptr) DeleteDC(memDc);
-        if (hBmp != nullptr) DeleteObject(hBmp);
+        if (hBmp != nullptr)
+        {
+            DeleteObject(hBmp);
+        }
+        *outBits = nullptr;
         return nullptr;
     }
 
-    HGDIOBJ oldBmp = SelectObject(memDc, hBmp);
-
-    // Dark slate background with cyan/infrared scanner reticle
-    HBRUSH bgBrush = CreateSolidBrush(RGB(22, 30, 46));
-    RECT fullRect{ 0, 0, kSize, kSize };
-    FillRect(memDc, &fullRect, bgBrush);
-    DeleteObject(bgBrush);
-
-    HPEN ringPen = CreatePen(PS_SOLID, 2, RGB(56, 189, 248));
-    HBRUSH hollowBrush = static_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
-    HGDIOBJ oldPen = SelectObject(memDc, ringPen);
-    HGDIOBJ oldBrush = SelectObject(memDc, hollowBrush);
-
-    // Outer scanner circle
-    Ellipse(memDc, 8, 8, kSize - 8, kSize - 8);
-
-    // Eyes / IR sensor dots
-    HBRUSH accentBrush = CreateSolidBrush(RGB(244, 63, 94));
-    SelectObject(memDc, accentBrush);
-    Ellipse(memDc, 21, 23, 27, 29);
-    Ellipse(memDc, 37, 23, 43, 29);
-    DeleteObject(accentBrush);
-
-    // Smile arc / scan line
-    SelectObject(memDc, hollowBrush);
-    Arc(memDc, 20, 26, 44, 46, 22, 38, 42, 38);
-
-    SelectObject(memDc, oldBrush);
-    SelectObject(memDc, oldPen);
-    DeleteObject(ringPen);
-    SelectObject(memDc, oldBmp);
-    DeleteDC(memDc);
+    ZeroMemory(*outBits, static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
     return hBmp;
+}
+
+HBITMAP DecodePngResourceToBitmap(UINT resourceId)
+{
+    HINSTANCE hInst = GetModuleInstance();
+    if (hInst == nullptr)
+    {
+        return nullptr;
+    }
+
+    HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+    if (hRes == nullptr)
+    {
+        return nullptr;
+    }
+
+    const DWORD pngSize = SizeofResource(hInst, hRes);
+    HGLOBAL hResData = LoadResource(hInst, hRes);
+    if (hResData == nullptr || pngSize == 0)
+    {
+        return nullptr;
+    }
+
+    const void* pngBytes = LockResource(hResData);
+    if (pngBytes == nullptr)
+    {
+        return nullptr;
+    }
+
+    const HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (FAILED(hrCom) && hrCom != RPC_E_CHANGED_MODE)
+    {
+        return nullptr;
+    }
+    const bool shouldUninit = (hrCom == S_OK || hrCom == S_FALSE);
+
+    HBITMAP hBmp = nullptr;
+    {
+        ComRef<IWICImagingFactory> factory;
+        ComRef<IWICStream> stream;
+        ComRef<IWICBitmapDecoder> decoder;
+        ComRef<IWICBitmapFrameDecode> frame;
+        ComRef<IWICFormatConverter> converter;
+
+        HRESULT hr = CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(factory.GetAddressOf()));
+
+        if (SUCCEEDED(hr))
+        {
+            hr = factory->CreateStream(stream.GetAddressOf());
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = stream->InitializeFromMemory(
+                static_cast<WICInProcPointer>(const_cast<void*>(pngBytes)),
+                pngSize);
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = factory->CreateDecoderFromStream(
+                stream.Get(),
+                nullptr,
+                WICDecodeMetadataCacheOnLoad,
+                decoder.GetAddressOf());
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = decoder->GetFrame(0, frame.GetAddressOf());
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = factory->CreateFormatConverter(converter.GetAddressOf());
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = converter->Initialize(
+                frame.Get(),
+                GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                nullptr,
+                0.0,
+                WICBitmapPaletteTypeCustom);
+        }
+
+        UINT width = 0;
+        UINT height = 0;
+        if (SUCCEEDED(hr))
+        {
+            hr = converter->GetSize(&width, &height);
+        }
+
+        if (SUCCEEDED(hr) && width > 0 && height > 0 && width <= 4096 && height <= 4096)
+        {
+            void* bits = nullptr;
+            hBmp = CreateTopDown32BppDib(static_cast<int>(width), static_cast<int>(height), &bits);
+            if (hBmp != nullptr)
+            {
+                const UINT stride = width * 4U;
+                const UINT bufferSize = stride * height;
+                hr = converter->CopyPixels(nullptr, stride, bufferSize, static_cast<BYTE*>(bits));
+                if (FAILED(hr))
+                {
+                    DeleteObject(hBmp);
+                    hBmp = nullptr;
+                }
+            }
+        }
+    }
+
+    if (shouldUninit)
+    {
+        CoUninitialize();
+    }
+
+    return hBmp;
+}
+
+HBITMAP CreateFallbackIRFaceTileBitmap()
+{
+    constexpr int kSize = 64;
+    void* bits = nullptr;
+    HBITMAP hBmp = CreateTopDown32BppDib(kSize, kSize, &bits);
+    if (hBmp == nullptr)
+    {
+        return nullptr;
+    }
+
+    // Minimalist pure-white (0xFFFFFFFF premultiplied BGRA) face brackets on 100% transparent background
+    auto* pixels = static_cast<uint32_t*>(bits);
+    auto fillRect = [pixels, kSize](int x0, int y0, int x1, int y1) {
+        for (int y = y0; y < y1; ++y)
+        {
+            for (int x = x0; x < x1; ++x)
+            {
+                if (x >= 0 && x < kSize && y >= 0 && y < kSize)
+                {
+                    pixels[y * kSize + x] = 0xFFFFFFFFU;
+                }
+            }
+        }
+    };
+
+    // Corner brackets
+    fillRect(10, 10, 22, 13); fillRect(10, 10, 13, 22);
+    fillRect(42, 10, 54, 13); fillRect(51, 10, 54, 22);
+    fillRect(10, 51, 22, 54); fillRect(10, 42, 13, 54);
+    fillRect(42, 51, 54, 54); fillRect(51, 42, 54, 54);
+    // Eyes and mouth
+    fillRect(23, 24, 26, 30);
+    fillRect(38, 24, 41, 30);
+    fillRect(24, 40, 40, 43);
+
+    return hBmp;
+}
+
+HBITMAP CreateIRFaceTileBitmap()
+{
+    HBITMAP hBmp = DecodePngResourceToBitmap(IDR_IR_FACEID_PNG);
+    if (hBmp != nullptr)
+    {
+        return hBmp;
+    }
+    return CreateFallbackIRFaceTileBitmap();
 }
 
 } // namespace

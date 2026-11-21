@@ -20,9 +20,10 @@ inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\WinIRFaceID";
 inline constexpr DWORD kMaxPipeMessageBytes = 65536; // 64 KB per IPC_PROTOCOL.md
 inline constexpr DWORD kDefaultVerifyTimeoutMs = 8000;
 
-// COM DLL reference counting (implemented in dllmain.cpp)
+// COM DLL reference counting and module handle (implemented in dllmain.cpp)
 void DllAddRef();
 void DllRelease();
+HINSTANCE GetModuleInstance();
 
 // Securely wipes mutable string buffers containing sensitive data.
 inline void SecureWipeString(std::wstring& s)

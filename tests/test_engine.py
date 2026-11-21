@@ -1243,3 +1243,40 @@ def test_gui_on_demand_camera_standby_and_open_eyes(tmp_path: Path) -> None:
                 dlg.destroy()
         finally:
             app._on_close()
+
+
+def test_winrt_persistent_loop_reuses_single_thread() -> None:
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    from engine.ir_camera import _get_winrt_loop, _run_coro_sync
+
+    async def _thread_info() -> tuple[int, int, str]:
+        return (
+            id(asyncio.get_running_loop()),
+            threading.get_ident(),
+            threading.current_thread().name,
+        )
+
+    # Sequential calls from main thread
+    loop1 = _get_winrt_loop()
+    loop2 = _get_winrt_loop()
+    assert loop1 is loop2
+    info_seq = _run_coro_sync(_thread_info())
+    assert info_seq[0] == id(loop1)
+    assert info_seq[2] == "WinRT-AsyncLoop"
+
+    # Concurrent calls from multiple separate threads reuse the exact same loop & thread
+    def _worker() -> tuple[int, int, int, str]:
+        lp = _get_winrt_loop()
+        loop_id, tid, name = _run_coro_sync(_thread_info())
+        return id(lp), loop_id, tid, name
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda _: _worker(), range(12)))
+
+    for lp_id, running_id, tid, name in results:
+        assert lp_id == id(loop1)
+        assert running_id == info_seq[0]
+        assert tid == info_seq[1]
+        assert name == "WinRT-AsyncLoop"

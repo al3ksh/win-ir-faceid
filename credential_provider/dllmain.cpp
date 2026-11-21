@@ -12,6 +12,7 @@ namespace
 {
 
 LONG g_dllRefCount = 0;
+HINSTANCE g_hInst = nullptr;
 
 class WinIRFaceIDClassFactory final : public IClassFactory
 {
@@ -106,10 +107,16 @@ void DllRelease()
     InterlockedDecrement(&g_dllRefCount);
 }
 
+HINSTANCE GetModuleInstance()
+{
+    return g_hInst;
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID /*lpReserved*/)
 {
     if (ulReasonForCall == DLL_PROCESS_ATTACH)
     {
+        g_hInst = hModule;
         DisableThreadLibraryCalls(hModule);
     }
     return TRUE;
