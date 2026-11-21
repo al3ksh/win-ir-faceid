@@ -1048,6 +1048,61 @@ def test_named_pipe_server_live_roundtrip(tmp_path: Path) -> None:
         srv_thread.join(timeout=2.0)
 
 
+def test_named_pipe_server_quiet_disconnect_logging(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+    import pywintypes
+
+    store = ProfileStore(tmp_path / "profiles.enc")
+    server = NamedPipeServer(
+        pipe_name=rf"\\.\pipe\WinIRFaceID_QuietTest_{time.time_ns()}",
+        store=store,
+        service_mode=False,
+    )
+    try:
+        for code in (109, 232):
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG, logger="engine.ipc_server"):
+                with (
+                    patch.object(server, "_overlapped_read_line", return_value=b'{"cmd":"ping"}\n'),
+                    patch.object(
+                        server,
+                        "_overlapped_write_all",
+                        side_effect=pywintypes.error(code, "WriteFile", "Pipe closed"),
+                    ),
+                    patch("engine.ipc_server.win32pipe.DisconnectNamedPipe"),
+                    patch("engine.ipc_server.win32file.CloseHandle"),
+                ):
+                    server._handle_client(object())
+
+            assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+            assert any(
+                r.levelno == logging.DEBUG and f"winerror={code}" in r.getMessage()
+                for r in caplog.records
+            )
+
+        # Unexpected winerrors should still be logged at ERROR level
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="engine.ipc_server"):
+            with (
+                patch.object(server, "_overlapped_read_line", return_value=b'{"cmd":"ping"}\n'),
+                patch.object(
+                    server,
+                    "_overlapped_write_all",
+                    side_effect=pywintypes.error(5, "WriteFile", "Access denied"),
+                ),
+                patch("engine.ipc_server.win32pipe.DisconnectNamedPipe"),
+                patch("engine.ipc_server.win32file.CloseHandle"),
+            ):
+                server._handle_client(object())
+
+        assert any(
+            r.levelno == logging.ERROR and "Pipe client error" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        server.close()
+
+
 def test_cli_require_open_eyes_flags() -> None:
     parser = build_parser()
     args_verify = parser.parse_args(["verify", "--require-open-eyes", "--require-motion"])

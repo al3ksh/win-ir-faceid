@@ -1,3 +1,7 @@
 @echo off
 cd /d "%~dp0"
-start "" ".venv\Scripts\pythonw.exe" -m engine.gui_app
+if exist ".venv\Scripts\pythonw.exe" (
+    start "" /B ".venv\Scripts\pythonw.exe" -m engine.cli gui
+) else (
+    start "" /B ".venv\Scripts\python.exe" -m engine.cli gui
+)

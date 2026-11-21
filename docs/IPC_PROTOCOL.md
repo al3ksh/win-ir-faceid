@@ -14,7 +14,7 @@ The thin C++ Windows Credential Provider DLL communicates with the background IR
 ```
 Response:
 ```json
-{"status": "ok", "version": "0.1.0", "enrolled_users": ["DELL"]}
+{"status": "ok", "version": "0.1.0", "enrolled_users": ["Alice"]}
 ```
 
 ### 2. Verify
@@ -28,7 +28,7 @@ Starts the IR camera and hardware IR LED illuminator (`KSPROPERTY_CAMERACONTROL_
 Responses:
 - Match succeeded:
 ```json
-{"status": "matched", "username": "DELL", "domain": ".", "password": "<secret-or-empty>", "score": 0.68, "liveness_delta": 42.5}
+{"status": "matched", "username": "Alice", "domain": ".", "password": "<secret-or-empty>", "score": 0.68, "liveness_delta": 42.5}
 ```
 - Match failed / timed out:
 ```json

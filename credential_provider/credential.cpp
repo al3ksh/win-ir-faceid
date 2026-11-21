@@ -858,7 +858,7 @@ IFACEMETHODIMP WinIRFaceIDCredential::GetSerialization(
     }
     else if (domain.empty() || domain == L".")
     {
-        // Preserve Windows qualified identity (e.g. MicrosoftAccount\user@example.com or COMPUTER\DELL)
+        // Preserve Windows qualified identity (e.g. MicrosoftAccount\user@example.com or COMPUTER\User)
         // when the profile store uses the default local domain placeholder ".".
         const size_t qSlash = _qualifiedName.find(L'\\');
         if (qSlash != std::wstring::npos && qSlash > 0 && qSlash + 1 < _qualifiedName.size())

@@ -344,7 +344,7 @@ IFACEMETHODIMP WinIRFaceIDProvider::SetUserArray(ICredentialProviderUserArray* u
             qualifiedName = rawUserName;
         }
 
-        // Prefer SID -> SAM account name (e.g. "DELL" on Microsoft Accounts where
+        // Prefer SID -> SAM account name (e.g. "User" on Microsoft Accounts where
         // PKEY_Identity_UserName may return the email address).
         std::wstring samName = LookupUsernameFromSidString(sidStr);
         if (samName.empty())

@@ -57,6 +57,7 @@ _POSE_PROMPTS = (
 )
 
 _ENROLL_TARGET = 8
+_MAX_EMBEDDINGS_PER_USER = 32
 _ENROLL_MIN_INTERVAL = 0.45
 _JPEG_QUALITY = 88
 
@@ -508,6 +509,7 @@ class WinIRFaceIDController:
         self._motion_tracker = TemporalLivenessTracker()
 
         self._enroll_username: str = ""
+        self._enroll_append: bool = False
         self._enroll_embeddings: list[np.ndarray] = []
         self._last_enroll_capture_ts: float = 0.0
         self._last_processed_pair_ts: float | None = None
@@ -535,7 +537,12 @@ class WinIRFaceIDController:
         if auto_start_server:
             self._start_http_server()
 
-    def _build_standby_state(self, *, completed_user: str = "") -> dict[str, Any]:
+    def _build_standby_state(
+        self,
+        *,
+        completed_user: str = "",
+        completed_append: bool = False,
+    ) -> dict[str, Any]:
         return {
             "mode": "standby",
             "camera_active": False,
@@ -562,6 +569,7 @@ class WinIRFaceIDController:
                 "target": _ENROLL_TARGET,
                 "prompt": "",
                 "completed_user": completed_user,
+                "completed_append": bool(completed_append),
             },
             "error": None,
         }
@@ -696,7 +704,12 @@ class WinIRFaceIDController:
                 self._state["error"] = f"Model load error: {exc}"
             return False
 
-    def _stop_camera_and_loop(self, *, completed_user: str = "") -> None:
+    def _stop_camera_and_loop(
+        self,
+        *,
+        completed_user: str = "",
+        completed_append: bool = False,
+    ) -> None:
         self._proc_stop.set()
         proc_thread: threading.Thread | None
         worker: Any | None
@@ -714,9 +727,13 @@ class WinIRFaceIDController:
             self._camera_active = False
             self._enroll_embeddings = []
             self._enroll_username = ""
+            self._enroll_append = False
             self._last_processed_pair_ts = None
             self._motion_tracker.reset()
-            self._state = self._build_standby_state(completed_user=completed_user)
+            self._state = self._build_standby_state(
+                completed_user=completed_user,
+                completed_append=completed_append,
+            )
 
         with self._frame_cond:
             self._latest_jpeg = None
@@ -882,6 +899,7 @@ class WinIRFaceIDController:
             # Enrollment capture flow
             if mode == "enroll":
                 completed_user = ""
+                completed_append = False
                 enroll_done = False
                 if (
                     is_new_pair
@@ -899,17 +917,22 @@ class WinIRFaceIDController:
                             captured = len(self._enroll_embeddings)
                             if captured >= _ENROLL_TARGET:
                                 target_user = self._enroll_username
+                                append_mode = self._enroll_append
                                 self._store.upsert_embeddings(
                                     target_user,
                                     self._enroll_embeddings,
-                                    append=False,
+                                    append=append_mode,
                                 )
                                 completed_user = target_user
+                                completed_append = append_mode
                                 enroll_done = True
                 if enroll_done:
                     if pair is not None:
                         self._last_processed_pair_ts = pair.timestamp
-                    self._stop_camera_and_loop(completed_user=completed_user)
+                    self._stop_camera_and_loop(
+                        completed_user=completed_user,
+                        completed_append=completed_append,
+                    )
                     break
 
             # Live test flow
@@ -1028,6 +1051,7 @@ class WinIRFaceIDController:
                         "target": _ENROLL_TARGET,
                         "prompt": prompt,
                         "completed_user": "",
+                        "append": self._enroll_append,
                     },
                     "error": None,
                 }
@@ -1081,11 +1105,24 @@ class WinIRFaceIDController:
             snap["config_dirty"] = self._config_dirty
             return snap
 
-    def start_enroll(self, username: str) -> dict[str, Any]:
+    def start_enroll(self, username: str, append: bool = False) -> dict[str, Any]:
         """Start 8-sample active-IR face enrollment for *username*."""
         clean = str(username or "").strip()
         if not clean:
             return {"ok": False, "error": "Enter a Windows username first.", "state": self.get_state()}
+
+        append_mode = bool(append)
+        if append_mode:
+            existing = self._store.get_user(clean)
+            if existing is not None and len(existing.embeddings) >= _MAX_EMBEDDINGS_PER_USER:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Maximum appearances reached ({_MAX_EMBEDDINGS_PER_USER} samples). "
+                        "Remove and re-enroll to start fresh."
+                    ),
+                    "state": self.get_state(),
+                }
 
         if not self._ensure_recognizer_loaded():
             return {
@@ -1118,6 +1155,7 @@ class WinIRFaceIDController:
         with self._lock:
             self._mode = "enroll"
             self._enroll_username = clean
+            self._enroll_append = append_mode
             self._enroll_embeddings = []
             self._last_enroll_capture_ts = 0.0
             self._state = {
@@ -1129,6 +1167,7 @@ class WinIRFaceIDController:
                     "target": _ENROLL_TARGET,
                     "prompt": _POSE_PROMPTS[0],
                     "completed_user": "",
+                    "append": append_mode,
                 },
             }
 
@@ -1400,8 +1439,8 @@ class _JsApiBridge:
     def get_state(self) -> dict[str, Any]:
         return self._ctrl.get_state()
 
-    def start_enroll(self, username: str) -> dict[str, Any]:
-        return self._ctrl.start_enroll(username)
+    def start_enroll(self, username: str, append: bool = False) -> dict[str, Any]:
+        return self._ctrl.start_enroll(username, append=append)
 
     def cancel_action(self) -> dict[str, Any]:
         return self._ctrl.cancel_action()

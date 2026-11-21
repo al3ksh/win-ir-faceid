@@ -141,18 +141,43 @@
     }
   }
 
+  function updateEnrollButton(mode, prof) {
+    if (mode === "enroll") {
+      els.btnEnroll.textContent = "Cancel";
+      els.btnEnroll.removeAttribute("title");
+    } else if (prof && prof.sample_count > 0) {
+      els.btnEnroll.textContent = "Add Appearance";
+      els.btnEnroll.title = "Add another appearance, e.g. with glasses";
+    } else {
+      els.btnEnroll.textContent = "Enroll Face";
+      els.btnEnroll.removeAttribute("title");
+    }
+  }
+
   function renderAccountSection() {
     const user = currentUsername();
     const prof = findProfile(user);
     const mode = state.live ? state.live.mode : "standby";
 
     if (prof) {
-      const samplesLabel = prof.sample_count === 1 ? "1 sample" : `${prof.sample_count} samples`;
+      let statusPrefix;
+      if (prof.sample_count > 0) {
+        const samplesLabel = prof.sample_count === 1 ? "1 sample" : `${prof.sample_count} samples`;
+        if (prof.sample_count > 8) {
+          const looks = Math.max(2, Math.round(prof.sample_count / 8));
+          statusPrefix = `Enrolled · ${samplesLabel} (${looks} looks)`;
+        } else {
+          statusPrefix = `Enrolled · ${samplesLabel}`;
+        }
+      } else {
+        statusPrefix = "Not enrolled";
+      }
+
       if (prof.has_password) {
-        els.accountStatusLine.textContent = `${samplesLabel} · Password saved`;
+        els.accountStatusLine.textContent = `${statusPrefix} · Password saved`;
         els.accountStatusLine.dataset.tone = "ok";
       } else {
-        els.accountStatusLine.textContent = `${samplesLabel} · Password not set`;
+        els.accountStatusLine.textContent = `${statusPrefix} · Password not set`;
         els.accountStatusLine.dataset.tone = "warn";
       }
       els.btnRemove.classList.remove("hidden");
@@ -168,11 +193,7 @@
       els.removeConfirmRow.classList.add("hidden");
     }
 
-    if (mode === "enroll") {
-      els.btnEnroll.textContent = "Cancel";
-    } else {
-      els.btnEnroll.textContent = prof && prof.sample_count > 0 ? "Re-enroll" : "Enroll Face";
-    }
+    updateEnrollButton(mode, prof);
   }
 
   function renderServiceStatus(status, configDirty) {
@@ -315,11 +336,7 @@
 
     // Buttons state
     const prof = findProfile(currentUsername());
-    if (mode === "enroll") {
-      els.btnEnroll.textContent = "Cancel";
-    } else {
-      els.btnEnroll.textContent = prof && prof.sample_count > 0 ? "Re-enroll" : "Enroll Face";
-    }
+    updateEnrollButton(mode, prof);
     els.btnLiveTest.textContent = mode === "test" ? "Stop Test" : "Test Live";
     els.btnLiveTest.classList.toggle("active", mode === "test");
     els.btnPreview.setAttribute("aria-pressed", mode === "preview" ? "true" : "false");
@@ -395,8 +412,12 @@
       if (state.wasEnrolling) {
         state.wasEnrolling = false;
         const doneUser = live.enroll && live.enroll.completed_user;
+        const doneAppend = Boolean(live.enroll && live.enroll.completed_append);
         if (doneUser) {
-          showFeedback(`Enrolled 8 IR samples for '${doneUser}'.`, "ok", 5000);
+          const msg = doneAppend
+            ? `Appearance added for '${doneUser}'.`
+            : `Enrolled 8 IR samples for '${doneUser}'.`;
+          showFeedback(msg, "ok", 5000);
           refreshBootstrapData();
         }
       }
@@ -557,7 +578,9 @@
         els.usernameInput.focus();
         return;
       }
-      const res = await a.start_enroll(user);
+      const prof = findProfile(user);
+      const append = Boolean(prof && prof.sample_count > 0);
+      const res = await a.start_enroll(user, append);
       if (!res.ok) {
         showFeedback(res.error || "Unable to start enrollment.", "error");
       }

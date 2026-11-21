@@ -525,6 +525,11 @@ class NamedPipeServer:
 
             payload = (json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8")
             self._overlapped_write_all(pipe_handle, payload)
+        except pywintypes.error as exc:
+            if getattr(exc, "winerror", None) in (109, 232):
+                logger.debug("Pipe client disconnected cleanly (winerror=%s)", exc.winerror)
+            else:
+                logger.exception("Pipe client error: %s", exc)
         except Exception as exc:
             logger.exception("Pipe client error: %s", exc)
         finally:
