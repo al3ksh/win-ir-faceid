@@ -65,18 +65,19 @@ Type: files; Name: "{app}\setup.log"
 var
   SetupOk: Boolean;
   SetupExitCode: Integer;
+  PurgeData: Boolean;
 
 function SetupSucceeded: Boolean;
 begin
   Result := SetupOk;
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+procedure StopAppProcesses;
 var
   ResultCode: Integer;
 begin
-  // On upgrade: stop the service and any process running from the install dir (GUI, Python runtime)
-  // so bin, runtime and .venv files are not locked while they are overwritten.
+  // Stop the service and any process running from the install dir (GUI, Python runtime)
+  // so bin, runtime, .venv and data files are not locked.
   Exec('sc.exe', 'stop WinIRFaceIDService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('powershell.exe',
     '-NoProfile -ExecutionPolicy Bypass -Command "$r=''' + ExpandConstant('{app}') + '\''; ' +
@@ -85,6 +86,11 @@ begin
     'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(1200);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopAppProcesses;
   Result := '';
 end;
 
@@ -131,4 +137,38 @@ begin
     Result := 0
   else
     Result := 1;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+  PythonExe: String;
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    // Runs before [UninstallRun] and before files are removed, so the venv is still usable.
+    PurgeData := False;
+    if not UninstallSilent then
+      PurgeData := MsgBox(
+        'Also delete your saved face profiles and the stored Windows password?' + #13#10#13#10 +
+        'Yes - remove everything (recommended unless you plan to reinstall).' + #13#10 +
+        'No - keep them in ' + ExpandConstant('{app}\data') + ' for a later reinstall.',
+        mbConfirmation, MB_YESNO) = IDYES;
+    if PurgeData then
+    begin
+      StopAppProcesses;
+      PythonExe := ExpandConstant('{app}\.venv\Scripts\python.exe');
+      // Deletes the TPM password key and the data directory.
+      if FileExists(PythonExe) then
+        Exec(PythonExe, '-m engine.cli purge-data --yes', ExpandConstant('{app}'), SW_HIDE,
+          ewWaitUntilTerminated, ResultCode);
+    end;
+  end
+  else if CurUninstallStep = usPostUninstall then
+  begin
+    if PurgeData then
+      DelTree(ExpandConstant('{app}\data'), True, True, True);
+    // Removes the install dir only when nothing (e.g. kept data) is left in it.
+    RemoveDir(ExpandConstant('{app}'));
+  end;
 end;

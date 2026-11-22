@@ -295,3 +295,23 @@ def test_delete_look_over_pipe_is_bound_to_caller(tmp_path: Path) -> None:
     last = {"cmd": "profile_delete_look", "look_id": r["profile"]["looks"][0]["id"]}
     assert handle_request(last, store, client=alice)["reason"] == "last_look"
     assert handle_request({"cmd": "profile_delete_look", "look_id": 5}, store, client=alice)["reason"] == "bad_request"
+
+
+def test_purge_data_requires_yes_and_removes_data_dir(tmp_path, monkeypatch, capsys):
+    import engine.store as store_mod
+    import engine.tpm as tpm_mod
+    from engine import cli
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "profiles.enc").write_bytes(b"secret")
+    monkeypatch.setattr(store_mod, "get_default_store_path", lambda: data_dir / "profiles.enc")
+    calls = []
+    monkeypatch.setattr(tpm_mod.TpmKeyProtector, "delete_key", lambda self: calls.append(self.key_name) or True)
+
+    assert cli.main(["purge-data"]) == 2
+    assert data_dir.exists() and not calls
+
+    assert cli.main(["purge-data", "--yes"]) == 0
+    assert not data_dir.exists()
+    assert calls == [tpm_mod.DEFAULT_KEY_NAME]

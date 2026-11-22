@@ -228,6 +228,39 @@ def _cmd_delete(args: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_purge_data(args: argparse.Namespace) -> int:
+    """Delete every stored face profile and password: the TPM key and the data directory."""
+    import shutil
+
+    from engine.store import get_default_store_path
+    from engine.tpm import TpmKeyProtector, TpmUnavailableError
+
+    if not args.yes:
+        print("Refusing to delete data without --yes.", file=sys.stderr)
+        return 2
+
+    rc = 0
+    try:
+        deleted = TpmKeyProtector().delete_key()
+        print("Deleted the TPM password key." if deleted else "No TPM password key found.")
+    except (TpmUnavailableError, OSError) as exc:
+        # Without profiles.enc the key has nothing left to decrypt; still report it.
+        print(f"Could not delete the TPM password key: {exc}", file=sys.stderr)
+        rc = 1
+
+    data_dir = get_default_store_path().parent
+    if data_dir.exists():
+        try:
+            shutil.rmtree(data_dir)
+            print(f"Deleted '{data_dir}'.")
+        except OSError as exc:
+            print(f"Could not delete '{data_dir}': {exc}", file=sys.stderr)
+            rc = 1
+    else:
+        print(f"'{data_dir}' does not exist.")
+    return rc
+
+
 def _cmd_migrate_store(args: argparse.Namespace) -> int:
     path = getattr(args, "path", None)
     store = ProfileStore(path, local_machine=True) if path else ProfileStore(local_machine=True)
@@ -422,6 +455,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_del = sub.add_parser("delete", help="Delete an enrolled user profile")
     p_del.add_argument("--user", required=True, help="Windows username to delete")
     p_del.set_defaults(func=_cmd_delete)
+
+    p_purge = sub.add_parser(
+        "purge-data",
+        help="Delete all face profiles, stored passwords and the TPM key (used by the uninstaller)",
+    )
+    p_purge.add_argument("--yes", action="store_true", help="Confirm irreversible deletion")
+    p_purge.set_defaults(func=_cmd_purge_data)
 
     p_migrate = sub.add_parser(
         "migrate-store",

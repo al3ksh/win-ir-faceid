@@ -195,13 +195,27 @@ class TpmKeyProtector:
         """Decrypt a blob produced by :meth:`wrap` inside the TPM."""
         return self._crypt(ciphertext, encrypt=False)
 
-    def delete_key(self) -> None:
-        """Delete the persisted TPM key (irreversibly invalidates every wrapped blob)."""
+    def delete_key(self) -> bool:
+        """Delete the persisted TPM key (irreversibly invalidates every wrapped blob).
+
+        Returns False when the key does not exist.
+        """
         lib = _lib()
         with self._lock:
             h_prov = self._open_provider()
             try:
-                h_key = self._open_key(h_prov, create=False)
-                _check(lib.NCryptDeleteKey(h_key, 0), "NCryptDeleteKey")
+                h_key = _NCRYPT_HANDLE()
+                rc = lib.NCryptOpenKey(h_prov, ctypes.byref(h_key), self.key_name, 0, self._key_flags)
+                if (rc & 0xFFFFFFFF) in (NTE_BAD_KEYSET, NTE_NO_KEY):
+                    return False
+                _check(rc, "NCryptOpenKey")
+                # NCryptDeleteKey frees the key handle only on success. The Platform Crypto
+                # Provider rejects NCRYPT_SILENT_FLAG here (NTE_BAD_FLAGS).
+                rc = lib.NCryptDeleteKey(h_key.value, 0)
+                if rc != 0:
+                    lib.NCryptFreeObject(h_key.value)
+                _check(rc, "NCryptDeleteKey")
+                logger.info("Deleted TPM key '%s'", self.key_name)
+                return True
             finally:
                 lib.NCryptFreeObject(h_prov)

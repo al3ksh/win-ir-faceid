@@ -217,10 +217,17 @@ Press **`Win + L`** to lock your workstation and test pure-IR unlock.
 
 ## Clean Uninstall & Safe Mode Recovery
 
-- **Wizard Installer:** Uninstall **WinIRFaceID** from **Windows Settings -> Apps -> Installed apps** (automatically unregisters the Credential Provider, removes `WinIRFaceIDService`, and cleans up `.venv`, the private Python `runtime`, and `models`).
-- **Portable ZIP / Source Clone:** Double-click **`Uninstall.bat`**, or run in an **Administrator PowerShell** prompt:
+- **Wizard Installer:** Uninstall **WinIRFaceID** from **Windows Settings -> Apps -> Installed apps**. This unregisters the Credential Provider, removes `WinIRFaceIDService`, and cleans up `.venv`, the private Python `runtime`, and `models`. It then asks whether to **also delete your face profiles and stored Windows password**: **Yes** deletes the TPM password key and the whole `data\` folder; **No** keeps `data\` for a later reinstall. Silent uninstalls (`/SILENT`) keep the data.
+- **Remove only the lock screen tile** (keep the app and service) from an **Administrator PowerShell** prompt:
 
 ```powershell
+& "C:\Program Files\WinIRFaceID\credential_provider\uninstall.ps1"
+```
+
+- **Portable ZIP / Source Clone:** Double-click **`Uninstall.bat`**, or run in an **Administrator PowerShell** prompt from the WinIRFaceID folder. The first line deletes your face profiles, stored password and TPM key; skip it to keep them:
+
+```powershell
+.\.venv\Scripts\python.exe -m engine.cli purge-data --yes
 .\credential_provider\uninstall.ps1
 .\scripts\uninstall_service.ps1
 ```
