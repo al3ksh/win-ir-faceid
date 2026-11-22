@@ -202,23 +202,29 @@
     return window.pywebview && window.pywebview.api ? window.pywebview.api : null;
   }
 
+  // pywebview creates window.pywebview.api before it injects the Python methods (and fires
+  // "pywebviewready" only afterwards); on slow machines polling can see the empty object first.
+  function apiReady() {
+    const a = api();
+    return !!a && typeof a.get_bootstrap === "function" && typeof a.get_state === "function";
+  }
+
   function waitForPywebview() {
-    if (api()) {
+    if (apiReady()) {
       return Promise.resolve();
     }
     return new Promise((resolve) => {
-      const onReady = () => {
+      let check = null;
+      const done = () => {
+        clearInterval(check);
         window.removeEventListener("pywebviewready", onReady);
         resolve();
       };
+      const onReady = () => {
+        if (apiReady()) done();
+      };
       window.addEventListener("pywebviewready", onReady);
-      const check = setInterval(() => {
-        if (api()) {
-          clearInterval(check);
-          window.removeEventListener("pywebviewready", onReady);
-          resolve();
-        }
-      }, 40);
+      check = setInterval(onReady, 40);
     });
   }
 
