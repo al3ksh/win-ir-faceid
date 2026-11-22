@@ -121,8 +121,18 @@ while ((Get-Date) -lt $waitDeadline) {
     Start-Sleep -Milliseconds 500
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($null -ne $svc -and $svc.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) {
-        & $PipeTestExe ping 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        # The pipe may not exist yet (win32_error_2). Windows PowerShell turns redirected native stderr
+        # into terminating errors under ErrorActionPreference=Stop, so relax it for the probe.
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $PipeTestExe ping 2>$null | Out-Null
+            $pingRc = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $prevEap
+        }
+        if ($pingRc -eq 0) {
             break
         }
     }
