@@ -14,7 +14,7 @@ from engine import __version__
 from engine.liveness import check_ir_liveness
 from engine.models import ensure_models
 from engine.recognizer import DEFAULT_MATCH_THRESHOLD, FaceRecognizer, enhance_ir_bgr
-from engine.store import ProfileStore, load_service_config
+from engine.store import ProfileStore, clamp_service_threshold, load_service_config
 
 logger = logging.getLogger(__name__)
 
@@ -246,7 +246,7 @@ def _resolve_serve_options(args: argparse.Namespace) -> tuple[float, bool, bool]
     """Resolve effective ``serve`` options, falling back to ``service_config.json``."""
     cfg = load_service_config()
     explicit = getattr(args, "_explicit_args", set())
-    threshold = float(args.threshold) if "threshold" in explicit else float(cfg.threshold)
+    threshold = clamp_service_threshold(float(args.threshold) if "threshold" in explicit else float(cfg.threshold))
     require_motion = bool(args.require_motion) if "require_motion" in explicit else bool(cfg.require_motion)
     require_open_eyes = (
         bool(args.require_open_eyes) if "require_open_eyes" in explicit else bool(cfg.require_open_eyes)

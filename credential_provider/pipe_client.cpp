@@ -79,6 +79,44 @@ IoWaitOutcome WaitForOverlappedIo(
     return IoWaitOutcome::Failed;
 }
 
+// Passwords are only ever accepted from a pipe server running as LocalSystem. A
+// non-privileged process that races the service for the pipe name (e.g. while the
+// service restarts) therefore cannot feed LogonUI forged credentials or harvest requests.
+bool IsPipeServerLocalSystem(HANDLE hPipe)
+{
+    ULONG serverPid = 0;
+    if (!GetNamedPipeServerProcessId(hPipe, &serverPid) || serverPid == 0)
+    {
+        return false;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, serverPid);
+    if (hProcess == nullptr)
+    {
+        return false;
+    }
+
+    bool isSystem = false;
+    HANDLE hToken = nullptr;
+    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken))
+    {
+        DWORD needed = 0;
+        GetTokenInformation(hToken, TokenUser, nullptr, 0, &needed);
+        if (needed > 0)
+        {
+            std::vector<BYTE> buffer(needed);
+            if (GetTokenInformation(hToken, TokenUser, buffer.data(), needed, &needed))
+            {
+                const auto* tokenUser = reinterpret_cast<const TOKEN_USER*>(buffer.data());
+                isSystem = IsWellKnownSid(tokenUser->User.Sid, WinLocalSystemSid) != FALSE;
+            }
+        }
+        CloseHandle(hToken);
+    }
+    CloseHandle(hProcess);
+    return isSystem;
+}
+
 HANDLE OpenPipeWithCancel(ULONGLONG deadlineTick, HANDLE cancelEvent, DWORD& outError)
 {
     outError = ERROR_SUCCESS;
@@ -91,19 +129,26 @@ HANDLE OpenPipeWithCancel(ULONGLONG deadlineTick, HANDLE cancelEvent, DWORD& out
             return INVALID_HANDLE_VALUE;
         }
 
+        // Least-privilege access (no FILE_CREATE_PIPE_INSTANCE) and an identification-only
+        // impersonation level: the server may learn who we are but never act as us.
         HANDLE hPipe = CreateFileW(
             kPipeName,
-            GENERIC_READ | GENERIC_WRITE,
+            GENERIC_READ | FILE_WRITE_DATA,
             0,
             nullptr,
             OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
             nullptr);
 
         if (hPipe != INVALID_HANDLE_VALUE)
         {
-            DWORD mode = PIPE_READMODE_BYTE;
-            SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
+            // Pipe is created in byte read mode by the server; no handle state change needed.
+            if (!IsPipeServerLocalSystem(hPipe))
+            {
+                CloseHandle(hPipe);
+                outError = ERROR_ACCESS_DENIED;
+                return INVALID_HANDLE_VALUE;
+            }
             return hPipe;
         }
 

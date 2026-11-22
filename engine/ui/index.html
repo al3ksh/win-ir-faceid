@@ -110,18 +110,21 @@
             <!-- Bottom Enrollment Overlay (8-segment bar + single calm pose prompt) -->
             <div class="enroll-hud" id="enrollHud" data-visible="false" aria-hidden="true">
               <div class="enroll-prompt-row">
-                <span class="enroll-prompt" id="enrollPrompt">Look straight at the camera</span>
+                <div class="pose-guide" id="poseGuide" data-pose="center" aria-hidden="true">
+                  <svg viewBox="0 0 48 48" width="56" height="56">
+                    <circle class="pose-ring-bg" cx="24" cy="24" r="21"></circle>
+                    <circle class="pose-ring" id="poseRing" cx="24" cy="24" r="21" pathLength="100"></circle>
+                    <circle class="pose-dot" cx="24" cy="24" r="4.5"></circle>
+                    <path class="pose-arrow" d="M24 13 L24 35 M15 22 L24 13 L33 22"></path>
+                  </svg>
+                </div>
+                <div class="enroll-text">
+                  <span class="enroll-prompt" id="enrollPrompt">Look straight at the camera</span>
+                  <span class="enroll-sub" id="enrollSub">Get ready</span>
+                </div>
                 <span class="enroll-counter tabular" id="enrollCounter">0 / 8</span>
               </div>
               <div class="enroll-segments" id="enrollSegments" aria-label="Enrollment progress">
-                <span class="seg"></span>
-                <span class="seg"></span>
-                <span class="seg"></span>
-                <span class="seg"></span>
-                <span class="seg"></span>
-                <span class="seg"></span>
-                <span class="seg"></span>
-                <span class="seg"></span>
               </div>
             </div>
           </div>
@@ -210,6 +213,7 @@
           </div>
 
           <div class="account-status-line" id="accountStatusLine">Not enrolled</div>
+          <ul class="looks-list hidden" id="looksList" aria-label="Enrolled looks"></ul>
 
           <!-- Inline Model Download Row (shown only when ONNX models are missing) -->
           <div class="models-row hidden" id="modelsRow">
@@ -256,7 +260,7 @@
               type="range"
               id="thresholdSlider"
               class="range-slider"
-              min="0.50"
+              min="0.60"
               max="0.80"
               step="0.01"
               value="0.65"
@@ -265,6 +269,17 @@
               <span>Balanced</span>
               <span>Strict</span>
               <span>Max</span>
+            </div>
+            <div class="score-stats hidden" id="scoreStats" aria-live="polite">
+              <div class="score-track" aria-hidden="true">
+                <div class="score-range" id="scoreRange"></div>
+                <div class="score-median" id="scoreMedian"></div>
+                <div class="score-thresh" id="scoreThresh"></div>
+              </div>
+              <div class="score-scale" aria-hidden="true">
+                <span>0.30</span><span>1.00</span>
+              </div>
+              <div class="score-stats-text tabular" id="scoreStatsText"></div>
             </div>
           </div>
         </section>

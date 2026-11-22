@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import ntsecuritycon
@@ -21,37 +24,66 @@ import winerror
 from engine import __version__
 from engine.liveness import TemporalLivenessTracker, check_eyes_open_ir, check_ir_liveness
 from engine.recognizer import DEFAULT_MATCH_THRESHOLD, FaceRecognizer, enhance_ir_bgr
-from engine.store import ProfileStore, UserProfile
+from engine.store import (
+    ProfileStore,
+    ServiceConfig,
+    UserProfile,
+    clamp_service_threshold,
+    load_service_config,
+    save_service_config,
+)
 
 logger = logging.getLogger(__name__)
 
 PIPE_NAME = r"\\.\pipe\WinIRFaceID"
 MAX_MESSAGE_BYTES = 65536
+MAX_REQUEST_BYTES = 1024 * 1024
 DEFAULT_TIMEOUT_MS = 8000
 DEFAULT_THRESHOLD = DEFAULT_MATCH_THRESHOLD
 DEFAULT_REQUIRED_CONSECUTIVE = 2
+MAX_EMBEDDINGS_PER_USER = 32
+MAX_EMBEDDING_DIM = 2048
+MAX_PASSWORD_CHARS = 256
+
+FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+
+# Rights granted to ordinary interactive users on the pipe: read/write data, but NOT
+# FILE_CREATE_PIPE_INSTANCE (== FILE_APPEND_DATA), so they cannot squat server instances.
+PIPE_CLIENT_ACCESS = ntsecuritycon.FILE_GENERIC_READ | ntsecuritycon.FILE_WRITE_DATA
+
+_SID_SYSTEM_STR = "S-1-5-18"
+
+
+def _current_process_user_sid() -> Any:
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    try:
+        return win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    finally:
+        win32api.CloseHandle(token)
 
 
 def build_pipe_security_attributes(service_mode: bool = False) -> pywintypes.SECURITY_ATTRIBUTES:
-    """Build a Named Pipe DACL permitting LocalSystem, Administrators, and current user."""
+    """Build the Named Pipe DACL.
+
+    LocalSystem and Administrators get full control. Authenticated users may connect and
+    exchange messages (the server authorizes each command against the caller's identity),
+    but are never granted ``FILE_CREATE_PIPE_INSTANCE``. In developer (non-service) mode the
+    current user additionally gets full control.
+    """
     sd = win32security.SECURITY_DESCRIPTOR()
     acl = win32security.ACL()
 
     sid_system = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
     sid_admins = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
+    sid_auth_users = win32security.CreateWellKnownSid(win32security.WinAuthenticatedUserSid, None)
 
     acl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, sid_system)
     acl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, sid_admins)
+    acl.AddAccessAllowedAce(win32security.ACL_REVISION, PIPE_CLIENT_ACCESS, sid_auth_users)
 
     if not service_mode:
-        token = win32security.OpenProcessToken(
-            win32api.GetCurrentProcess(),
-            win32con.TOKEN_QUERY,
-        )
-        try:
-            sid_user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
-        finally:
-            win32api.CloseHandle(token)
+        sid_user = _current_process_user_sid()
         acl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, sid_user)
 
     sd.SetSecurityDescriptorDacl(1, acl, 0)
@@ -275,11 +307,16 @@ class IRFaceVerifier:
                         consecutive_count = 1
 
                     if consecutive_count >= self.required_consecutive:
+                        try:
+                            password = best_profile.resolve_password()
+                        except Exception as exc:
+                            logger.error("Failed to unwrap stored password: %s", exc)
+                            return {"status": "failed", "reason": "credential_error"}
                         return {
                             "status": "matched",
                             "username": best_profile.username,
                             "domain": best_profile.domain,
-                            "password": best_profile.password,
+                            "password": password,
                             "score": round(float(best_score), 4),
                             "liveness_delta": round(float(liveness.delta), 2),
                         }
@@ -298,46 +335,340 @@ class IRFaceVerifier:
                 logger.warning("Error stopping camera worker: %s", stop_exc)
 
 
+@dataclass(frozen=True)
+class ClientIdentity:
+    """Windows identity of a connected pipe client, captured via impersonation."""
+
+    sid: str
+    username: str
+    domain: str
+    is_system: bool = False
+    privileged: bool = False
+    is_admin_member: bool = False
+
+
+_SID_ADMINS_STR = "S-1-5-32-544"
+
+
+def _token_is_admin_member(token: Any) -> bool:
+    """True if the token lists BUILTIN\\Administrators (enabled or UAC deny-only)."""
+    try:
+        groups = win32security.GetTokenInformation(token, win32security.TokenGroups)
+    except pywintypes.error:
+        return False
+    for sid, _attrs in groups:
+        try:
+            if win32security.ConvertSidToStringSid(sid) == _SID_ADMINS_STR:
+                return True
+        except pywintypes.error:
+            continue
+    return False
+
+
+def identify_pipe_client(pipe_handle: Any, *, service_mode: bool) -> ClientIdentity | None:
+    """Impersonate the pipe client briefly to learn who it is. Returns None on failure."""
+    try:
+        win32security.ImpersonateNamedPipeClient(pipe_handle)
+    except Exception:
+        return None
+    try:
+        token = win32security.OpenThreadToken(
+            win32api.GetCurrentThread(), win32con.TOKEN_QUERY, True
+        )
+    except Exception:
+        token = None
+    finally:
+        try:
+            win32security.RevertToSelf()
+        except Exception:
+            logger.critical("RevertToSelf failed; terminating to avoid running as client")
+            raise SystemExit(1)
+    if token is None:
+        return None
+    try:
+        sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+        sid_str = win32security.ConvertSidToStringSid(sid)
+        is_admin_member = _token_is_admin_member(token)
+    except Exception:
+        return None
+    finally:
+        try:
+            win32api.CloseHandle(token)
+        except Exception:
+            pass
+
+    try:
+        username, domain, _type = win32security.LookupAccountSid(None, sid)
+    except Exception:
+        username, domain = "", ""
+
+    is_system = sid_str == _SID_SYSTEM_STR
+    privileged = is_system
+    if not service_mode and not privileged:
+        try:
+            privileged = sid_str == win32security.ConvertSidToStringSid(_current_process_user_sid())
+        except Exception:
+            privileged = False
+    return ClientIdentity(
+        sid=sid_str,
+        username=str(username or ""),
+        domain=str(domain or ""),
+        is_system=is_system,
+        privileged=privileged,
+        is_admin_member=is_admin_member or is_system,
+    )
+
+
+def _fail(reason: str) -> dict[str, Any]:
+    return {"status": "failed", "reason": reason}
+
+
+def _public_profile(profile: UserProfile | None) -> dict[str, Any] | None:
+    """Profile view safe to hand to its owner: never includes the password."""
+    if profile is None:
+        return None
+    return {
+        "username": profile.username,
+        "domain": profile.domain,
+        "embeddings": profile.embeddings,
+        "has_password": profile.has_password,
+        "created_at": profile.created_at,
+        "updated_at": profile.updated_at,
+        "looks": [dict(look) for look in profile.looks],
+    }
+
+
+def _validate_embeddings(raw: Any) -> list[list[float]] | None:
+    if not isinstance(raw, list) or not (1 <= len(raw) <= MAX_EMBEDDINGS_PER_USER):
+        return None
+    out: list[list[float]] = []
+    dim: int | None = None
+    for row in raw:
+        if not isinstance(row, list) or not (1 <= len(row) <= MAX_EMBEDDING_DIM):
+            return None
+        if dim is None:
+            dim = len(row)
+        elif len(row) != dim:
+            return None
+        vals: list[float] = []
+        for v in row:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return None
+            fv = float(v)
+            if not math.isfinite(fv):
+                return None
+            vals.append(fv)
+        out.append(vals)
+    return out
+
+
+def _config_to_dict(cfg: ServiceConfig) -> dict[str, Any]:
+    return {
+        "threshold": float(cfg.threshold),
+        "require_motion": bool(cfg.require_motion),
+        "require_open_eyes": bool(cfg.require_open_eyes),
+    }
+
+
+_MANAGEMENT_COMMANDS = frozenset(
+    {"profile_get", "profile_enroll", "profile_set_password", "profile_delete", "profile_delete_look", "config_get", "config_set"}
+)
+
+
+def _handle_management(
+    cmd: str,
+    msg: dict[str, Any],
+    store: ProfileStore,
+    verifier: Any | None,
+    client: ClientIdentity,
+    config_path: Path | str | None,
+    store_lock: threading.Lock,
+) -> dict[str, Any]:
+    """Self-service commands. Every profile operation is bound to the caller's own account."""
+    if cmd == "config_get":
+        return {"status": "ok", "config": _config_to_dict(load_service_config(config_path))}
+
+    if cmd == "config_set":
+        # Global security settings: only members of BUILTIN\Administrators may change them.
+        if not (client.privileged or client.is_admin_member):
+            return _fail("forbidden")
+        with store_lock:
+            cfg = load_service_config(config_path)
+            if "threshold" in msg:
+                raw = msg["threshold"]
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    return _fail("bad_request")
+                cfg.threshold = clamp_service_threshold(float(raw))
+            for key in ("require_motion", "require_open_eyes"):
+                if key in msg:
+                    if not isinstance(msg[key], bool):
+                        return _fail("bad_request")
+                    setattr(cfg, key, msg[key])
+            save_service_config(cfg, config_path)
+        if verifier is not None:
+            for attr in ("threshold", "require_motion", "require_open_eyes"):
+                if hasattr(verifier, attr):
+                    setattr(verifier, attr, getattr(cfg, attr))
+        return {"status": "ok", "config": _config_to_dict(cfg)}
+
+    username = client.username.strip()
+    if not username or client.is_system:
+        return _fail("forbidden")
+
+    with store_lock:
+        existing = store.get_user(username)
+        if existing is not None and existing.sid and existing.sid != client.sid:
+            return _fail("forbidden")
+
+        if cmd == "profile_get":
+            return {"status": "ok", "username": username, "profile": _public_profile(existing)}
+
+        if cmd == "profile_enroll":
+            embeddings = _validate_embeddings(msg.get("embeddings"))
+            if embeddings is None:
+                return _fail("bad_request")
+            append = msg.get("append", True)
+            if not isinstance(append, bool):
+                return _fail("bad_request")
+            current = len(existing.embeddings) if (existing is not None and append) else 0
+            if current + len(embeddings) > MAX_EMBEDDINGS_PER_USER:
+                return _fail("too_many_samples")
+            if append and existing is not None and existing.embeddings:
+                if len(existing.embeddings[0]) != len(embeddings[0]):
+                    return _fail("bad_request")
+            profile = store.upsert_embeddings(username, embeddings, append=append, sid=client.sid)
+            return {"status": "ok", "username": username, "profile": _public_profile(profile)}
+
+        if cmd == "profile_set_password":
+            password = msg.get("password")
+            domain = msg.get("domain", ".")
+            if not isinstance(password, str) or not password or len(password) > MAX_PASSWORD_CHARS:
+                return _fail("bad_request")
+            if not isinstance(domain, str) or len(domain) > 256:
+                return _fail("bad_request")
+            rejected = _validate_logon_password(username, domain or ".", password)
+            if rejected:
+                return _fail(rejected)
+            profile = store.set_credentials(username, password, domain=domain or ".", sid=client.sid)
+            return {"status": "ok", "username": username, "profile": _public_profile(profile)}
+
+        if cmd == "profile_delete_look":
+            look_id = msg.get("look_id")
+            if not isinstance(look_id, str) or not look_id or len(look_id) > 64:
+                return _fail("bad_request")
+            if existing is None:
+                return _fail("not_found")
+            try:
+                profile = store.delete_look(username, look_id)
+            except KeyError:
+                return _fail("not_found")
+            except ValueError:
+                return _fail("last_look")
+            return {"status": "ok", "username": username, "profile": _public_profile(profile)}
+
+        if cmd == "profile_delete":
+            removed = store.delete_user(username)
+            return {"status": "ok", "username": username, "deleted": bool(removed)}
+
+    return _fail("bad_request")
+
+
+# LogonUser results that prove the password is wrong / unusable. Any other failure (for
+# example a policy that denies network logons) means "could not verify" and is not
+# treated as a bad password, so such machines are not locked out of the feature.
+_LOGON_REJECT_REASONS = {
+    winerror.ERROR_LOGON_FAILURE: "invalid_password",
+    winerror.ERROR_ACCOUNT_LOCKED_OUT: "account_locked",
+    winerror.ERROR_PASSWORD_EXPIRED: "password_expired",
+    winerror.ERROR_PASSWORD_MUST_CHANGE: "password_expired",
+    winerror.ERROR_ACCOUNT_DISABLED: "account_disabled",
+}
+
+
+def _validate_logon_password(username: str, domain: str, password: str) -> str | None:
+    """Check *password* with LogonUserW before storing it.
+
+    Returns ``None`` if the credentials are valid (or cannot be checked), otherwise a
+    failure reason. A wrong password stored here would only surface at the lock screen.
+    """
+    try:
+        token = win32security.LogonUser(
+            username,
+            domain or ".",
+            password,
+            win32con.LOGON32_LOGON_NETWORK,
+            win32con.LOGON32_PROVIDER_DEFAULT,
+        )
+    except pywintypes.error as exc:
+        reason = _LOGON_REJECT_REASONS.get(exc.winerror)
+        if reason is None:
+            logger.warning("Could not verify password for %s (error %s); storing anyway", username, exc.winerror)
+        return reason
+    try:
+        token.Close()
+    except Exception:
+        pass
+    return None
+
+
+_DEFAULT_STORE_LOCK = threading.Lock()
+
+
 def handle_request(
     msg: dict[str, Any],
     store: ProfileStore,
     verifier: Any | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    client: ClientIdentity | None = None,
+    config_path: Path | str | None = None,
+    store_lock: threading.Lock | None = None,
 ) -> dict[str, Any]:
-    """Handle one parsed IPC request dictionary and return a response dictionary."""
+    """Handle one parsed IPC request dictionary and return a response dictionary.
+
+    ``client`` is the authenticated pipe caller. ``None`` means a trusted in-process
+    caller (unit tests, CLI); such callers are treated as privileged but cannot use the
+    per-user management commands, which need a Windows identity to bind to.
+    """
     if not isinstance(msg, dict):
-        return {"status": "failed", "reason": "bad_request"}
+        return _fail("bad_request")
 
     cmd = msg.get("cmd")
     if not isinstance(cmd, str):
-        return {"status": "failed", "reason": "bad_request"}
+        return _fail("bad_request")
+
+    privileged = client is None or client.privileged
 
     if cmd == "ping":
-        enrolled = [u.username for u in store.list_users() if u.embeddings]
-        return {
-            "status": "ok",
-            "version": __version__,
-            "enrolled_users": enrolled,
-        }
+        response: dict[str, Any] = {"status": "ok", "version": __version__}
+        if privileged:
+            response["enrolled_users"] = [u.username for u in store.list_users() if u.embeddings]
+        return response
 
     if cmd == "cancel":
+        if not privileged:
+            return _fail("forbidden")
         if cancel_event is not None:
             cancel_event.set()
         return {"status": "ok"}
 
     if cmd == "verify":
+        # Only LocalSystem (the credential provider inside LogonUI) may receive passwords.
+        if not privileged:
+            return _fail("forbidden")
         username = msg.get("username", "")
         if username is None:
             username = ""
         if not isinstance(username, str):
-            return {"status": "failed", "reason": "bad_request"}
+            return _fail("bad_request")
 
         raw_timeout = msg.get("timeout_ms", DEFAULT_TIMEOUT_MS)
         if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
-            return {"status": "failed", "reason": "bad_request"}
+            return _fail("bad_request")
         timeout_ms = int(raw_timeout)
         if timeout_ms <= 0:
-            return {"status": "failed", "reason": "bad_request"}
+            return _fail("bad_request")
+        timeout_ms = min(timeout_ms, 60000)
 
         active_verifier = verifier if verifier is not None else IRFaceVerifier(store)
         if hasattr(active_verifier, "verify"):
@@ -352,9 +683,20 @@ def handle_request(
                 timeout_ms=timeout_ms,
                 cancel_event=cancel_event,
             )
-        return {"status": "failed", "reason": "camera_error"}
+        return _fail("camera_error")
 
-    return {"status": "failed", "reason": "bad_request"}
+    if cmd in _MANAGEMENT_COMMANDS:
+        if client is None:
+            return _fail("forbidden")
+        try:
+            return _handle_management(
+                cmd, msg, store, verifier, client, config_path, store_lock or _DEFAULT_STORE_LOCK
+            )
+        except Exception as exc:
+            logger.exception("Management command '%s' failed: %s", cmd, exc)
+            return _fail("internal_error")
+
+    return _fail("bad_request")
 
 
 def handle_raw_message(
@@ -362,16 +704,22 @@ def handle_raw_message(
     store: ProfileStore,
     verifier: Any | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    client: ClientIdentity | None = None,
+    config_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Parse a raw UTF-8 JSON line and dispatch it through ``handle_request``."""
     try:
         text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
         parsed = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return {"status": "failed", "reason": "bad_request"}
+        return _fail("bad_request")
     if not isinstance(parsed, dict):
-        return {"status": "failed", "reason": "bad_request"}
-    return handle_request(parsed, store=store, verifier=verifier, cancel_event=cancel_event)
+        return _fail("bad_request")
+    return handle_request(
+        parsed, store=store, verifier=verifier, cancel_event=cancel_event,
+        client=client, config_path=config_path,
+    )
 
 
 class NamedPipeServer:
@@ -384,17 +732,21 @@ class NamedPipeServer:
         store: ProfileStore | None = None,
         verifier: Any | None = None,
         service_mode: bool = False,
+        config_path: Path | str | None = None,
     ) -> None:
         self.pipe_name = pipe_name
         self.store = store if store is not None else ProfileStore(local_machine=service_mode)
         self.verifier = verifier if verifier is not None else IRFaceVerifier(self.store)
         self.service_mode = service_mode
+        self.config_path = config_path
 
         self._stop_event = threading.Event()
         self._win_stop_event = win32event.CreateEvent(None, True, False, None)
         self._verify_lock = threading.Lock()
+        self._store_lock = threading.Lock()
         self._active_cancel_event = threading.Event()
         self._sa = build_pipe_security_attributes(service_mode=service_mode)
+        self._first_instance = True
 
     def stop(self) -> None:
         """Signal the server accept loop and any active verification to stop."""
@@ -410,23 +762,32 @@ class NamedPipeServer:
             self._win_stop_event = None
 
     def _create_pipe_instance(self) -> Any:
-        return win32pipe.CreateNamedPipe(
+        open_mode = win32pipe.PIPE_ACCESS_DUPLEX | win32file.FILE_FLAG_OVERLAPPED
+        if self._first_instance:
+            # Fail loudly if another process already owns this pipe name (squatting).
+            open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE
+        handle = win32pipe.CreateNamedPipe(
             self.pipe_name,
-            win32pipe.PIPE_ACCESS_DUPLEX | win32file.FILE_FLAG_OVERLAPPED,
-            win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
+            open_mode,
+            win32pipe.PIPE_TYPE_BYTE
+            | win32pipe.PIPE_READMODE_BYTE
+            | win32pipe.PIPE_WAIT
+            | PIPE_REJECT_REMOTE_CLIENTS,
             win32pipe.PIPE_UNLIMITED_INSTANCES,
             MAX_MESSAGE_BYTES,
             MAX_MESSAGE_BYTES,
             0,
             self._sa,
         )
+        self._first_instance = False
+        return handle
 
     def _overlapped_read_line(self, pipe_handle: Any) -> bytes | None:
         io_event = win32event.CreateEvent(None, True, False, None)
         read_buf = win32file.AllocateReadBuffer(4096)
         buf = bytearray()
         try:
-            while len(buf) < MAX_MESSAGE_BYTES:
+            while len(buf) < MAX_REQUEST_BYTES:
                 win32event.ResetEvent(io_event)
                 ov = pywintypes.OVERLAPPED()
                 ov.hEvent = io_event
@@ -489,6 +850,18 @@ class NamedPipeServer:
         finally:
             win32api.CloseHandle(io_event)
 
+    def _identify(self, pipe_handle: Any) -> ClientIdentity:
+        try:
+            ident = identify_pipe_client(pipe_handle, service_mode=self.service_mode)
+        except SystemExit:
+            raise
+        except Exception:
+            ident = None
+        if ident is None:
+            # Unknown caller: least privilege, no identity to bind management commands to.
+            return ClientIdentity(sid="", username="", domain="")
+        return ident
+
     def _handle_client(self, pipe_handle: Any) -> None:
         try:
             raw_data = self._overlapped_read_line(pipe_handle)
@@ -497,7 +870,7 @@ class NamedPipeServer:
 
             line = raw_data.split(b"\n", 1)[0].strip()
             if not line:
-                response = {"status": "failed", "reason": "bad_request"}
+                response = _fail("bad_request")
             else:
                 try:
                     parsed = json.loads(line.decode("utf-8"))
@@ -505,23 +878,23 @@ class NamedPipeServer:
                     parsed = None
 
                 if not isinstance(parsed, dict):
-                    response = {"status": "failed", "reason": "bad_request"}
-                elif parsed.get("cmd") == "verify":
-                    with self._verify_lock:
-                        self._active_cancel_event.clear()
-                        response = handle_request(
-                            parsed,
-                            store=self.store,
-                            verifier=self.verifier,
-                            cancel_event=self._active_cancel_event,
-                        )
+                    response = _fail("bad_request")
                 else:
-                    response = handle_request(
-                        parsed,
+                    client = self._identify(pipe_handle)
+                    kwargs: dict[str, Any] = dict(
                         store=self.store,
                         verifier=self.verifier,
                         cancel_event=self._active_cancel_event,
+                        client=client,
+                        config_path=self.config_path,
+                        store_lock=self._store_lock,
                     )
+                    if parsed.get("cmd") == "verify" and client.privileged:
+                        with self._verify_lock:
+                            self._active_cancel_event.clear()
+                            response = handle_request(parsed, **kwargs)
+                    else:
+                        response = handle_request(parsed, **kwargs)
 
             payload = (json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8")
             self._overlapped_write_all(pipe_handle, payload)
@@ -535,56 +908,82 @@ class NamedPipeServer:
         finally:
             try:
                 win32pipe.DisconnectNamedPipe(pipe_handle)
-            except pywintypes.error:
+            except Exception:
                 pass
             try:
                 win32file.CloseHandle(pipe_handle)
-            except pywintypes.error:
+            except Exception:
                 pass
+
+    def _wait_for_connection(self, pipe_handle: Any) -> bool | None:
+        """Wait for a client on ``pipe_handle``. True=connected, False=retry, None=stopping."""
+        connect_event = win32event.CreateEvent(None, True, False, None)
+        overlapped = pywintypes.OVERLAPPED()
+        overlapped.hEvent = connect_event
+        try:
+            try:
+                rc = win32pipe.ConnectNamedPipe(pipe_handle, overlapped)
+            except pywintypes.error as exc:
+                rc = exc.winerror
+
+            if rc == 0 or rc == winerror.ERROR_PIPE_CONNECTED:
+                return True
+            if rc == winerror.ERROR_IO_PENDING:
+                wait_rc = win32event.WaitForMultipleObjects(
+                    [connect_event, self._win_stop_event],
+                    False,
+                    win32event.INFINITE,
+                )
+                if wait_rc == win32event.WAIT_OBJECT_0:
+                    try:
+                        win32pipe.GetOverlappedResult(pipe_handle, overlapped, True)
+                    except pywintypes.error:
+                        return False
+                    return True
+                win32file.CancelIo(pipe_handle)
+                return None
+            if rc == winerror.ERROR_NO_DATA:
+                return False
+            raise pywintypes.error(rc, "ConnectNamedPipe", "Failed to accept pipe client")
+        finally:
+            win32api.CloseHandle(connect_event)
 
     def serve_forever(self) -> None:
-        """Accept Named Pipe connections until ``stop()`` is called."""
+        """Accept Named Pipe connections until ``stop()`` is called.
+
+        A listening instance always exists: the next instance is created *before* the
+        connected one is handed to its worker thread, so there is no window in which
+        another process could create a rogue instance under our pipe name.
+        """
         logger.info("WinIRFaceID IPC server listening on %s", self.pipe_name)
-        while not self._stop_event.is_set():
-            pipe_handle = self._create_pipe_instance()
-            connect_event = win32event.CreateEvent(None, True, False, None)
-            overlapped = pywintypes.OVERLAPPED()
-            overlapped.hEvent = connect_event
-            connected = False
+        pipe_handle = self._create_pipe_instance()
+        try:
+            while not self._stop_event.is_set():
+                state = self._wait_for_connection(pipe_handle)
+                if state is None:
+                    break
+                if state is False:
+                    try:
+                        win32pipe.DisconnectNamedPipe(pipe_handle)
+                    except pywintypes.error:
+                        pass
+                    continue
 
-            try:
+                connected_handle = pipe_handle
                 try:
-                    rc = win32pipe.ConnectNamedPipe(pipe_handle, overlapped)
-                except pywintypes.error as exc:
-                    rc = exc.winerror
-
-                if rc == 0 or rc == winerror.ERROR_PIPE_CONNECTED:
-                    connected = True
-                elif rc == winerror.ERROR_IO_PENDING:
-                    wait_rc = win32event.WaitForMultipleObjects(
-                        [connect_event, self._win_stop_event],
-                        False,
-                        win32event.INFINITE,
-                    )
-                    if wait_rc == win32event.WAIT_OBJECT_0:
-                        win32pipe.GetOverlappedResult(pipe_handle, overlapped, True)
-                        connected = True
-                    else:
-                        win32file.CancelIo(pipe_handle)
-                        win32file.CloseHandle(pipe_handle)
-                        break
-                else:
-                    raise pywintypes.error(rc, "ConnectNamedPipe", "Failed to accept pipe client")
-            finally:
-                win32api.CloseHandle(connect_event)
-
-            if not connected:
-                win32file.CloseHandle(pipe_handle)
-                continue
-
-            thread = threading.Thread(
-                target=self._handle_client,
-                args=(pipe_handle,),
-                daemon=True,
-            )
-            thread.start()
+                    pipe_handle = self._create_pipe_instance()
+                except Exception:
+                    pipe_handle = None
+                    self._handle_client(connected_handle)
+                    raise
+                threading.Thread(
+                    target=self._handle_client,
+                    args=(connected_handle,),
+                    daemon=True,
+                ).start()
+        finally:
+            if pipe_handle is not None:
+                try:
+                    win32file.CloseHandle(pipe_handle)
+                except Exception:
+                    pass

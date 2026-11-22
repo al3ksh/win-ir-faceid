@@ -1610,7 +1610,7 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
         assert worker_enroll.stop_called is True
         bob_profile = store.get_user("Bob")
         assert bob_profile is not None
-        assert len(bob_profile.embeddings) == 8
+        assert len(bob_profile.embeddings) == gui_app_mod._ENROLL_TARGET
         port = ctrl.server_port
     finally:
         ctrl.shutdown()

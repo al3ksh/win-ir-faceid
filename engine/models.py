@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import tempfile
@@ -24,6 +25,11 @@ SFACE_URL = (
     "https://github.com/opencv/opencv_zoo/raw/main/models/"
     "face_recognition_sface/face_recognition_sface_2021dec.onnx"
 )
+
+# Pinned SHA-256 digests: a tampered or swapped model (e.g. a compromised mirror) must
+# never be loaded by the LocalSystem service that unlocks the machine.
+YUNET_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+SFACE_SHA256 = "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79"
 
 _MIN_VALID_BYTES = 1024
 _CHUNK_SIZE = 64 * 1024
@@ -63,8 +69,9 @@ def _download_file(
     dest: Path,
     progress_callback: Callable[[str, int, int | None], None] | None = None,
     timeout: float = 60.0,
+    expected_sha256: str | None = None,
 ) -> Path:
-    """Download *url* atomically to *dest* and verify non-empty payload."""
+    """Download *url* atomically to *dest*, verifying size and (optionally) SHA-256."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(
         url,
@@ -78,6 +85,7 @@ def _download_file(
     )
     tmp_path = Path(tmp_name)
     downloaded = 0
+    digest = hashlib.sha256()
     try:
         with os.fdopen(fd, "wb") as out_file:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -92,6 +100,7 @@ def _download_file(
                     if not chunk:
                         break
                     out_file.write(chunk)
+                    digest.update(chunk)
                     downloaded += len(chunk)
                     if progress_callback is not None:
                         progress_callback(dest.name, downloaded, total_bytes)
@@ -99,6 +108,11 @@ def _download_file(
         if downloaded <= _MIN_VALID_BYTES:
             raise ValueError(
                 f"Downloaded file {dest.name} is unexpectedly small ({downloaded} bytes)"
+            )
+
+        if expected_sha256 is not None and digest.hexdigest().lower() != expected_sha256.lower():
+            raise ValueError(
+                f"SHA-256 mismatch for {dest.name}: got {digest.hexdigest()}, expected {expected_sha256}"
             )
 
         os.replace(tmp_path, dest)
@@ -121,12 +135,12 @@ def ensure_models(
     """Ensure YuNet and SFace ONNX models are present locally, downloading if needed."""
     paths = get_model_paths(models_dir)
     specs = (
-        (YUNET_URL, paths.yunet),
-        (SFACE_URL, paths.sface),
+        (YUNET_URL, paths.yunet, YUNET_SHA256),
+        (SFACE_URL, paths.sface, SFACE_SHA256),
     )
-    for url, dest in specs:
+    for url, dest, sha in specs:
         if not force and dest.is_file() and dest.stat().st_size > _MIN_VALID_BYTES:
             continue
         logger.info("Downloading model %s from %s", dest.name, url)
-        _download_file(url, dest, progress_callback=progress_callback)
+        _download_file(url, dest, progress_callback=progress_callback, expected_sha256=sha)
     return paths

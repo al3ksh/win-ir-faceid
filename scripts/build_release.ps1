@@ -7,12 +7,16 @@
     Skip running CMake to build credential_provider and use existing Release binaries.
 .PARAMETER SkipInstaller
     Skip compiling the Inno Setup .exe installer even if ISCC.exe is installed.
+.PARAMETER SkipBundle
+    Do not bundle the private Python runtime, dependency wheels, and ONNX models (the installer then
+    downloads them at install time). Bundling needs network access at build time.
 #>
 [CmdletBinding()]
 param(
     [string]$Version = "",
     [switch]$SkipBuild,
-    [switch]$SkipInstaller
+    [switch]$SkipInstaller,
+    [switch]$SkipBundle
 )
 
 $ErrorActionPreference = "Stop"
@@ -164,7 +168,7 @@ foreach ($cpFile in @("install.ps1", "uninstall.ps1", "register.reg", "unregiste
 
 $StageScriptsDir = Join-Path $StageDir "scripts"
 New-Item -ItemType Directory -Path $StageScriptsDir -Force | Out-Null
-foreach ($scriptFile in @("setup.ps1", "install_service.ps1", "uninstall_service.ps1", "create_shortcut.ps1")) {
+foreach ($scriptFile in @("setup.ps1", "python_runtime.ps1", "install_service.ps1", "uninstall_service.ps1", "create_shortcut.ps1")) {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\$scriptFile") -Destination (Join-Path $StageScriptsDir $scriptFile) -Force
 }
 
@@ -176,6 +180,57 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\IPC_PROTOCOL.md") -Destination
 
 foreach ($rootFile in @("Install.bat", "Uninstall.bat", "launch_gui.bat", "requirements.txt", "LICENSE", "README.md")) {
     Copy-Item -LiteralPath (Join-Path $RepoRoot $rootFile) -Destination (Join-Path $StageDir $rootFile) -Force
+}
+
+# 2b. Bundle the private Python runtime, dependency wheels, and ONNX models (offline install)
+if (-not $SkipBundle) {
+    . (Join-Path $RepoRoot "scripts\python_runtime.ps1")
+    $StageRuntime = Join-Path $StageDir "runtime\python"
+    Write-Host "Bundling private Python runtime into '$StageRuntime'..."
+    Install-PrivatePython -RuntimeDir $StageRuntime
+    $StagePython = Join-Path $StageRuntime "python.exe"
+
+    # Smoke test: a venv built on the bundled runtime (as setup.ps1 does) must work end to end.
+    $SmokeVenv = Join-Path $DistDir "smoke-venv"
+    if (Test-Path -LiteralPath $SmokeVenv) { Remove-Item -LiteralPath $SmokeVenv -Recurse -Force }
+    & $StagePython -I -m venv $SmokeVenv
+    if ($LASTEXITCODE -ne 0) { throw "Creating a venv from the bundled runtime failed ($LASTEXITCODE)." }
+    $SmokePython = Join-Path $SmokeVenv "Scripts\python.exe"
+    $Requirements = Join-Path $RepoRoot "requirements.txt"
+
+    $StageWheels = Join-Path $StageDir "wheels"
+    New-Item -ItemType Directory -Path $StageWheels -Force | Out-Null
+    Write-Host "Building dependency wheelhouse in '$StageWheels'..."
+    # pip wheel (not download) so sdist-only dependencies such as proxy_tools become wheels too.
+    & $SmokePython -m pip wheel --disable-pip-version-check --no-input -w $StageWheels -r $Requirements
+    if ($LASTEXITCODE -ne 0) { throw "pip wheel failed with exit code $LASTEXITCODE." }
+
+    & $SmokePython -m pip install --disable-pip-version-check --no-input --no-index --find-links $StageWheels -r $Requirements
+    if ($LASTEXITCODE -ne 0) { throw "Offline install from bundled wheels failed ($LASTEXITCODE)." }
+    $StageModels = Join-Path $StageDir "models"
+    Push-Location $StageDir
+    try {
+        & $SmokePython -c "import cv2, numpy, webview, win32api, winrt.windows.media.capture, engine.cli; print('smoke ok', cv2.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Import smoke test in the bundled runtime failed ($LASTEXITCODE)." }
+        Write-Host "Downloading ONNX models into '$StageModels' (SHA-256 pinned)..."
+        & $SmokePython -m engine.cli download-models
+        if ($LASTEXITCODE -ne 0) { throw "Model download failed ($LASTEXITCODE)." }
+    }
+    finally {
+        Pop-Location
+    }
+    foreach ($model in @("face_detection_yunet_2023mar.onnx", "face_recognition_sface_2021dec.onnx")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $StageModels $model))) {
+            throw "Expected bundled model '$model' in '$StageModels'."
+        }
+    }
+    Remove-Item -LiteralPath $SmokeVenv -Recurse -Force
+    Get-ChildItem -LiteralPath $StageDir -Recurse -Directory -Filter "__pycache__" | Where-Object {
+        $_.FullName -notlike "$StageRuntime*"
+    } | Remove-Item -Recurse -Force
+}
+else {
+    Write-Host "Skipping runtime/wheels/models bundling (-SkipBundle); setup will download them at install time."
 }
 
 # 3. Create portable ZIP archive

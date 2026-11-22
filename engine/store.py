@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import ctypes.wintypes as wintypes
 import json
 import logging
 import os
+import secrets
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,11 +23,23 @@ import win32con
 import win32security
 
 from engine.recognizer import DEFAULT_MATCH_THRESHOLD
+from engine.tpm import (
+    MAX_PLAINTEXT_BYTES as TPM_MAX_PLAINTEXT_BYTES,
+    TPM_BLOB_PREFIX,
+    TpmKeyProtector,
+    TpmUnavailableError,
+    tpm_disabled_by_env,
+)
 
 logger = logging.getLogger(__name__)
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x01
 CRYPTPROTECT_LOCAL_MACHINE = 0x04
+
+MIN_SERVICE_THRESHOLD = 0.60
+MAX_SERVICE_THRESHOLD = 0.80
+
+_default_tpm_protector = TpmKeyProtector()
 
 
 class _DATA_BLOB(ctypes.Structure):
@@ -123,9 +137,59 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+#: Samples captured per enrollment pass; used to split legacy profiles into looks.
+LEGACY_LOOK_SIZE = 8
+
+
+def _new_look_id() -> str:
+    return secrets.token_hex(4)
+
+
+def _new_look(count: int, added_at: str | None = None) -> dict[str, Any]:
+    return {"id": _new_look_id(), "added_at": added_at or _utc_now_iso(), "count": int(count)}
+
+
+def normalize_looks(looks: Any, total: int, fallback_added_at: str) -> list[dict[str, Any]]:
+    """Return a valid look list partitioning ``total`` embeddings.
+
+    Each look is one enrollment pass (``{"id", "added_at", "count"}``) covering a
+    contiguous slice of the flat embedding list. Profiles written before looks existed
+    (or with an inconsistent list) are split into chunks of :data:`LEGACY_LOOK_SIZE`.
+    """
+    out: list[dict[str, Any]] = []
+    if isinstance(looks, list):
+        seen: set[str] = set()
+        for item in looks:
+            if not isinstance(item, dict):
+                out = []
+                break
+            look_id = str(item.get("id", "") or "")[:64]
+            try:
+                count = int(item.get("count", 0))
+            except (TypeError, ValueError):
+                count = 0
+            if not look_id or look_id in seen or count <= 0:
+                out = []
+                break
+            seen.add(look_id)
+            out.append({"id": look_id, "added_at": str(item.get("added_at") or fallback_added_at), "count": count})
+    if out and sum(l["count"] for l in out) == total:
+        return out
+    legacy: list[dict[str, Any]] = []
+    for i, start in enumerate(range(0, total, LEGACY_LOOK_SIZE)):
+        count = min(LEGACY_LOOK_SIZE, total - start)
+        legacy.append({"id": f"legacy-{i}", "added_at": fallback_added_at, "count": count})
+    return legacy
+
+
 @dataclass
 class UserProfile:
-    """Enrolled user face embeddings and optional DPAPI-protected logon credentials."""
+    """Enrolled user face embeddings and optional protected logon credentials.
+
+    ``password`` holds a plaintext password only while it is not TPM-wrapped (legacy
+    stores, machines without a TPM). ``password_blob`` holds the TPM-wrapped form
+    (``tpm1:<base64>``); use :meth:`resolve_password` to obtain the plaintext.
+    """
 
     username: str
     domain: str = "."
@@ -133,6 +197,26 @@ class UserProfile:
     password: str = ""
     created_at: str = field(default_factory=_utc_now_iso)
     updated_at: str = field(default_factory=_utc_now_iso)
+    password_blob: str = ""
+    sid: str = ""
+    looks: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.looks = normalize_looks(self.looks, len(self.embeddings), self.created_at)
+
+    @property
+    def has_password(self) -> bool:
+        """True if a logon password (plaintext or TPM-wrapped) is stored."""
+        return bool(self.password or self.password_blob)
+
+    def resolve_password(self, protector: TpmKeyProtector | None = None) -> str:
+        """Return the plaintext password, unwrapping it inside the TPM when needed."""
+        if self.password or not self.password_blob:
+            return self.password
+        if not self.password_blob.startswith(TPM_BLOB_PREFIX):
+            raise TpmUnavailableError("Unknown password blob format")
+        raw = base64.b64decode(self.password_blob[len(TPM_BLOB_PREFIX):])
+        return (protector or _default_tpm_protector).unwrap(raw).decode("utf-8")
 
     def embedding_arrays(self) -> list[np.ndarray]:
         """Return stored embeddings as 1-D float32 numpy arrays."""
@@ -140,14 +224,20 @@ class UserProfile:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize profile to JSON-compatible dictionary."""
-        return {
+        data: dict[str, Any] = {
             "username": self.username,
             "domain": self.domain,
             "embeddings": self.embeddings,
             "password": self.password,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "looks": normalize_looks(self.looks, len(self.embeddings), self.created_at),
         }
+        if self.password_blob:
+            data["password_tpm"] = self.password_blob
+        if self.sid:
+            data["sid"] = self.sid
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UserProfile:
@@ -159,6 +249,9 @@ class UserProfile:
             password=str(data.get("password", "") or ""),
             created_at=str(data.get("created_at") or _utc_now_iso()),
             updated_at=str(data.get("updated_at") or _utc_now_iso()),
+            password_blob=str(data.get("password_tpm", "") or ""),
+            sid=str(data.get("sid", "") or ""),
+            looks=data.get("looks") or [],
         )
 
 
@@ -194,8 +287,22 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
+def _current_token_is_elevated() -> bool:
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    try:
+        return bool(win32security.GetTokenInformation(token, win32security.TokenElevation))
+    finally:
+        win32api.CloseHandle(token)
+
+
 def harden_file_acl(path: Path | str) -> bool:
-    """Set a protected DACL granting FILE_ALL_ACCESS only to SYSTEM, Admins, and current user."""
+    """Set a protected DACL granting FILE_ALL_ACCESS only to SYSTEM and Administrators.
+
+    The writing user is added only when the process is neither SYSTEM nor elevated
+    (developer runs and tests) so the writer can still read back its own file. Files
+    written by the WinIRFaceID service (SYSTEM) or the elevated installer are therefore
+    unreadable by any standard, non-elevated process.
+    """
     target = Path(path)
     try:
         sid_system = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
@@ -213,7 +320,7 @@ def harden_file_acl(path: Path | str) -> bool:
         acl = win32security.ACL()
         acl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, sid_system)
         acl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, sid_admins)
-        if sid_user != sid_system and sid_user != sid_admins:
+        if sid_user != sid_system and sid_user != sid_admins and not _current_token_is_elevated():
             acl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_ALL_ACCESS, sid_user)
 
         win32security.SetNamedSecurityInfo(
@@ -240,6 +347,13 @@ class ServiceConfig:
     require_open_eyes: bool = False
 
 
+def clamp_service_threshold(value: float) -> float:
+    """Clamp a match threshold into the supported, secure 0.60-0.80 range."""
+    if value != value:  # NaN
+        return DEFAULT_MATCH_THRESHOLD
+    return round(min(MAX_SERVICE_THRESHOLD, max(MIN_SERVICE_THRESHOLD, float(value))), 2)
+
+
 def load_service_config(path: Path | str | None = None) -> ServiceConfig:
     """Load ``ServiceConfig`` from JSON, falling back to defaults if absent or invalid."""
     target = Path(path) if path is not None else get_default_service_config_path()
@@ -249,7 +363,7 @@ def load_service_config(path: Path | str | None = None) -> ServiceConfig:
         raw = json.loads(target.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             return ServiceConfig()
-        threshold = float(raw.get("threshold", DEFAULT_MATCH_THRESHOLD))
+        threshold = clamp_service_threshold(float(raw.get("threshold", DEFAULT_MATCH_THRESHOLD)))
         require_motion = bool(raw.get("require_motion", False))
         require_open_eyes = bool(raw.get("require_open_eyes", False))
         return ServiceConfig(
@@ -266,7 +380,7 @@ def save_service_config(cfg: ServiceConfig, path: Path | str | None = None) -> P
     """Persist ``ServiceConfig`` as JSON at ``path`` (default ``data/service_config.json``)."""
     target = Path(path) if path is not None else get_default_service_config_path()
     payload = {
-        "threshold": float(cfg.threshold),
+        "threshold": clamp_service_threshold(float(cfg.threshold)),
         "require_motion": bool(cfg.require_motion),
         "require_open_eyes": bool(cfg.require_open_eyes),
     }
@@ -276,16 +390,47 @@ def save_service_config(cfg: ServiceConfig, path: Path | str | None = None) -> P
 
 
 class ProfileStore:
-    """Encrypted on-disk profile store backed by Windows DPAPI."""
+    """Encrypted on-disk profile store: DPAPI for the file, TPM for logon passwords.
+
+    The whole file is DPAPI-encrypted. In machine scope, logon passwords are additionally
+    wrapped with a non-exportable TPM key (see ``engine.tpm``) whenever a TPM is available.
+    """
 
     def __init__(
         self,
         path: Path | str | None = None,
         *,
         local_machine: bool = True,
+        use_tpm: bool | None = None,
+        tpm_protector: TpmKeyProtector | None = None,
     ) -> None:
         self.path = Path(path) if path is not None else get_default_store_path()
         self.local_machine = local_machine
+        if use_tpm is None:
+            use_tpm = local_machine and not tpm_disabled_by_env()
+        self.use_tpm = bool(use_tpm)
+        self._tpm = tpm_protector or _default_tpm_protector
+        self._tpm_failed = False
+
+    def _wrap_passwords(self, users: dict[str, UserProfile]) -> None:
+        """Move plaintext passwords into TPM-wrapped blobs (best effort, DPAPI-only fallback)."""
+        if not self.use_tpm or self._tpm_failed:
+            return
+        for profile in users.values():
+            if not profile.password:
+                continue
+            secret = profile.password.encode("utf-8")
+            if len(secret) > TPM_MAX_PLAINTEXT_BYTES:
+                logger.warning("Password for '%s' too long for TPM wrapping; DPAPI only", profile.username)
+                continue
+            try:
+                blob = self._tpm.wrap(secret)
+            except (TpmUnavailableError, OSError) as exc:
+                logger.warning("TPM password wrapping unavailable, using DPAPI only: %s", exc)
+                self._tpm_failed = True
+                return
+            profile.password_blob = TPM_BLOB_PREFIX + base64.b64encode(blob).decode("ascii")
+            profile.password = ""
 
     def _load_all(self) -> dict[str, UserProfile]:
         if not self.path.is_file():
@@ -303,6 +448,7 @@ class ProfileStore:
         return result
 
     def _save_all(self, users: dict[str, UserProfile]) -> None:
+        self._wrap_passwords(users)
         payload = {
             "version": 1,
             "users": {
@@ -349,6 +495,7 @@ class ProfileStore:
         *,
         append: bool = True,
         domain: str | None = None,
+        sid: str | None = None,
     ) -> UserProfile:
         """Create or update a user's face embeddings."""
         clean = username.strip()
@@ -373,15 +520,23 @@ class ProfileStore:
                 password="",
                 created_at=now,
                 updated_at=now,
+                sid=sid or "",
+                looks=[_new_look(len(normalized), now)],
             )
         else:
             existing.username = clean
+            if sid:
+                existing.sid = sid
             if domain is not None:
                 existing.domain = domain.strip() or "."
             if append:
+                existing.looks = normalize_looks(
+                    existing.looks, len(existing.embeddings), existing.created_at
+                ) + [_new_look(len(normalized), now)]
                 existing.embeddings.extend(normalized)
             else:
                 existing.embeddings = normalized
+                existing.looks = [_new_look(len(normalized), now)]
             existing.updated_at = now
             profile = existing
 
@@ -394,6 +549,7 @@ class ProfileStore:
         username: str,
         password: str,
         domain: str = ".",
+        sid: str | None = None,
     ) -> UserProfile:
         """Store or update a user's DPAPI-encrypted Windows logon credentials."""
         clean = username.strip()
@@ -413,14 +569,49 @@ class ProfileStore:
                 password=password,
                 created_at=now,
                 updated_at=now,
+                sid=sid or "",
             )
         else:
             existing.username = clean
+            if sid:
+                existing.sid = sid
             existing.domain = clean_domain
             existing.password = password
+            existing.password_blob = ""
             existing.updated_at = now
             profile = existing
 
+        users[key] = profile
+        self._save_all(users)
+        return profile
+
+    def delete_look(self, username: str, look_id: str) -> UserProfile:
+        """Remove one enrollment pass (look) and its embeddings from a profile.
+
+        Raises ``KeyError`` if the user or look does not exist and ``ValueError`` when
+        asked to remove the last remaining look (delete the whole profile instead).
+        """
+        clean = username.strip()
+        users = self._load_all()
+        key = clean.lower()
+        profile = users.get(key)
+        if profile is None:
+            raise KeyError("not_found")
+        looks = normalize_looks(profile.looks, len(profile.embeddings), profile.created_at)
+        start = 0
+        for idx, look in enumerate(looks):
+            if look["id"] == look_id:
+                break
+            start += look["count"]
+        else:
+            raise KeyError("not_found")
+        if len(looks) <= 1:
+            raise ValueError("last_look")
+        count = looks[idx]["count"]
+        del profile.embeddings[start:start + count]
+        del looks[idx]
+        profile.looks = looks
+        profile.updated_at = _utc_now_iso()
         users[key] = profile
         self._save_all(users)
         return profile

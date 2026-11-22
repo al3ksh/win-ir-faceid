@@ -23,6 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from engine import REPO_URL, __version__  # noqa: E402
 from engine.gui_app import (  # noqa: E402
+    _ENROLL_TARGET,
     _MAX_EMBEDDINGS_PER_USER,
     WinIRFaceIDController,
     _JsApiBridge,
@@ -248,7 +249,7 @@ def test_start_enroll_append_adds_appearance_and_enforces_cap(
 
         prof = store.get_user("Alice")
         assert prof is not None
-        assert len(prof.embeddings) == 16
+        assert len(prof.embeddings) == 8 + _ENROLL_TARGET
         assert prof.embeddings[0][0] == pytest.approx(1.0)
         assert prof.embeddings[8][64] == pytest.approx(1.0)
 

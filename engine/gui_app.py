@@ -43,28 +43,73 @@ from engine.store import (
     ProfileStore,
     ServiceConfig,
     UserProfile,
+    clamp_service_threshold,
     load_service_config,
     save_service_config,
+)
+from engine.service_client import (
+    ServiceProfileClient,
+    ServiceRequestError,
+    ServiceUnavailableError,
 )
 
 logger = logging.getLogger(__name__)
 
+
+def _default_profile_store() -> Any:
+    """GUI default: manage the caller's own profile through the SYSTEM service.
+
+    ``WINIRFACEID_LOCAL_STORE=1`` (developer mode / tests) opens ``data/profiles.enc``
+    directly instead, which requires read/write access to the file.
+    """
+    if os.environ.get("WINIRFACEID_LOCAL_STORE", "").strip() in ("1", "true", "yes"):
+        return ProfileStore()
+    return ServiceProfileClient()
+
+
+_SERVICE_ERROR_MESSAGES = {
+    "forbidden": "This profile belongs to a different Windows account.",
+    "too_many_samples": "Maximum number of face samples reached. Remove and re-enroll to start fresh.",
+    "bad_request": "The service rejected the request.",
+    "invalid_password": "Windows rejected this password. Check it (and the domain) and try again.",
+    "account_locked": "This Windows account is locked out. Unlock it before saving the password.",
+    "password_expired": "This password has expired. Change it in Windows first, then save the new one.",
+    "account_disabled": "This Windows account is disabled.",
+    "not_found": "That look no longer exists. Refresh and try again.",
+    "last_look": "This is your only look. Use Remove to delete the whole profile instead.",
+}
+
+
+def _store_error_message(exc: BaseException) -> str:
+    if isinstance(exc, ServiceUnavailableError):
+        return "WinIRFaceID service is not running. Start it (or reinstall) to manage profiles."
+    if isinstance(exc, ServiceRequestError):
+        return _SERVICE_ERROR_MESSAGES.get(exc.reason, f"Service error: {exc.reason}")
+    if isinstance(exc, PermissionError):
+        return str(exc) or "Access denied."
+    return str(exc) or exc.__class__.__name__
+
 SERVICE_NAME = "WinIRFaceIDService"
 
-_POSE_PROMPTS = (
-    "Look straight at the camera",
-    "Hold steady looking straight",
-    "Turn your head slightly left",
-    "Turn your head slightly right",
-    "Tilt your head slightly up",
-    "Tilt your head slightly down",
-    "Hold a natural expression",
-    "Look straight for final capture",
+# One sample per step; ``pose`` drives the direction arrow in the UI.
+_POSE_STEPS = (
+    ("center", "Look straight at the camera"),
+    ("left", "Turn your head slightly left"),
+    ("right", "Turn your head slightly right"),
+    ("relax", "Relax your face"),
+    ("up", "Tilt your chin up a little"),
+    ("down", "Tilt your chin down a little"),
+    ("center", "Back to center"),
 )
+_POSE_PROMPTS = tuple(text for _pose, text in _POSE_STEPS)
 
-_ENROLL_TARGET = 8
+_ENROLL_TARGET = len(_POSE_STEPS)
 _MAX_EMBEDDINGS_PER_USER = 32
-_ENROLL_MIN_INTERVAL = 0.45
+# Time each pose prompt stays on screen before its sample is taken, so the user can
+# read it and move. The first pose gets extra "get ready" time.
+# Only counts while a live face is in frame, so stepping away never skips a pose.
+_ENROLL_MIN_INTERVAL = 2.8
+_ENROLL_GET_READY_FACTOR = 1.5
 _JPEG_QUALITY = 88
 
 _DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19
@@ -694,8 +739,10 @@ class WinIRFaceIDController:
         update_checker: Callable[[], dict[str, Any]] | None = None,
         auto_start_server: bool = True,
     ) -> None:
-        self._store = store if store is not None else ProfileStore()
+        self._store = store if store is not None else _default_profile_store()
         self._config_path = Path(config_path) if config_path is not None else None
+        # When talking to the service, settings are applied live by the service itself.
+        self._service_config = config_path is None and hasattr(self._store, "load_config")
         self._models_dir = Path(models_dir) if models_dir is not None else None
         self._ui_dir = Path(ui_dir) if ui_dir is not None else (Path(__file__).resolve().parent / "ui")
         self._camera_discoverer = camera_discoverer
@@ -710,8 +757,15 @@ class WinIRFaceIDController:
         self._frame_cond = threading.Condition()
         self._shutting_down = False
 
-        self._config: ServiceConfig = load_service_config(self._config_path)
-        self._config.threshold = round(_clamp(self._config.threshold, 0.50, 0.80), 2)
+        self._config: ServiceConfig = ServiceConfig()
+        if self._service_config:
+            try:
+                self._config = self._store.load_config()
+            except Exception as exc:
+                logger.warning("Could not load settings from service: %s", exc)
+        else:
+            self._config = load_service_config(self._config_path)
+        self._config.threshold = clamp_service_threshold(self._config.threshold)
         self._config_dirty = False
 
         self._mode: str = "standby"
@@ -729,6 +783,7 @@ class WinIRFaceIDController:
         self._enroll_append: bool = False
         self._enroll_embeddings: list[np.ndarray] = []
         self._last_enroll_capture_ts: float = 0.0
+        self._enroll_hold: float = 0.0
         self._last_processed_pair_ts: float | None = None
 
         self._proc_stop = threading.Event()
@@ -872,18 +927,39 @@ class WinIRFaceIDController:
                 self._selected_camera_idx = 0
                 self._current_cam_is_ir = False
 
+    def _owner_error(self, username: str) -> str | None:
+        """Service-backed stores may only manage the signed-in Windows user's profile."""
+        is_owner = getattr(self._store, "is_owner", None)
+        if callable(is_owner) and not is_owner(username):
+            owner = getattr(self._store, "owner_username", "") or "the signed-in user"
+            return f"You can only manage your own profile ({owner})."
+        return None
+
     def _serialize_profiles(self) -> list[dict[str, Any]]:
         """Serialize profiles WITHOUT ever exposing plaintext passwords."""
         profiles: list[dict[str, Any]] = []
-        for p in self._store.list_users():
+        try:
+            users = self._store.list_users()
+        except Exception as exc:
+            logger.warning("Could not list profiles: %s", _store_error_message(exc))
+            users = []
+        for p in users:
             profiles.append(
                 {
                     "username": p.username,
                     "domain": p.domain,
                     "sample_count": len(p.embeddings),
-                    "has_password": bool(p.password),
+                    "has_password": p.has_password,
                     "created_at": p.created_at,
                     "updated_at": p.updated_at,
+                    "looks": [
+                        {
+                            "id": str(look.get("id", "")),
+                            "added_at": str(look.get("added_at", "")),
+                            "count": int(look.get("count", 0)),
+                        }
+                        for look in getattr(p, "looks", []) or []
+                    ],
                 }
             )
         return profiles
@@ -1044,6 +1120,7 @@ class WinIRFaceIDController:
             self._proc_thread.start()
 
     def _processing_loop(self) -> None:
+        match_seq = 0  # lets the UI count each evaluated frame once
         while not self._proc_stop.is_set() and not self._shutting_down:
             try:
                 with self._lock:
@@ -1135,9 +1212,20 @@ class WinIRFaceIDController:
 
                 # Enrollment capture flow
                 if mode == "enroll":
+                    now_tick = time.monotonic()
+                    face_ok = det is not None and liveness is not None and liveness.passed
+                    with self._lock:
+                        if face_ok:
+                            # Accumulate hold time only while a live face is visible.
+                            self._enroll_hold += min(0.25, max(0.0, now_tick - self._last_enroll_capture_ts))
+                        self._last_enroll_capture_ts = now_tick
                     completed_user = ""
                     completed_append = False
                     enroll_done = False
+                    enroll_error: str | None = None
+                    target_user = ""
+                    append_mode = False
+                    samples: list[Any] = []
                     if (
                         is_new_pair
                         and rec is not None
@@ -1145,30 +1233,37 @@ class WinIRFaceIDController:
                         and liveness is not None
                         and liveness.passed
                     ):
-                        now = time.monotonic()
-                        if now - self._last_enroll_capture_ts >= _ENROLL_MIN_INTERVAL:
+                        if self._enroll_hold >= self._enroll_dwell():
                             emb = rec.extract_embedding(eval_src, det)
                             with self._lock:
                                 self._enroll_embeddings.append(emb)
-                                self._last_enroll_capture_ts = now
+                                self._enroll_hold = 0.0
                                 captured = len(self._enroll_embeddings)
                                 if captured >= _ENROLL_TARGET:
                                     target_user = self._enroll_username
                                     append_mode = self._enroll_append
+                                    samples = list(self._enroll_embeddings)
+                                    enroll_done = True
+                            if enroll_done:
+                                # Pipe I/O to the service happens outside the state lock.
+                                try:
                                     self._store.upsert_embeddings(
                                         target_user,
-                                        self._enroll_embeddings,
+                                        samples,
                                         append=append_mode,
                                     )
                                     completed_user = target_user
                                     completed_append = append_mode
-                                    enroll_done = True
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.error("Saving enrollment failed: %s", exc)
+                                    enroll_error = _store_error_message(exc)
                     if enroll_done:
                         if pair is not None:
                             self._last_processed_pair_ts = pair.timestamp
                         self._stop_camera_and_loop(
                             completed_user=completed_user,
                             completed_append=completed_append,
+                            error_msg=enroll_error,
                         )
                         break
 
@@ -1185,7 +1280,12 @@ class WinIRFaceIDController:
                         emb = rec.extract_embedding(eval_src, det)
                         best_user = ""
                         best_score = 0.0
-                        for profile in self._store.list_users():
+                        try:
+                            test_profiles = self._store.list_users()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Live test: cannot list profiles: %s", exc)
+                            test_profiles = []
+                        for profile in test_profiles:
                             if not profile.embeddings:
                                 continue
                             _, score = rec.match_against(
@@ -1271,11 +1371,18 @@ class WinIRFaceIDController:
                     if self._mode == "standby":
                         break
                     count = len(self._enroll_embeddings)
+                    ready_in = 0.0
+                    if self._mode == "enroll":
+                        ready_in = max(0.0, self._enroll_dwell() - self._enroll_hold)
+                    pose = _POSE_STEPS[min(count, len(_POSE_STEPS) - 1)][0] if self._mode == "enroll" else ""
                     prompt = (
                         _POSE_PROMPTS[min(count, len(_POSE_PROMPTS) - 1)]
                         if self._mode == "enroll"
                         else ""
                     )
+                    if match_dict["state"] != "idle":
+                        match_seq += 1
+                    match_dict["seq"] = match_seq
                     self._state = {
                         "mode": self._mode,
                         "camera_active": True,
@@ -1287,6 +1394,10 @@ class WinIRFaceIDController:
                             "count": count,
                             "target": _ENROLL_TARGET,
                             "prompt": prompt,
+                            "ready_in": round(ready_in, 2),
+                            "pose": pose,
+                            "face_ok": bool(det is not None and liveness is not None and liveness.passed),
+                            "dwell": round(self._enroll_dwell(), 2) if self._mode == "enroll" else 0.0,
                             "completed_user": "",
                             "append": self._enroll_append,
                         },
@@ -1332,6 +1443,9 @@ class WinIRFaceIDController:
             "stream_url": self.stream_url,
             "profiles": profiles,
             "active_user": active_user,
+            # In service mode the service binds every profile to the caller's account,
+            # so the UI locks the username field to the signed-in user.
+            "username_locked": callable(getattr(self._store, "is_owner", None)),
             "config": config,
             "models_ready": self._models_ready(),
             "service_status": self._service_status_provider(),
@@ -1366,21 +1480,38 @@ class WinIRFaceIDController:
                 self._selected_camera_idx = ir_idx
         return None
 
+    def _enroll_dwell(self) -> float:
+        """Seconds the current pose prompt is shown before its sample is captured."""
+        if not self._enroll_embeddings:
+            return _ENROLL_MIN_INTERVAL * _ENROLL_GET_READY_FACTOR
+        return _ENROLL_MIN_INTERVAL
+
     def start_enroll(self, username: str, append: bool = False) -> dict[str, Any]:
         """Start 8-sample active-IR face enrollment for *username*."""
         clean = str(username or "").strip()
         if not clean:
             return {"ok": False, "error": "Enter a Windows username first.", "state": self.get_state()}
 
+        owner_err = self._owner_error(clean)
+        if owner_err:
+            return {"ok": False, "error": owner_err, "state": self.get_state()}
+
         append_mode = bool(append)
         if append_mode:
-            existing = self._store.get_user(clean)
-            if existing is not None and len(existing.embeddings) >= _MAX_EMBEDDINGS_PER_USER:
+            try:
+                existing = self._store.get_user(clean)
+            except Exception as exc:
+                return {"ok": False, "error": _store_error_message(exc), "state": self.get_state()}
+            if (
+                append_mode
+                and existing is not None
+                and len(existing.embeddings) + _ENROLL_TARGET > _MAX_EMBEDDINGS_PER_USER
+            ):
                 return {
                     "ok": False,
                     "error": (
                         f"Maximum appearances reached ({_MAX_EMBEDDINGS_PER_USER} samples). "
-                        "Remove and re-enroll to start fresh."
+                        "Delete a look or re-enroll to start fresh."
                     ),
                     "state": self.get_state(),
                 }
@@ -1404,7 +1535,9 @@ class WinIRFaceIDController:
             self._enroll_username = clean
             self._enroll_append = append_mode
             self._enroll_embeddings = []
-            self._last_enroll_capture_ts = 0.0
+            # The hold clock starts now: the first prompt is shown before any capture.
+            self._last_enroll_capture_ts = time.monotonic()
+            self._enroll_hold = 0.0
             self._state = {
                 **self._build_standby_state(),
                 "mode": "enroll",
@@ -1413,6 +1546,10 @@ class WinIRFaceIDController:
                     "count": 0,
                     "target": _ENROLL_TARGET,
                     "prompt": _POSE_PROMPTS[0],
+                    "pose": _POSE_STEPS[0][0],
+                    "face_ok": False,
+                    "ready_in": round(_ENROLL_MIN_INTERVAL * _ENROLL_GET_READY_FACTOR, 2),
+                    "dwell": round(_ENROLL_MIN_INTERVAL * _ENROLL_GET_READY_FACTOR, 2),
                     "completed_user": "",
                     "append": append_mode,
                 },
@@ -1554,19 +1691,28 @@ class WinIRFaceIDController:
         require_open_eyes: bool,
     ) -> dict[str, Any]:
         """Persist updated ServiceConfig to data/service_config.json."""
-        clean_thresh = round(_clamp(float(threshold), 0.50, 0.80), 2)
+        clean_thresh = clamp_service_threshold(float(threshold))
         cfg = ServiceConfig(
             threshold=clean_thresh,
             require_motion=bool(require_motion),
             require_open_eyes=bool(require_open_eyes),
         )
-        save_service_config(cfg, self._config_path)
+        if self._service_config:
+            try:
+                cfg = self._store.save_config(cfg)
+            except Exception as exc:
+                msg = _store_error_message(exc)
+                if isinstance(exc, ServiceRequestError) and exc.reason == "forbidden":
+                    msg = "Only administrators can change verification settings."
+                return {"ok": False, "error": msg}
+        else:
+            save_service_config(cfg, self._config_path)
         svc_status = self._service_status_provider()
 
         with self._lock:
             self._config = cfg
             self._motion_tracker.reset()
-            if svc_status == "running":
+            if svc_status == "running" and not self._service_config:
                 self._config_dirty = True
             dirty = self._config_dirty
 
@@ -1589,7 +1735,13 @@ class WinIRFaceIDController:
         if not password:
             return {"ok": False, "error": "Password cannot be empty."}
         clean_domain = str(domain or ".").strip() or "."
-        self._store.set_credentials(clean_user, password=password, domain=clean_domain)
+        owner_err = self._owner_error(clean_user)
+        if owner_err:
+            return {"ok": False, "error": owner_err}
+        try:
+            self._store.set_credentials(clean_user, password=password, domain=clean_domain)
+        except Exception as exc:
+            return {"ok": False, "error": _store_error_message(exc)}
         return {
             "ok": True,
             "error": None,
@@ -1599,12 +1751,34 @@ class WinIRFaceIDController:
     def delete_profile(self, username: str) -> dict[str, Any]:
         """Remove an enrolled user profile and return updated profile summaries."""
         clean_user = str(username or "").strip()
-        deleted = self._store.delete_user(clean_user)
+        owner_err = self._owner_error(clean_user)
+        if owner_err:
+            return {"ok": False, "error": owner_err, "profiles": self._serialize_profiles()}
+        try:
+            deleted = self._store.delete_user(clean_user)
+        except Exception as exc:
+            return {"ok": False, "error": _store_error_message(exc), "profiles": self._serialize_profiles()}
         return {
             "ok": True,
             "deleted": deleted,
             "profiles": self._serialize_profiles(),
         }
+
+    def delete_look(self, username: str, look_id: str) -> dict[str, Any]:
+        """Remove one enrolled look (enrollment pass) from the caller's profile."""
+        clean_user = str(username or "").strip()
+        owner_err = self._owner_error(clean_user)
+        if owner_err:
+            return {"ok": False, "error": owner_err, "profiles": self._serialize_profiles()}
+        try:
+            self._store.delete_look(clean_user, str(look_id or ""))
+        except KeyError:
+            return {"ok": False, "error": _SERVICE_ERROR_MESSAGES["not_found"], "profiles": self._serialize_profiles()}
+        except ValueError:
+            return {"ok": False, "error": _SERVICE_ERROR_MESSAGES["last_look"], "profiles": self._serialize_profiles()}
+        except Exception as exc:
+            return {"ok": False, "error": _store_error_message(exc), "profiles": self._serialize_profiles()}
+        return {"ok": True, "profiles": self._serialize_profiles()}
 
     def download_models(self) -> dict[str, Any]:
         """Download YuNet and SFace ONNX models in a background thread."""
@@ -1762,6 +1936,9 @@ class _JsApiBridge:
 
     def delete_profile(self, username: str) -> dict[str, Any]:
         return self._ctrl.delete_profile(username)
+
+    def delete_look(self, username: str, look_id: str) -> dict[str, Any]:
+        return self._ctrl.delete_look(username, look_id)
 
     def download_models(self) -> dict[str, Any]:
         return self._ctrl.download_models()

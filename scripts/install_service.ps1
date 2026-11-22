@@ -115,7 +115,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "sc.exe start failed with exit code $LASTEXITCODE"
 }
 
-$waitDeadline = (Get-Date).AddSeconds(6)
+# First start in a fresh venv compiles .pyc files and loads OpenCV; allow time for that.
+$waitDeadline = (Get-Date).AddSeconds(45)
 while ((Get-Date) -lt $waitDeadline) {
     Start-Sleep -Milliseconds 500
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue

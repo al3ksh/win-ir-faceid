@@ -44,6 +44,9 @@
     matchPillText: $("matchPillText"),
     enrollHud: $("enrollHud"),
     enrollPrompt: $("enrollPrompt"),
+    enrollSub: $("enrollSub"),
+    poseGuide: $("poseGuide"),
+    poseRing: $("poseRing"),
     enrollCounter: $("enrollCounter"),
     enrollSegments: $("enrollSegments"),
 
@@ -68,6 +71,7 @@
     btnRemoveConfirm: $("btnRemoveConfirm"),
     btnRemoveCancel: $("btnRemoveCancel"),
     accountStatusLine: $("accountStatusLine"),
+    looksList: $("looksList"),
 
     modelsRow: $("modelsRow"),
     modelsSub: $("modelsSub"),
@@ -77,6 +81,11 @@
     toggleMotion: $("toggleMotion"),
     thresholdSlider: $("thresholdSlider"),
     thresholdValue: $("thresholdValue"),
+    scoreStats: $("scoreStats"),
+    scoreRange: $("scoreRange"),
+    scoreMedian: $("scoreMedian"),
+    scoreThresh: $("scoreThresh"),
+    scoreStatsText: $("scoreStatsText"),
 
     feedSegThumb: $("feedSegThumb"),
     btnFeedSubtract: $("btnFeedSubtract"),
@@ -125,7 +134,69 @@
     currentErrorInfo: null,
     isRescanning: false,
     updateReleaseUrl: "",
+    testScores: [],
+    lastMatchSeq: 0,
+    wasTesting: false,
   };
+
+  // ---- Live-test score distribution (helps pick the match threshold) ----
+  const SCORE_SCALE_MIN = 0.3;
+  const SCORE_SCALE_MAX = 1.0;
+  const MAX_TEST_SCORES = 900;
+
+  function scorePos(v) {
+    const t = (v - SCORE_SCALE_MIN) / (SCORE_SCALE_MAX - SCORE_SCALE_MIN);
+    return Math.min(1, Math.max(0, t)) * 100;
+  }
+
+  function collectTestScore(mode, active, match) {
+    const testing = active && mode === "test";
+    if (testing && !state.wasTesting) {
+      state.testScores = [];
+      state.lastMatchSeq = 0;
+    }
+    state.wasTesting = testing;
+    if (!testing || !match) return;
+    const seq = Number(match.seq || 0);
+    const score = Number(match.score || 0);
+    if (!seq || seq === state.lastMatchSeq || !match.username || !(score > 0)) return;
+    state.lastMatchSeq = seq;
+    state.testScores.push(score);
+    if (state.testScores.length > MAX_TEST_SCORES) state.testScores.shift();
+    renderScoreStats();
+  }
+
+  function renderScoreStats() {
+    const xs = state.testScores;
+    if (!xs.length) {
+      els.scoreStats.classList.add("hidden");
+      return;
+    }
+    const sorted = [...xs].sort((a, b) => a - b);
+    const n = sorted.length;
+    // 5th percentile instead of the raw minimum: a few transitional frames (sitting
+    // down, head turned away, face half out of frame) should not dominate. The max stays
+    // raw, because for someone else's face a single high frame is what matters.
+    const low = sorted[Math.min(n - 1, Math.floor(n * 0.05))];
+    const max = sorted[n - 1];
+    const median = n % 2 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
+    const thr = parseFloat(els.thresholdSlider.value);
+    const below = sorted.filter((v) => v < thr).length;
+    const pctBelow = Math.round((below / n) * 100);
+
+    const left = scorePos(low);
+    els.scoreRange.style.left = `${left}%`;
+    els.scoreRange.style.width = `max(2px, ${scorePos(max) - left}%)`;
+    els.scoreRange.dataset.tone = low < thr ? "warn" : "ok";
+    els.scoreMedian.style.left = `${scorePos(median)}%`;
+    els.scoreThresh.style.left = `${scorePos(thr)}%`;
+
+    els.scoreStatsText.textContent =
+      `Test: ${n} frames · low (5%) ${low.toFixed(2)} · median ${median.toFixed(2)} · max ${max.toFixed(2)} · ` +
+      `${pctBelow}% below ${thr.toFixed(2)}. ` +
+      "Your own face should sit right of the red line; anyone else's should stay left of it.";
+    els.scoreStats.classList.remove("hidden");
+  }
 
   function api() {
     return window.pywebview && window.pywebview.api ? window.pywebview.api : null;
@@ -235,9 +306,9 @@
       let statusPrefix;
       if (prof.sample_count > 0) {
         const samplesLabel = prof.sample_count === 1 ? "1 sample" : `${prof.sample_count} samples`;
-        if (prof.sample_count > 8) {
-          const looks = Math.max(2, Math.round(prof.sample_count / 8));
-          statusPrefix = `Enrolled · ${samplesLabel} (${looks} looks)`;
+        const lookCount = (prof.looks || []).length;
+        if (lookCount > 1) {
+          statusPrefix = `Enrolled · ${samplesLabel} (${lookCount} looks)`;
         } else {
           statusPrefix = `Enrolled · ${samplesLabel}`;
         }
@@ -253,6 +324,7 @@
         els.accountStatusLine.dataset.tone = "warn";
       }
       els.btnRemove.classList.remove("hidden");
+      renderLooksList(user, prof.looks || []);
     } else if (user) {
       els.accountStatusLine.textContent = "Not enrolled";
       els.accountStatusLine.dataset.tone = "neutral";
@@ -264,8 +336,82 @@
       els.btnRemove.classList.add("hidden");
       setDrawerOpen(els.removeConfirmDrawer, false);
     }
+    if (!prof) renderLooksList(user, []);
 
     updateEnrollButton(mode, prof);
+  }
+
+  function formatLookDate(iso) {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return "Unknown date";
+    return d.toLocaleString(undefined, {
+      day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
+    });
+  }
+
+  function renderLooksList(user, looks) {
+    const list = els.looksList;
+    if (!list) return;
+    // Only rebuild when the looks actually change (this runs on every poll tick).
+    const key = user + "|" + looks.map((l) => `${l.id}:${l.count}`).join(",");
+    if (list.dataset.key === key) return;
+    list.dataset.key = key;
+    list.textContent = "";
+    if (looks.length === 0) {
+      list.classList.add("hidden");
+      return;
+    }
+    list.classList.remove("hidden");
+    const single = looks.length <= 1;
+    looks.forEach((look, i) => {
+      const li = document.createElement("li");
+      li.className = "look-row";
+      const label = document.createElement("span");
+      label.className = "look-label";
+      const name = document.createElement("span");
+      name.className = "look-name";
+      name.textContent = `Look ${i + 1}`;
+      const meta = document.createElement("span");
+      meta.className = "look-meta";
+      const samples = look.count === 1 ? "1 sample" : `${look.count} samples`;
+      meta.textContent = `${formatLookDate(look.added_at)} · ${samples}`;
+      label.append(name, meta);
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn-subtle btn-xs btn-danger-ghost look-delete";
+      btn.textContent = "Delete";
+      btn.disabled = single;
+      btn.title = single ? "Your only look — use Remove to delete the whole profile" : "Delete this look";
+      let disarmTimer = null;
+      btn.addEventListener("click", async () => {
+        if (btn.dataset.armed !== "true") {
+          btn.dataset.armed = "true";
+          btn.textContent = "Confirm";
+          disarmTimer = setTimeout(() => {
+            btn.dataset.armed = "false";
+            btn.textContent = "Delete";
+          }, 3000);
+          return;
+        }
+        clearTimeout(disarmTimer);
+        const a = api();
+        if (!a) return;
+        btn.disabled = true;
+        const res = await a.delete_look(user, look.id);
+        if (res) state.profiles = res.profiles || state.profiles;
+        list.dataset.key = "";
+        renderProfileDatalist();
+        renderAccountSection();
+        if (res && res.ok) {
+          showFeedback(`Deleted look ${i + 1}.`, "neutral");
+        } else if (res && res.error) {
+          showFeedback(res.error, "error");
+        }
+      });
+      li.append(label, btn);
+      list.appendChild(li);
+    });
   }
 
   function renderServiceStatus(status, configDirty) {
@@ -701,6 +847,8 @@
     }
 
     // Buttons state
+    collectTestScore(mode, active, live.match);
+
     const prof = findProfile(currentUsername());
     updateEnrollButton(mode, prof);
     els.btnLiveTest.textContent = mode === "test" ? "Stop Test" : "Test Live";
@@ -714,7 +862,7 @@
     let reticleTone = "neutral";
     if (active && mode === "test") {
       const m = live.match || {};
-      const pct = m.score ? `${Math.round(m.score * 100)}%` : "";
+      const pct = m.score ? Number(m.score).toFixed(2) : "";
       if (m.state === "verified") {
         reticleTone = "ok";
         els.matchPill.dataset.tone = "ok";
@@ -760,12 +908,48 @@
 
     // Enrollment HUD
     if (active && mode === "enroll") {
-      const enr = live.enroll || { count: 0, target: 8, prompt: "" };
-      els.enrollPrompt.textContent = enr.prompt || "Look straight at the camera";
+      const enr = live.enroll || { count: 0, target: 7, prompt: "" };
+      const promptText = enr.prompt || "Look straight at the camera";
+      if (els.enrollPrompt.textContent !== promptText) {
+        els.enrollPrompt.textContent = promptText;
+        // Re-trigger the fade so a new instruction is noticeable.
+        els.enrollPrompt.classList.remove("prompt-enter");
+        void els.enrollPrompt.offsetWidth;
+        els.enrollPrompt.classList.add("prompt-enter");
+      }
+      const readyIn = Number(enr.ready_in) || 0;
+      const dwell = Number(enr.dwell) || 0;
       els.enrollCounter.textContent = `${enr.count} / ${enr.target}`;
+      const holdPct = dwell > 0 ? Math.round(100 * (1 - Math.min(1, readyIn / dwell))) : 100;
+      let sub;
+      if (!enr.face_ok) {
+        sub = "Waiting for your face…";
+      } else if (enr.count === 0 && holdPct < 40) {
+        sub = "Get ready";
+      } else {
+        sub = `Hold still… ${Math.max(1, Math.ceil(readyIn))}`;
+      }
+      els.enrollSub.textContent = sub;
+      els.enrollSub.dataset.tone = enr.face_ok ? "ok" : "warn";
+      els.poseGuide.dataset.pose = enr.pose || "center";
+      els.poseGuide.dataset.face = enr.face_ok ? "ok" : "none";
+      els.poseRing.style.strokeDashoffset = String(100 - holdPct);
+      const target = Math.max(1, Number(enr.target) || 7);
+      if (els.enrollSegments.children.length !== target) {
+        els.enrollSegments.textContent = "";
+        for (let i = 0; i < target; i++) {
+          const seg = document.createElement("span");
+          seg.className = "seg";
+          els.enrollSegments.appendChild(seg);
+        }
+        els.enrollSegments.style.setProperty("--seg-count", String(target));
+      }
       const segs = els.enrollSegments.querySelectorAll(".seg");
       segs.forEach((seg, idx) => {
         seg.classList.toggle("filled", idx < enr.count);
+        const current = idx === enr.count;
+        seg.classList.toggle("current", current);
+        seg.style.setProperty("--hold", current ? `${holdPct}%` : "0%");
       });
       setVisible(els.enrollHud, true);
       state.wasEnrolling = true;
@@ -858,7 +1042,14 @@
       els.btnVersion.textContent = `v${boot.version}`;
     }
 
-    if (!els.usernameInput.value) {
+    if (boot.username_locked) {
+      // The service only lets each Windows account manage its own profile.
+      els.usernameInput.value = boot.active_user || "";
+      els.usernameInput.readOnly = true;
+      els.usernameInput.removeAttribute("list");
+      els.usernameInput.title = "Profiles are tied to the signed-in Windows account";
+      els.usernameInput.classList.add("is-locked");
+    } else if (!els.usernameInput.value) {
       els.usernameInput.value = boot.active_user || "";
     }
     renderProfileDatalist();
@@ -1208,6 +1399,7 @@
     els.toggleMotion.addEventListener("change", persistSecurityConfig);
 
     els.thresholdSlider.addEventListener("input", () => {
+      renderScoreStats();
       els.thresholdValue.textContent = parseFloat(els.thresholdSlider.value).toFixed(2);
     });
     els.thresholdSlider.addEventListener("change", persistSecurityConfig);
