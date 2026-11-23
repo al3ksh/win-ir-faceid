@@ -2,9 +2,11 @@
 
 #include "common.h"
 #include "pipe_client.h"
+#include "resource.h"
 
 #include <windows.h>
 #include <credentialprovider.h>
+#include <cstdint>
 #include <string>
 
 #ifndef __ICredentialProviderCredential3_INTERFACE_DEFINED__
@@ -19,6 +21,29 @@ public:
         BYTE** ppImageBuffer) = 0;
 };
 #endif
+
+#ifndef __ICredentialProviderCredentialEvents3_INTERFACE_DEFINED__
+#define __ICredentialProviderCredentialEvents3_INTERFACE_DEFINED__
+MIDL_INTERFACE("2D8DEEB8-1322-4973-8DF9-B282F2468290")
+ICredentialProviderCredentialEvents3 : public ICredentialProviderCredentialEvents2
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE SetFieldBitmapBuffer(
+        ICredentialProviderCredential* pcpc,
+        DWORD fieldID,
+        DWORD imageBufferSize,
+        const BYTE* pImageBuffer) = 0;
+};
+#endif
+
+enum class HeroAnimState
+{
+    Idle,
+    Entering,
+    Scanning,
+    Unlocked,
+    Failed
+};
 
 class WinIRFaceIDProvider;
 
@@ -97,8 +122,16 @@ private:
     void UpdateStatusText(const std::wstring& newText, bool updateButtonState);
     void WipeVerifiedCredentialsLocked();
 
+    void EnsureAnimThreadStarted();
+    void StopAnimThreadAndWait();
+    void SetHeroAnimState(HeroAnimState state);
+    void PushHeroFrame(UINT resId);
+
     static DWORD WINAPI ScanThreadProc(LPVOID param);
     void RunScan();
+
+    static DWORD WINAPI AnimThreadProc(LPVOID param);
+    void RunAnimation();
 
     LONG _refCount = 1;
     CRITICAL_SECTION _cs{};
@@ -110,13 +143,21 @@ private:
     std::wstring _qualifiedName;
 
     ICredentialProviderCredentialEvents* _pCredEvents = nullptr;
+    ICredentialProviderCredentialEvents3* _pCredEvents3 = nullptr;
     HANDLE _cancelEvent = nullptr;
     HANDLE _hScanThread = nullptr;
+
+    UINT _currentHeroResId = IDR_IR_FACEID_PNG;
+    HeroAnimState _animState = HeroAnimState::Idle;
+    uint64_t _animGeneration = 0;
+    HANDLE _animThread = nullptr;
+    HANDLE _animStopEvent = nullptr;
+    HANDLE _animWakeEvent = nullptr;
 
     bool _selected = false;
     bool _scanning = false;
     bool _hasVerifiedCred = false;
-    std::wstring _statusText = L"Looking for you...";
+    std::wstring _statusText = L"IR Face ID";
 
     std::wstring _verifiedUsername;
     std::wstring _verifiedDomain;

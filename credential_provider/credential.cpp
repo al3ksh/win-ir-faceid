@@ -16,12 +16,19 @@
 namespace
 {
 
+constexpr wchar_t kStatusReadyDeferred[] = L"IR Face ID";
 constexpr wchar_t kStatusScanning[] = L"Looking for you...";
 constexpr wchar_t kStatusRecognized[] = L"Welcome back!";
-constexpr wchar_t kStatusFailed[] = L"Couldn't recognize you - try again or use Fingerprint / PIN";
+constexpr wchar_t kStatusFailed[] = L"Couldn't recognize you";
+constexpr wchar_t kStatusServiceOffline[] = L"Face ID service offline - use Fingerprint or PIN";
 constexpr wchar_t kStatusNoPassword[] = L"Face recognized, but no saved credential - use Fingerprint or PIN";
 constexpr wchar_t kStatusSignInFailed[] = L"Sign-in failed - use Fingerprint or PIN";
-constexpr wchar_t kStatusReadyDeferred[] = L"Ready - move mouse or press key to scan";
+
+constexpr DWORD kEnterFrameMs = 45;
+constexpr DWORD kScanFrameMs = 70;
+constexpr DWORD kUnlockFrameMs = 45;
+constexpr DWORD kFailFrameMs = 50;
+constexpr DWORD kUnlockPreviewWaitMs = 280;
 
 std::wstring GetLocalComputerNetbiosName()
 {
@@ -207,10 +214,14 @@ HBITMAP CreateTopDown32BppDib(int width, int height, void** outBits)
     return hBmp;
 }
 
-bool LoadEmbeddedResourceBytes(UINT resourceId, const void*& outBytes, DWORD& outSize)
+bool LoadEmbeddedPngResource(UINT resId, const BYTE** ppData, DWORD* pSize)
 {
-    outBytes = nullptr;
-    outSize = 0;
+    if (ppData == nullptr || pSize == nullptr)
+    {
+        return false;
+    }
+    *ppData = nullptr;
+    *pSize = 0;
 
     HINSTANCE hInst = GetModuleInstance();
     if (hInst == nullptr)
@@ -218,7 +229,7 @@ bool LoadEmbeddedResourceBytes(UINT resourceId, const void*& outBytes, DWORD& ou
         return false;
     }
 
-    HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+    HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCEW(resId), RT_RCDATA);
     if (hRes == nullptr)
     {
         return false;
@@ -237,8 +248,20 @@ bool LoadEmbeddedResourceBytes(UINT resourceId, const void*& outBytes, DWORD& ou
         return false;
     }
 
-    outBytes = bytes;
-    outSize = size;
+    *ppData = static_cast<const BYTE*>(bytes);
+    *pSize = size;
+    return true;
+}
+
+bool LoadEmbeddedResourceBytes(UINT resourceId, const void*& outBytes, DWORD& outSize)
+{
+    const BYTE* ptr = nullptr;
+    if (!LoadEmbeddedPngResource(resourceId, &ptr, &outSize))
+    {
+        outBytes = nullptr;
+        return false;
+    }
+    outBytes = ptr;
     return true;
 }
 
@@ -388,22 +411,27 @@ void CreateFallbackIRFacePixels(
 }
 
 void GetIRFaceTilePbgra(
+    UINT resourceId,
     UINT& outWidth,
     UINT& outHeight,
     std::vector<BYTE>& outPixels)
 {
-    if (!DecodePngResourceToPbgra(IDR_IR_FACEID_PNG, outWidth, outHeight, outPixels))
+    if (!DecodePngResourceToPbgra(resourceId, outWidth, outHeight, outPixels))
     {
-        CreateFallbackIRFacePixels(outWidth, outHeight, outPixels);
+        if (resourceId == IDR_IR_FACEID_PNG ||
+            !DecodePngResourceToPbgra(IDR_IR_FACEID_PNG, outWidth, outHeight, outPixels))
+        {
+            CreateFallbackIRFacePixels(outWidth, outHeight, outPixels);
+        }
     }
 }
 
-HBITMAP CreateIRFaceTileBitmap()
+HBITMAP CreateIRFaceTileBitmap(UINT resourceId)
 {
     UINT width = 0;
     UINT height = 0;
     std::vector<BYTE> pixels;
-    GetIRFaceTilePbgra(width, height, pixels);
+    GetIRFaceTilePbgra(resourceId, width, height, pixels);
     if (width == 0 || height == 0 || pixels.empty())
     {
         return nullptr;
@@ -420,7 +448,7 @@ HBITMAP CreateIRFaceTileBitmap()
     return hBmp;
 }
 
-HRESULT CreateIRFaceTileBitmapBuffer(DWORD* outSize, BYTE** outBuffer)
+HRESULT CreateIRFaceTileBitmapBuffer(UINT resourceId, DWORD* outSize, BYTE** outBuffer)
 {
     if (outSize == nullptr || outBuffer == nullptr)
     {
@@ -429,11 +457,15 @@ HRESULT CreateIRFaceTileBitmapBuffer(DWORD* outSize, BYTE** outBuffer)
     *outSize = 0;
     *outBuffer = nullptr;
 
-    const void* pngBytes = nullptr;
+    const BYTE* pngBytes = nullptr;
     DWORD pngSize = 0;
-    if (!LoadEmbeddedResourceBytes(IDR_IR_FACEID_PNG, pngBytes, pngSize))
+    if (!LoadEmbeddedPngResource(resourceId, &pngBytes, &pngSize))
     {
-        return E_FAIL;
+        if (resourceId == IDR_IR_FACEID_PNG ||
+            !LoadEmbeddedPngResource(IDR_IR_FACEID_PNG, &pngBytes, &pngSize))
+        {
+            return E_FAIL;
+        }
     }
 
     auto* buffer = static_cast<BYTE*>(CoTaskMemAlloc(pngSize));
@@ -466,26 +498,50 @@ WinIRFaceIDCredential::WinIRFaceIDCredential(
     DllAddRef();
     InitializeCriticalSection(&_cs);
     _cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    _animStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    _animWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
 
 WinIRFaceIDCredential::~WinIRFaceIDCredential()
 {
     CancelScanAndWait();
+    StopAnimThreadAndWait();
+
+    ICredentialProviderCredentialEvents* pEventsToRelease = nullptr;
+    ICredentialProviderCredentialEvents3* pEvents3ToRelease = nullptr;
 
     EnterCriticalSection(&_cs);
     WipeVerifiedCredentialsLocked();
-    if (_pCredEvents != nullptr)
-    {
-        _pCredEvents->Release();
-        _pCredEvents = nullptr;
-    }
+    pEvents3ToRelease = _pCredEvents3;
+    _pCredEvents3 = nullptr;
+    pEventsToRelease = _pCredEvents;
+    _pCredEvents = nullptr;
     _pProvider = nullptr;
     LeaveCriticalSection(&_cs);
+
+    if (pEvents3ToRelease != nullptr)
+    {
+        pEvents3ToRelease->Release();
+    }
+    if (pEventsToRelease != nullptr)
+    {
+        pEventsToRelease->Release();
+    }
 
     if (_cancelEvent != nullptr)
     {
         CloseHandle(_cancelEvent);
         _cancelEvent = nullptr;
+    }
+    if (_animStopEvent != nullptr)
+    {
+        CloseHandle(_animStopEvent);
+        _animStopEvent = nullptr;
+    }
+    if (_animWakeEvent != nullptr)
+    {
+        CloseHandle(_animWakeEvent);
+        _animWakeEvent = nullptr;
     }
 
     DeleteCriticalSection(&_cs);
@@ -503,6 +559,7 @@ void WinIRFaceIDCredential::WipeVerifiedCredentialsLocked()
 void WinIRFaceIDCredential::DetachProvider()
 {
     CancelScanAndWait();
+    StopAnimThreadAndWait();
     EnterCriticalSection(&_cs);
     _pProvider = nullptr;
     LeaveCriticalSection(&_cs);
@@ -546,21 +603,38 @@ IFACEMETHODIMP WinIRFaceIDCredential::Advise(ICredentialProviderCredentialEvents
 {
     bool canStart = false;
     bool isSelected = false;
+    bool isScanning = false;
+    bool hasCredEvents3 = false;
     WinIRFaceIDProvider* provider = nullptr;
+    ICredentialProviderCredentialEvents* oldEvents = nullptr;
+    ICredentialProviderCredentialEvents3* oldEvents3 = nullptr;
+    ICredentialProviderCredentialEvents3* newEvents3 = nullptr;
+
+    if (pcpce != nullptr)
+    {
+        if (FAILED(pcpce->QueryInterface(
+                __uuidof(ICredentialProviderCredentialEvents3),
+                reinterpret_cast<void**>(&newEvents3))))
+        {
+            newEvents3 = nullptr;
+        }
+    }
 
     EnterCriticalSection(&_cs);
-    if (_pCredEvents != nullptr)
-    {
-        _pCredEvents->Release();
-        _pCredEvents = nullptr;
-    }
+    oldEvents = _pCredEvents;
     _pCredEvents = pcpce;
     if (_pCredEvents != nullptr)
     {
         _pCredEvents->AddRef();
     }
+
+    oldEvents3 = _pCredEvents3;
+    _pCredEvents3 = newEvents3; // Transfer reference from QueryInterface
+
     canStart = (pcpce != nullptr) && !_scanning && !_hasVerifiedCred;
     isSelected = _selected;
+    isScanning = _scanning;
+    hasCredEvents3 = (_pCredEvents3 != nullptr);
     if (canStart && _pProvider != nullptr)
     {
         provider = _pProvider;
@@ -568,12 +642,22 @@ IFACEMETHODIMP WinIRFaceIDCredential::Advise(ICredentialProviderCredentialEvents
     }
     LeaveCriticalSection(&_cs);
 
+    if (oldEvents3 != nullptr)
+    {
+        oldEvents3->Release();
+    }
+    if (oldEvents != nullptr)
+    {
+        oldEvents->Release();
+    }
+
     if (canStart)
     {
         if (isSelected)
         {
             if (provider != nullptr && provider->ShouldDeferInitialUnlockScan())
             {
+                SetHeroAnimState(HeroAnimState::Idle);
                 UpdateStatusText(kStatusReadyDeferred, true);
             }
             else
@@ -586,6 +670,10 @@ IFACEMETHODIMP WinIRFaceIDCredential::Advise(ICredentialProviderCredentialEvents
             StartScan();
         }
     }
+    else if (isSelected && hasCredEvents3 && isScanning)
+    {
+        EnsureAnimThreadStarted();
+    }
 
     if (provider != nullptr)
     {
@@ -596,16 +684,31 @@ IFACEMETHODIMP WinIRFaceIDCredential::Advise(ICredentialProviderCredentialEvents
 
 IFACEMETHODIMP WinIRFaceIDCredential::UnAdvise()
 {
-    CancelScanAndWait();
+    ICredentialProviderCredentialEvents* pEventsToRelease = nullptr;
+    ICredentialProviderCredentialEvents3* pEvents3ToRelease = nullptr;
 
     EnterCriticalSection(&_cs);
-    if (_pCredEvents != nullptr)
-    {
-        _pCredEvents->Release();
-        _pCredEvents = nullptr;
-    }
+    pEventsToRelease = _pCredEvents;
+    _pCredEvents = nullptr;
+    pEvents3ToRelease = _pCredEvents3;
+    _pCredEvents3 = nullptr;
     _selected = false;
+    _animState = HeroAnimState::Idle;
+    ++_animGeneration;
+    _currentHeroResId = IDR_IR_FACEID_PNG;
     LeaveCriticalSection(&_cs);
+
+    CancelScanAndWait();
+    StopAnimThreadAndWait();
+
+    if (pEvents3ToRelease != nullptr)
+    {
+        pEvents3ToRelease->Release();
+    }
+    if (pEventsToRelease != nullptr)
+    {
+        pEventsToRelease->Release();
+    }
 
     return S_OK;
 }
@@ -636,10 +739,15 @@ IFACEMETHODIMP WinIRFaceIDCredential::SetSelected(BOOL* pbAutoLogon)
     }
 
     *pbAutoLogon = FALSE;
-    if (!alreadyScanning)
+    if (alreadyScanning)
+    {
+        EnsureAnimThreadStarted();
+    }
+    else
     {
         if (provider != nullptr && provider->ShouldDeferInitialUnlockScan())
         {
+            SetHeroAnimState(HeroAnimState::Idle);
             UpdateStatusText(kStatusReadyDeferred, true);
         }
         else
@@ -659,8 +767,12 @@ IFACEMETHODIMP WinIRFaceIDCredential::SetDeselected()
 {
     EnterCriticalSection(&_cs);
     _selected = false;
+    _animState = HeroAnimState::Idle;
+    ++_animGeneration;
+    _currentHeroResId = IDR_IR_FACEID_PNG;
     LeaveCriticalSection(&_cs);
 
+    StopAnimThreadAndWait();
     CancelScanAndWait();
     return S_OK;
 }
@@ -753,7 +865,18 @@ IFACEMETHODIMP WinIRFaceIDCredential::GetBitmapValue(DWORD dwFieldID, HBITMAP* p
         return E_INVALIDARG;
     }
 
-    *phbmp = CreateIRFaceTileBitmap();
+    UINT resId = IDR_IR_FACEID_PNG;
+    if (dwFieldID == FID_HERO_IMAGE)
+    {
+        EnterCriticalSection(&_cs);
+        if (_currentHeroResId != 0)
+        {
+            resId = _currentHeroResId;
+        }
+        LeaveCriticalSection(&_cs);
+    }
+
+    *phbmp = CreateIRFaceTileBitmap(resId);
     return (*phbmp != nullptr) ? S_OK : E_FAIL;
 }
 
@@ -774,7 +897,18 @@ IFACEMETHODIMP WinIRFaceIDCredential::GetBitmapBufferValue(
         return E_INVALIDARG;
     }
 
-    return CreateIRFaceTileBitmapBuffer(pImageBufferSize, ppImageBuffer);
+    UINT resId = IDR_IR_FACEID_PNG;
+    if (dwFieldID == FID_HERO_IMAGE)
+    {
+        EnterCriticalSection(&_cs);
+        if (_currentHeroResId != 0)
+        {
+            resId = _currentHeroResId;
+        }
+        LeaveCriticalSection(&_cs);
+    }
+
+    return CreateIRFaceTileBitmapBuffer(resId, pImageBufferSize, ppImageBuffer);
 }
 
 IFACEMETHODIMP WinIRFaceIDCredential::GetCheckboxValue(
@@ -1050,11 +1184,13 @@ void WinIRFaceIDCredential::StartScan()
     if (hThread == nullptr)
     {
         Release();
+        SetHeroAnimState(HeroAnimState::Failed);
         UpdateStatusText(kStatusFailed, true);
     }
     else
     {
         UpdateStatusText(kStatusScanning, true);
+        SetHeroAnimState(HeroAnimState::Entering);
     }
 }
 
@@ -1078,6 +1214,260 @@ void WinIRFaceIDCredential::CancelScanAndWait()
     {
         WaitForSingleObject(hThread, 2500);
         CloseHandle(hThread);
+    }
+}
+
+void WinIRFaceIDCredential::EnsureAnimThreadStarted()
+{
+    HANDLE threadToClose = nullptr;
+    HANDLE hNewThread = nullptr;
+    bool shouldRelease = false;
+
+    EnterCriticalSection(&_cs);
+    if (_selected && _pCredEvents3 != nullptr && _animStopEvent != nullptr && _animWakeEvent != nullptr)
+    {
+        if (_animThread != nullptr)
+        {
+            if (WaitForSingleObject(_animThread, 0) != WAIT_TIMEOUT)
+            {
+                threadToClose = _animThread;
+                _animThread = nullptr;
+            }
+        }
+
+        if (_animThread == nullptr)
+        {
+            ResetEvent(_animStopEvent);
+            AddRef(); // Balanced in AnimThreadProc before exit
+            hNewThread = CreateThread(nullptr, 0, AnimThreadProc, this, 0, nullptr);
+            if (hNewThread != nullptr)
+            {
+                _animThread = hNewThread;
+            }
+            else
+            {
+                shouldRelease = true;
+            }
+        }
+    }
+    LeaveCriticalSection(&_cs);
+
+    if (threadToClose != nullptr)
+    {
+        CloseHandle(threadToClose);
+    }
+    if (shouldRelease)
+    {
+        Release();
+    }
+}
+
+void WinIRFaceIDCredential::StopAnimThreadAndWait()
+{
+    HANDLE hThread = nullptr;
+
+    EnterCriticalSection(&_cs);
+    if (_animStopEvent != nullptr)
+    {
+        SetEvent(_animStopEvent);
+    }
+    if (_animThread != nullptr)
+    {
+        hThread = _animThread;
+        _animThread = nullptr;
+    }
+    LeaveCriticalSection(&_cs);
+
+    if (hThread != nullptr)
+    {
+        WaitForSingleObject(hThread, 2500);
+        CloseHandle(hThread);
+    }
+}
+
+void WinIRFaceIDCredential::SetHeroAnimState(HeroAnimState state)
+{
+    bool startThread = false;
+
+    EnterCriticalSection(&_cs);
+    const bool retrigger =
+        (state == HeroAnimState::Entering) ||
+        (state == HeroAnimState::Unlocked) ||
+        (state == HeroAnimState::Failed);
+    if (_animState != state || retrigger)
+    {
+        _animState = state;
+        ++_animGeneration;
+    }
+    startThread = _selected && (_pCredEvents3 != nullptr);
+    HANDLE wakeEvent = _animWakeEvent;
+    LeaveCriticalSection(&_cs);
+
+    if (startThread)
+    {
+        EnsureAnimThreadStarted();
+    }
+    if (wakeEvent != nullptr)
+    {
+        SetEvent(wakeEvent);
+    }
+}
+
+void WinIRFaceIDCredential::PushHeroFrame(UINT resId)
+{
+    const BYTE* pngData = nullptr;
+    DWORD pngSize = 0;
+    if (!LoadEmbeddedPngResource(resId, &pngData, &pngSize))
+    {
+        return;
+    }
+
+    ICredentialProviderCredentialEvents3* pEvents3 = nullptr;
+    EnterCriticalSection(&_cs);
+    _currentHeroResId = resId;
+    if (_selected && _pCredEvents3 != nullptr)
+    {
+        pEvents3 = _pCredEvents3;
+        pEvents3->AddRef();
+    }
+    LeaveCriticalSection(&_cs);
+
+    if (pEvents3 != nullptr)
+    {
+        pEvents3->SetFieldBitmapBuffer(this, FID_HERO_IMAGE, pngSize, pngData);
+        pEvents3->Release();
+    }
+}
+
+DWORD WINAPI WinIRFaceIDCredential::AnimThreadProc(LPVOID param)
+{
+    auto* self = static_cast<WinIRFaceIDCredential*>(param);
+    if (self != nullptr)
+    {
+        self->RunAnimation();
+        self->Release();
+    }
+    return 0;
+}
+
+void WinIRFaceIDCredential::RunAnimation()
+{
+    struct AnimSequenceSpec
+    {
+        UINT baseResId = IDR_IR_FACEID_PNG;
+        DWORD frameCount = 1;
+        DWORD frameDelayMs = INFINITE;
+        bool loop = false;
+        bool advanceToScanning = false;
+    };
+
+    auto getSpec = [](HeroAnimState state) -> AnimSequenceSpec {
+        switch (state)
+        {
+        case HeroAnimState::Entering:
+            return { IDR_ANIM_ENTER_BASE, IDR_ANIM_ENTER_COUNT, kEnterFrameMs, false, true };
+        case HeroAnimState::Scanning:
+            return { IDR_ANIM_SCAN_BASE, IDR_ANIM_SCAN_COUNT, kScanFrameMs, true, false };
+        case HeroAnimState::Unlocked:
+            return { IDR_ANIM_UNLOCK_BASE, IDR_ANIM_UNLOCK_COUNT, kUnlockFrameMs, false, false };
+        case HeroAnimState::Failed:
+            return { IDR_ANIM_FAIL_BASE, IDR_ANIM_FAIL_COUNT, kFailFrameMs, false, false };
+        case HeroAnimState::Idle:
+        default:
+            return { IDR_IR_FACEID_PNG, 1, INFINITE, false, false };
+        }
+    };
+
+    uint64_t activeGen = 0;
+    HeroAnimState activeState = HeroAnimState::Idle;
+    DWORD frameIdx = 0;
+    bool settled = false;
+    bool hasInitialized = false;
+
+    for (;;)
+    {
+        if (_animStopEvent == nullptr ||
+            WaitForSingleObject(_animStopEvent, 0) == WAIT_OBJECT_0)
+        {
+            break;
+        }
+
+        EnterCriticalSection(&_cs);
+        const HeroAnimState desiredState = _animState;
+        const uint64_t desiredGen = _animGeneration;
+        const bool canPush = _selected && (_pCredEvents3 != nullptr);
+        LeaveCriticalSection(&_cs);
+
+        if (!canPush)
+        {
+            HANDLE handles[2] = { _animStopEvent, _animWakeEvent };
+            const DWORD waitRes = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+            if (waitRes == WAIT_OBJECT_0 || waitRes == WAIT_FAILED)
+            {
+                break;
+            }
+            continue;
+        }
+
+        if (!hasInitialized || desiredGen != activeGen)
+        {
+            hasInitialized = true;
+            activeGen = desiredGen;
+            activeState = desiredState;
+            frameIdx = 0;
+            settled = false;
+        }
+
+        const AnimSequenceSpec spec = getSpec(activeState);
+
+        if (!settled)
+        {
+            PushHeroFrame(spec.baseResId + frameIdx);
+        }
+
+        DWORD waitMs = INFINITE;
+        if (!settled)
+        {
+            if (spec.loop || (frameIdx + 1 < spec.frameCount) || spec.advanceToScanning)
+            {
+                waitMs = spec.frameDelayMs;
+            }
+            else
+            {
+                settled = true;
+                waitMs = INFINITE;
+            }
+        }
+
+        HANDLE handles[2] = { _animStopEvent, _animWakeEvent };
+        const DWORD waitRes = WaitForMultipleObjects(2, handles, FALSE, waitMs);
+        if (waitRes == WAIT_OBJECT_0 || waitRes == WAIT_FAILED)
+        {
+            break;
+        }
+        if (waitRes == WAIT_OBJECT_0 + 1)
+        {
+            continue;
+        }
+
+        if (spec.loop)
+        {
+            frameIdx = (frameIdx + 1) % spec.frameCount;
+        }
+        else if (frameIdx + 1 < spec.frameCount)
+        {
+            ++frameIdx;
+        }
+        else if (spec.advanceToScanning)
+        {
+            EnterCriticalSection(&_cs);
+            if (_animGeneration == activeGen && _animState == HeroAnimState::Entering)
+            {
+                _animState = HeroAnimState::Scanning;
+                ++_animGeneration;
+            }
+            LeaveCriticalSection(&_cs);
+        }
     }
 }
 
@@ -1139,6 +1529,7 @@ void WinIRFaceIDCredential::RunScan()
         EnterCriticalSection(&_cs);
         _scanning = false;
         LeaveCriticalSection(&_cs);
+        SetHeroAnimState(HeroAnimState::Idle);
         return;
     }
 
@@ -1153,27 +1544,53 @@ void WinIRFaceIDCredential::RunScan()
         _hasVerifiedCred = true;
         _scanning = false;
         provider = _pProvider;
+        if (provider != nullptr)
+        {
+            provider->AddRef();
+        }
         LeaveCriticalSection(&_cs);
 
         result.Clear();
-        UpdateStatusText(kStatusRecognized, true);
+        UpdateStatusText(kStatusRecognized, false);
+        SetHeroAnimState(HeroAnimState::Unlocked);
+
+        if (_cancelEvent != nullptr &&
+            WaitForSingleObject(_cancelEvent, kUnlockPreviewWaitMs) == WAIT_OBJECT_0)
+        {
+            EnterCriticalSection(&_cs);
+            WipeVerifiedCredentialsLocked();
+            LeaveCriticalSection(&_cs);
+            if (provider != nullptr)
+            {
+                provider->Release();
+            }
+            return;
+        }
 
         if (provider != nullptr)
         {
             provider->NotifyCredentialsChanged();
+            provider->Release();
         }
         return;
     }
 
+    const pipe_client::VerifyStatus verifyStatus = result.status;
     result.Clear();
 
     EnterCriticalSection(&_cs);
     _scanning = false;
     LeaveCriticalSection(&_cs);
 
+    SetHeroAnimState(HeroAnimState::Failed);
+
     if (matched)
     {
         UpdateStatusText(kStatusNoPassword, true);
+    }
+    else if (verifyStatus == pipe_client::VerifyStatus::PipeUnavailable)
+    {
+        UpdateStatusText(kStatusServiceOffline, true);
     }
     else
     {

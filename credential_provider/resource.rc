@@ -1,3 +1,45 @@
 #include "resource.h"
 
 IDR_IR_FACEID_PNG RCDATA "assets/ir_faceid_icon.png"
+
+// Entrance (enter_00..enter_05)
+200 RCDATA "assets/frames/enter_00.png"
+201 RCDATA "assets/frames/enter_01.png"
+202 RCDATA "assets/frames/enter_02.png"
+203 RCDATA "assets/frames/enter_03.png"
+204 RCDATA "assets/frames/enter_04.png"
+205 RCDATA "assets/frames/enter_05.png"
+
+// Scanning loop (scan_00..scan_15)
+220 RCDATA "assets/frames/scan_00.png"
+221 RCDATA "assets/frames/scan_01.png"
+222 RCDATA "assets/frames/scan_02.png"
+223 RCDATA "assets/frames/scan_03.png"
+224 RCDATA "assets/frames/scan_04.png"
+225 RCDATA "assets/frames/scan_05.png"
+226 RCDATA "assets/frames/scan_06.png"
+227 RCDATA "assets/frames/scan_07.png"
+228 RCDATA "assets/frames/scan_08.png"
+229 RCDATA "assets/frames/scan_09.png"
+230 RCDATA "assets/frames/scan_10.png"
+231 RCDATA "assets/frames/scan_11.png"
+232 RCDATA "assets/frames/scan_12.png"
+233 RCDATA "assets/frames/scan_13.png"
+234 RCDATA "assets/frames/scan_14.png"
+235 RCDATA "assets/frames/scan_15.png"
+
+// Unlock checkmark morph (unlock_00..unlock_05)
+240 RCDATA "assets/frames/unlock_00.png"
+241 RCDATA "assets/frames/unlock_01.png"
+242 RCDATA "assets/frames/unlock_02.png"
+243 RCDATA "assets/frames/unlock_03.png"
+244 RCDATA "assets/frames/unlock_04.png"
+245 RCDATA "assets/frames/unlock_05.png"
+
+// Failed shake (fail_00..fail_05)
+260 RCDATA "assets/frames/fail_00.png"
+261 RCDATA "assets/frames/fail_01.png"
+262 RCDATA "assets/frames/fail_02.png"
+263 RCDATA "assets/frames/fail_03.png"
+264 RCDATA "assets/frames/fail_04.png"
+265 RCDATA "assets/frames/fail_05.png"
