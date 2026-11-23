@@ -44,11 +44,11 @@ WinIRFaceID is designed to be auditable, isolated, and safe to run on a daily-dr
 
 ## Features & UX Highlights
 
-- **Native Windows 11 Lock Screen Integration:** Implements `ICredentialProviderCredential3::GetBitmapBufferValue` for alpha-transparent white Fluent icons on both the sign-in options tile and the selected hero tile. On `Win + L`, background IR scanning starts automatically even while PIN or Fingerprint is selected, and cancels immediately if you sign in another way.
+- **Native Windows 11 Lock Screen Integration:** Implements `ICredentialProviderCredential3::GetBitmapBufferValue` and `ICredentialProviderCredentialEvents3::SetFieldBitmapBuffer` for 32+ FPS alpha-transparent white Fluent Look animations on the lock screen hero tile (plus the sign-in options tile icon). On `Win + L`, the session stays locked with the IR LED off until you dismiss the lock curtain (e.g. Space or click), then scans immediately — even while PIN or Fingerprint is selected — and cancels right away if you sign in another way.
 - **Local & Microsoft Account Support:** Works with local Windows accounts (`Domain = .`) and Microsoft Accounts (`MicrosoftAccount\...` resolved automatically from your Windows account password).
-- **Guided Enrollment:** Enrollment walks you through 7 head poses (center, left, right, relaxed, chin up, chin down, back to center) with an animated pose guide and a hold-still ring; a sample is only captured after your face has been steady and live for a moment.
-- **Alternate Appearances (Glasses, Beard, Lighting):** Clicking **Add Appearance** enrolls another look (7 more IR captures, up to 32 samples per user) so recognition stays reliable both with and without prescription glasses. Each look is listed under **Account** with its date and can be deleted individually. *(Near-IR passes through most clear prescription lenses; IR-blocking sunglasses will block 850nm light.)*
-- **Minimalist Edge WebView2 Desktop App:** Keeps the IR camera and flood LED on standby until you actively start enrollment, live testing, or preview. Includes live SVG corner-bracket face tracking, a collapsible monospace IR diagnostics strip (`IR Δ`, `BG`, `3D`, `Eyes`), live match scores, and 1-click SHA-256-verified delta updates (~350 KB) from GitHub Releases. Security settings (match strictness 0.60–0.80, liveness options) apply to the service immediately — no restart needed.
+- **Guided Enrollment:** Enrollment walks you through 7 head poses (center, left, right, relaxed, chin up, chin down, back to center) with an on-viewport wireframe and chevron guide, live head-position and head-pose angle awareness (yaw/pitch calibrated to your neutral pose), and smooth ~1.2s aligned capture pacing; a sample is only captured once your face is centered, properly angled, steady, and live.
+- **Alternate Appearances (Glasses, Beard, Lighting):** Clicking **Add Appearance** enrolls another look (7 more IR captures, up to 32 samples per user) so recognition stays reliable both with and without prescription glasses. Each look is listed under **Account** with its date and can be renamed inline or deleted individually. *(Near-IR passes through most clear prescription lenses; IR-blocking sunglasses will block 850nm light.)*
+- **Minimalist Edge WebView2 Desktop App:** Keeps the IR camera and flood LED on standby until you actively start enrollment, live testing, or preview. Includes mirrored natural preview with side-by-side **Split `RGB | IR`** camera preview (with automatic single-IR fallback), live SVG corner-bracket face tracking, a collapsible monospace IR diagnostics strip (`IR Δ`, `BG`, `3D`, `Eyes`), live match scores, a dismissible BitLocker drive `C:` encryption warning modal, and 1-click SHA-256-verified delta updates (~350 KB) from GitHub Releases. Security settings (match strictness 0.60–0.80, liveness options) apply to the service immediately — no restart needed.
 
 <details>
 <summary>Screenshot: Local-only DPAPI Logon Password modal</summary>
@@ -107,8 +107,7 @@ win-ir-faceid/
 
 - **OS:** Windows 11 x64 with a Windows Hello IR camera (hardware IR sensor + 850nm illuminator)
 - **Runtime:** Microsoft Edge WebView2 Runtime (pre-installed on Windows 11)
-- **Python:** none needed — setup installs a private CPython 3.11 x64 into `Program Files\WinIRFaceID
-untime\python` (bundled in releases; downloaded from the official python.org NuGet package for source installs). Your own Python installs are never used or modified. *(Developing from source still needs a Python 3.11 x64 of your own for the dev `.venv`.)*
+- **Python:** none needed — setup installs a private CPython 3.11 x64 into `Program Files\WinIRFaceID\runtime\python` (bundled in releases; downloaded from the official python.org NuGet package for source installs). Your own Python installs are never used or modified. *(Developing from source still needs a Python 3.11 x64 of your own for the dev `.venv`.)*
 - **Build Tools (Source Build only):** Visual Studio 2022 / 2026 (Desktop development with C++ + CMake) to compile the C++ Credential Provider and Service Host
 
 ---

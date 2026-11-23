@@ -25,7 +25,7 @@
           </svg>
           <span class="brand-name">WinIRFaceID</span>
         </button>
-        <button class="version-pill tabular" id="btnVersion" type="button" title="Check for updates">v0.1.1</button>
+        <button class="version-pill tabular" id="btnVersion" type="button" title="Check for updates">v0.3.0</button>
       </div>
 
       <div class="header-right">
@@ -425,7 +425,7 @@
       </div>
 
       <p class="modal-subtitle">
-        Stored locally with machine-scoped DPAPI encryption for <strong id="pwModalUser">User</strong>.
+        Stored locally with TPM 2.0 and machine-scoped DPAPI encryption for <strong id="pwModalUser">User</strong>.
       </p>
 
       <form id="passwordForm" class="modal-form">
@@ -485,7 +485,7 @@
         </div>
 
         <p class="modal-note">
-          For a Microsoft Account, enter your Microsoft Account password and keep Domain as <code>.</code>.
+          Enter your Windows or Microsoft Account password — not your Windows Hello PIN. Keep Domain as <code>.</code>.
         </p>
 
         <div class="modal-error hidden" id="pwModalError"></div>

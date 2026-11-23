@@ -389,6 +389,13 @@
     }
     if (!prof) renderLooksList(user, []);
 
+    if (els.btnPassword) {
+      const needsPassword = Boolean(
+        prof && (prof.has_embeddings || prof.sample_count > 0) && !prof.has_password
+      );
+      els.btnPassword.dataset.needed = needsPassword ? "true" : "false";
+    }
+
     updateEnrollButton(mode, prof);
   }
 
@@ -556,8 +563,8 @@
     };
     const paneDescs = {
       running: configDirty ? "Restart required to apply settings" : "Running in background",
-      stopped: "Installed, currently stopped",
-      not_installed: "Install via scripts/install_service.ps1",
+      stopped: "Stopped · Lock screen sign-in paused",
+      not_installed: "Not installed · Run Install.bat for lock screen",
       unknown: "Unable to query Service Control Manager",
     };
 
@@ -569,9 +576,13 @@
       els.btnHeaderRestart.classList.remove("hidden");
       els.btnPaneRestart.textContent = "Apply & Restart";
       els.btnPaneRestart.classList.remove("hidden");
-    } else if (status === "running" || status === "stopped") {
+    } else if (status === "running") {
       els.btnHeaderRestart.classList.add("hidden");
       els.btnPaneRestart.textContent = "Restart";
+      els.btnPaneRestart.classList.remove("hidden");
+    } else if (status === "stopped") {
+      els.btnHeaderRestart.classList.add("hidden");
+      els.btnPaneRestart.textContent = "Start";
       els.btnPaneRestart.classList.remove("hidden");
     } else {
       els.btnHeaderRestart.classList.add("hidden");
@@ -1155,10 +1166,19 @@
         const doneAppend = Boolean(live.enroll && live.enroll.completed_append);
         if (doneUser) {
           const target = Math.max(1, Number((live.enroll && live.enroll.target) || 7));
-          const msg = doneAppend
-            ? `Appearance added for '${doneUser}'.`
-            : `Enrolled ${target} IR samples for '${doneUser}'.`;
-          showFeedback(msg, "ok", 5000);
+          const doneProf = findProfile(doneUser);
+          const needsPassword = !(doneProf && doneProf.has_password);
+          let msg;
+          let durationMs = 5000;
+          if (doneAppend) {
+            msg = `Appearance added for '${doneUser}'.`;
+          } else if (needsPassword) {
+            msg = `Enrolled ${target} IR samples for '${doneUser}'. Next: click Password to enable lock screen sign-in.`;
+            durationMs = 8000;
+          } else {
+            msg = `Enrolled ${target} IR samples for '${doneUser}'.`;
+          }
+          showFeedback(msg, "ok", durationMs);
           refreshBootstrapData();
         }
       }
@@ -1416,7 +1436,7 @@
   function openUpdateModal(info) {
     if (!els.updateModal || !info) return;
     closeCameraDropdown(false);
-    const current = info.current_version || (state.bootstrap && state.bootstrap.version) || "0.2.3";
+    const current = info.current_version || (state.bootstrap && state.bootstrap.version) || "0.3.0";
     const latest = info.latest_version || current;
     els.updateVersionLine.textContent = `v${current} -> v${latest}`;
 
@@ -1897,7 +1917,7 @@
         }
         if (typeof a.check_for_updates !== "function") return;
 
-        const current = (state.bootstrap && state.bootstrap.version) || "0.2.3";
+        const current = (state.bootstrap && state.bootstrap.version) || "0.3.0";
         els.btnVersion.disabled = true;
         els.btnVersion.textContent = "Checking...";
         try {

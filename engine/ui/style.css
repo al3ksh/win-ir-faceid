@@ -1197,6 +1197,17 @@ button:disabled {
   border-color: var(--border-strong);
 }
 
+#btnPassword[data-needed="true"] {
+  border-color: rgba(245, 158, 11, 0.34);
+  background: rgba(245, 158, 11, 0.08);
+  color: var(--amber);
+}
+
+#btnPassword[data-needed="true"]:hover:not(:disabled) {
+  border-color: rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.14);
+}
+
 .btn-xs {
   height: 26px;
   padding: 0 10px;
