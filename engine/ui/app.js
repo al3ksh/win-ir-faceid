@@ -1450,7 +1450,7 @@
   function openUpdateModal(info) {
     if (!els.updateModal || !info) return;
     closeCameraDropdown(false);
-    const current = info.current_version || (state.bootstrap && state.bootstrap.version) || "0.3.0";
+    const current = info.current_version || (state.bootstrap && state.bootstrap.version) || "0.3.1";
     const latest = info.latest_version || current;
     els.updateVersionLine.textContent = `v${current} -> v${latest}`;
 
@@ -1935,7 +1935,7 @@
         }
         if (typeof a.check_for_updates !== "function") return;
 
-        const current = (state.bootstrap && state.bootstrap.version) || "0.3.0";
+        const current = (state.bootstrap && state.bootstrap.version) || "0.3.1";
         els.btnVersion.disabled = true;
         els.btnVersion.textContent = "Checking...";
         try {
