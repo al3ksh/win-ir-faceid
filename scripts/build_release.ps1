@@ -168,7 +168,7 @@ foreach ($cpFile in @("install.ps1", "uninstall.ps1", "register.reg", "unregiste
 
 $StageScriptsDir = Join-Path $StageDir "scripts"
 New-Item -ItemType Directory -Path $StageScriptsDir -Force | Out-Null
-foreach ($scriptFile in @("setup.ps1", "python_runtime.ps1", "install_service.ps1", "uninstall_service.ps1", "create_shortcut.ps1")) {
+foreach ($scriptFile in @("setup.ps1", "python_runtime.ps1", "install_service.ps1", "uninstall_service.ps1", "create_shortcut.ps1", "apply_update.ps1")) {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\$scriptFile") -Destination (Join-Path $StageScriptsDir $scriptFile) -Force
 }
 
@@ -181,6 +181,15 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\IPC_PROTOCOL.md") -Destination
 foreach ($rootFile in @("Install.bat", "Uninstall.bat", "launch_gui.bat", "requirements.txt", "LICENSE", "README.md")) {
     Copy-Item -LiteralPath (Join-Path $RepoRoot $rootFile) -Destination (Join-Path $StageDir $rootFile) -Force
 }
+
+# 2a. Create lightweight delta update archive (code + binaries only, before bundling runtime/wheels/models)
+$UpdateZipName = "WinIRFaceID-Update-v$Version-win64.zip"
+$UpdateZipPath = Join-Path $DistDir $UpdateZipName
+if (Test-Path -LiteralPath $UpdateZipPath) {
+    Remove-Item -LiteralPath $UpdateZipPath -Force
+}
+Write-Host "Creating lightweight delta update archive '$UpdateZipPath'..."
+Compress-Archive -Path (Join-Path $StageDir "*") -DestinationPath $UpdateZipPath -CompressionLevel Optimal
 
 # 2b. Bundle the private Python runtime, dependency wheels, and ONNX models (offline install)
 if (-not $SkipBundle) {
@@ -244,6 +253,7 @@ Write-Host "Creating ZIP archive '$ZipPath'..."
 Compress-Archive -Path (Join-Path $StageDir "*") -DestinationPath $ZipPath -CompressionLevel Optimal
 
 $Artifacts = [System.Collections.Generic.List[string]]::new()
+$Artifacts.Add($UpdateZipPath)
 $Artifacts.Add($ZipPath)
 
 # 4. Compile Inno Setup installer if ISCC.exe is available and not -SkipInstaller

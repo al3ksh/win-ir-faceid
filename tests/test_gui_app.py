@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import sys
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +42,14 @@ from engine.gui_app import (  # noqa: E402
 from engine.recognizer import FaceDetection  # noqa: E402
 from engine.store import ProfileStore, ServiceConfig, save_service_config  # noqa: E402
 from engine.ui.generate_app_icon import ICON_SIZES, generate_app_icon  # noqa: E402
+from engine.updater import (  # noqa: E402
+    download_and_verify_update,
+    fetch_latest_release,
+    is_allowed_release_url,
+    launch_elevated_update,
+    parse_sha256sums,
+    safe_extract_zip,
+)
 
 
 def test_app_ico_exists_and_contains_multiresolution_sizes(tmp_path: Path) -> None:
@@ -536,14 +546,13 @@ def test_check_github_latest_release_handles_200_404_and_network_errors(
         ),
     )
     ok_res = check_github_latest_release(current_version="0.1.0")
-    assert ok_res == {
-        "ok": True,
-        "current_version": "0.1.0",
-        "latest_version": "0.2.0",
-        "update_available": True,
-        "release_url": f"{REPO_URL}/releases/tag/v0.2.0",
-        "error": None,
-    }
+    assert ok_res["ok"] is True
+    assert ok_res["current_version"] == "0.1.0"
+    assert ok_res["latest_version"] == "0.2.0"
+    assert ok_res["update_available"] is True
+    assert ok_res["release_url"] == f"{REPO_URL}/releases/tag/v0.2.0"
+    assert ok_res["no_releases"] is False
+    assert ok_res["error"] is None
 
     # HTTP 200 with untrusted html_url falls back to REPO_URL/releases
     monkeypatch.setattr(
@@ -567,15 +576,13 @@ def test_check_github_latest_release_handles_200_404_and_network_errors(
 
     monkeypatch.setattr("engine.gui_app.urllib.request.urlopen", _raise_404)
     not_found = check_github_latest_release(current_version="0.1.0")
-    assert not_found == {
-        "ok": True,
-        "current_version": "0.1.0",
-        "latest_version": "0.1.0",
-        "update_available": False,
-        "release_url": f"{REPO_URL}/releases",
-        "no_releases": True,
-        "error": None,
-    }
+    assert not_found["ok"] is True
+    assert not_found["current_version"] == "0.1.0"
+    assert not_found["latest_version"] == "0.1.0"
+    assert not_found["update_available"] is False
+    assert not_found["release_url"] == f"{REPO_URL}/releases"
+    assert not_found["no_releases"] is True
+    assert not_found["error"] is None
 
     # Network error returns clean failure payload
     def _raise_net(req: object, timeout: float = 4.0) -> object:
@@ -583,14 +590,12 @@ def test_check_github_latest_release_handles_200_404_and_network_errors(
 
     monkeypatch.setattr("engine.gui_app.urllib.request.urlopen", _raise_net)
     err_res = check_github_latest_release(current_version="0.1.0")
-    assert err_res == {
-        "ok": False,
-        "current_version": "0.1.0",
-        "latest_version": "",
-        "update_available": False,
-        "release_url": f"{REPO_URL}/releases",
-        "error": "Unable to reach GitHub.",
-    }
+    assert err_res["ok"] is False
+    assert err_res["current_version"] == "0.1.0"
+    assert err_res["latest_version"] == ""
+    assert err_res["update_available"] is False
+    assert err_res["release_url"] == f"{REPO_URL}/releases"
+    assert err_res["error"] == "Unable to reach GitHub."
 
 
 def test_get_disk_encryption_status_mappings_and_fallback(
@@ -796,3 +801,289 @@ def test_enroll_state_exposes_just_captured_pause_beat(
         assert saw_post_pause_resume is True
     finally:
         ctrl.shutdown()
+
+
+def test_parse_sha256sums_and_is_allowed_release_url() -> None:
+    h1 = "A" * 64
+    h2 = "0123456789abcdef" * 4
+    manifest = (
+        f"# comment\n"
+        f"{h1}  WinIRFaceID-Update-v0.3.0-win64.zip\n"
+        f"{h2} *./SHA256SUMS.txt\n"
+        f"not-a-hash  broken.zip\n\n"
+    )
+    parsed = parse_sha256sums(manifest)
+    assert parsed == {
+        "WinIRFaceID-Update-v0.3.0-win64.zip": "a" * 64,
+        "SHA256SUMS.txt": h2,
+    }
+
+    assert is_allowed_release_url(f"{REPO_URL}/releases/download/v0.3.0/WinIRFaceID-Update-v0.3.0-win64.zip") is True
+    assert is_allowed_release_url("https://objects.githubusercontent.com/github-production-release-asset/foo") is True
+    assert is_allowed_release_url("https://release-assets.githubusercontent.com/github-production-release-asset/bar") is True
+
+    for bad in (
+        "",
+        "http://github.com/al3ksh/win-ir-faceid/releases",
+        "https://github.com/al3ksh/win-ir-faceid-evil/releases",
+        "https://github.com/other/repo/releases",
+        "https://user@github.com/al3ksh/win-ir-faceid/releases",
+        "https://github.com:8443/al3ksh/win-ir-faceid/releases",
+        "https://evil.example/objects.githubusercontent.com/a.zip",
+        "javascript:alert(1)",
+    ):
+        assert is_allowed_release_url(bad) is False
+
+
+def test_safe_extract_zip_valid_and_rejects_traversal_and_symlinks(tmp_path: Path) -> None:
+    good_zip = tmp_path / "good.zip"
+    with zipfile.ZipFile(good_zip, "w") as zf:
+        zf.writestr("engine/__init__.py", "__version__ = '0.3.0'\n")
+        zf.writestr("scripts/apply_update.ps1", "Write-Host 'ok'\n")
+
+    dest_good = tmp_path / "out_good"
+    safe_extract_zip(good_zip, dest_good)
+    assert (dest_good / "engine" / "__init__.py").is_file()
+    assert (dest_good / "scripts" / "apply_update.ps1").is_file()
+
+    for bad_name in ("../evil.txt", "..\\evil.txt", "/abs/evil.txt", "C:\\evil.txt", "sub/../../evil.txt"):
+        bad_zip = tmp_path / "bad.zip"
+        with zipfile.ZipFile(bad_zip, "w") as zf:
+            zf.writestr(bad_name, "pwned")
+        with pytest.raises(ValueError):
+            safe_extract_zip(bad_zip, tmp_path / "out_bad")
+        assert not (tmp_path / "evil.txt").exists()
+
+    symlink_zip = tmp_path / "symlink.zip"
+    with zipfile.ZipFile(symlink_zip, "w") as zf:
+        info = zipfile.ZipInfo("link.txt")
+        info.external_attr = (0o120777 << 16)
+        zf.writestr(info, "/etc/passwd")
+    with pytest.raises(ValueError, match="symlink"):
+        safe_extract_zip(symlink_zip, tmp_path / "out_sym")
+
+
+def test_download_and_verify_update_passes_and_deletes_on_tampered_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_zip = tmp_path / "source.zip"
+    with zipfile.ZipFile(payload_zip, "w") as zf:
+        zf.writestr("engine/__init__.py", '__version__ = "0.3.0"\n')
+        zf.writestr("scripts/apply_update.ps1", "exit 0\n")
+    zip_bytes = payload_zip.read_bytes()
+    valid_hash = hashlib.sha256(zip_bytes).hexdigest()
+
+    zip_name = "WinIRFaceID-Update-v0.3.0-win64.zip"
+    zip_url = f"{REPO_URL}/releases/download/v0.3.0/{zip_name}"
+    sums_url = f"{REPO_URL}/releases/download/v0.3.0/SHA256SUMS.txt"
+
+    class _FakeStreamResp:
+        def __init__(self, data: bytes) -> None:
+            self._bio = io.BytesIO(data)
+            self.headers = {"Content-Length": str(len(data))}
+
+        def read(self, n: int = -1) -> bytes:
+            return self._bio.read(n)
+
+        def __enter__(self) -> _FakeStreamResp:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    sums_body = [f"{valid_hash}  {zip_name}\n".encode("utf-8")]
+
+    def _fake_urlopen(req: urllib.request.Request, timeout: float = 20.0) -> _FakeStreamResp:
+        url = req.full_url
+        if url == sums_url:
+            return _FakeStreamResp(sums_body[0])
+        if url == zip_url:
+            return _FakeStreamResp(zip_bytes)
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr("engine.updater.urllib.request.urlopen", _fake_urlopen)
+
+    progress_events: list[tuple[int, int | None]] = []
+    work_ok = tmp_path / "work_ok"
+    extracted = download_and_verify_update(
+        zip_url,
+        sums_url,
+        zip_name,
+        work_ok,
+        progress_cb=lambda d, t: progress_events.append((d, t)),
+    )
+    assert extracted == work_ok / "extracted"
+    assert (extracted / "scripts" / "apply_update.ps1").is_file()
+    assert progress_events and progress_events[-1] == (len(zip_bytes), len(zip_bytes))
+
+    # Tampered SHA-256 must fail AND delete the downloaded zip
+    sums_body[0] = f"{'0' * 64}  {zip_name}\n".encode("utf-8")
+    work_bad = tmp_path / "work_bad"
+    with pytest.raises(ValueError, match="SHA-256 verification failed"):
+        download_and_verify_update(zip_url, sums_url, zip_name, work_bad)
+    assert not (work_bad / zip_name).exists()
+    assert not (work_bad / "extracted").exists()
+
+
+def test_fetch_latest_release_parses_delta_assets_and_git_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_name = "WinIRFaceID-Update-v0.3.0-win64.zip"
+    zip_url = f"{REPO_URL}/releases/download/v0.3.0/{zip_name}"
+    sums_url = f"{REPO_URL}/releases/download/v0.3.0/SHA256SUMS.txt"
+    long_notes = "  Release highlights\r\n" + ("x" * 2500)
+
+    class _FakeResp:
+        status = 200
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "tag_name": "v0.3.0",
+                    "html_url": f"{REPO_URL}/releases/tag/v0.3.0",
+                    "body": long_notes,
+                    "assets": [
+                        {"name": "WinIRFaceID-Setup-v0.3.0-x64.exe", "browser_download_url": f"{REPO_URL}/releases/download/v0.3.0/setup.exe", "size": 120_000_000},
+                        {"name": zip_name, "browser_download_url": zip_url, "size": 348_160},
+                        {"name": "SHA256SUMS.txt", "browser_download_url": sums_url, "size": 256},
+                    ],
+                }
+            ).encode("utf-8")
+
+        def __enter__(self) -> _FakeResp:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr("engine.updater.urllib.request.urlopen", lambda req, timeout=4.0: _FakeResp())
+
+    install_dir = tmp_path / "installed_app"
+    install_dir.mkdir()
+    res_install = fetch_latest_release(current_version="0.2.3", app_root=install_dir)
+    assert res_install["ok"] is True
+    assert res_install["update_available"] is True
+    assert res_install["update_asset"] == {"name": zip_name, "url": zip_url, "size": 348_160}
+    assert res_install["checksums_url"] == sums_url
+    assert res_install["is_git_checkout"] is False
+    assert res_install["can_auto_update"] is True
+    assert len(res_install["release_notes"]) <= 2000
+    assert res_install["release_notes"].startswith("Release highlights")
+
+    git_dir = tmp_path / "git_repo"
+    (git_dir / ".git").mkdir(parents=True)
+    res_git = fetch_latest_release(current_version="0.2.3", app_root=git_dir)
+    assert res_git["is_git_checkout"] is True
+    assert res_git["can_auto_update"] is False
+
+
+def test_git_checkout_guard_and_controller_install_update(tmp_path: Path) -> None:
+    extracted = tmp_path / "extracted"
+    (extracted / "scripts").mkdir(parents=True)
+    (extracted / "scripts" / "apply_update.ps1").write_text("exit 0\n", encoding="utf-8")
+
+    git_target = tmp_path / "dev_repo"
+    (git_target / ".git").mkdir(parents=True)
+    called_shell: list[object] = []
+    guard_res = launch_elevated_update(
+        extracted,
+        git_target,
+        tmp_path / "cleanup",
+        1234,
+        shell_execute=lambda *args: called_shell.append(args) or 42,
+    )
+    assert guard_res["ok"] is False
+    assert "git checkout" in str(guard_res["error"]).lower()
+    assert called_shell == []
+
+    # Controller refuses install_update inside a git checkout
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    store = ProfileStore(tmp_path / "profiles.enc")
+    dl_mock = MagicMock()
+    launch_mock = MagicMock()
+    ctrl_git = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        app_root=git_target,
+        camera_discoverer=lambda: [],
+        service_status_provider=lambda: "not_installed",
+        update_checker=lambda: {
+            "ok": True,
+            "current_version": "0.2.3",
+            "latest_version": "0.3.0",
+            "update_available": True,
+            "release_url": f"{REPO_URL}/releases/tag/v0.3.0",
+            "release_notes": "Notes",
+            "update_asset": {"name": "WinIRFaceID-Update-v0.3.0-win64.zip", "url": f"{REPO_URL}/releases/download/v0.3.0/WinIRFaceID-Update-v0.3.0-win64.zip", "size": 340000},
+            "checksums_url": f"{REPO_URL}/releases/download/v0.3.0/SHA256SUMS.txt",
+            "can_auto_update": True,
+            "is_git_checkout": False,
+            "no_releases": False,
+            "error": None,
+        },
+        update_downloader=dl_mock,
+        update_launcher=launch_mock,
+        auto_start_server=False,
+    )
+    try:
+        refused = ctrl_git.install_update()
+        assert refused["ok"] is False
+        assert "git checkout" in refused["error"].lower()
+        dl_mock.assert_not_called()
+        launch_mock.assert_not_called()
+    finally:
+        ctrl_git.shutdown()
+
+    # Non-git install dir succeeds and schedules close_callback
+    prod_target = tmp_path / "prod_install"
+    prod_target.mkdir()
+    closed_event = []
+    ctrl_prod = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        app_root=prod_target,
+        camera_discoverer=lambda: [],
+        service_status_provider=lambda: "not_installed",
+        update_checker=lambda: {
+            "ok": True,
+            "current_version": "0.2.3",
+            "latest_version": "0.3.0",
+            "update_available": True,
+            "release_url": f"{REPO_URL}/releases/tag/v0.3.0",
+            "release_notes": "Notes",
+            "update_asset": {"name": "WinIRFaceID-Update-v0.3.0-win64.zip", "url": f"{REPO_URL}/releases/download/v0.3.0/WinIRFaceID-Update-v0.3.0-win64.zip", "size": 340000},
+            "checksums_url": f"{REPO_URL}/releases/download/v0.3.0/SHA256SUMS.txt",
+            "can_auto_update": True,
+            "is_git_checkout": False,
+            "no_releases": False,
+            "error": None,
+        },
+        update_downloader=lambda *_a, **_kw: extracted,
+        update_launcher=lambda *_a, **_kw: {"ok": True, "code": 42, "error": None},
+        auto_start_server=False,
+    )
+    bridge = _JsApiBridge(ctrl_prod)
+    try:
+        ctrl_prod.set_close_callback(lambda: closed_event.append(True))
+        start_res = bridge.install_update()
+        assert start_res["ok"] is True
+        assert start_res["started"] is True
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if closed_event and ctrl_prod.get_state()["update"]["ready_to_close"] is True:
+                break
+            time.sleep(0.02)
+
+        upd_st = ctrl_prod.get_state()["update"]
+        assert upd_st["active"] is False
+        assert upd_st["ready_to_close"] is True
+        assert upd_st["error"] is None
+        assert closed_event == [True]
+    finally:
+        ctrl_prod.shutdown()

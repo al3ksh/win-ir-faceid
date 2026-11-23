@@ -23,7 +23,7 @@ After Microsoft's **CVE-2025-26644** mitigation on Windows 11, native Windows He
 
 WinIRFaceID is designed to be auditable, isolated, and safe to run on a daily-driver Windows 11 machine.
 
-- **100% Local & Offline:** No cloud services and no telemetry. The release installer bundles its own Python runtime, all dependency wheels, and the two OpenCV Zoo ONNX models (`YuNet` + `SFace`, SHA-256 pinned), so installing needs no network access at all. The only outbound call is the GitHub update check, and it runs only when you click it.
+- **100% Local & Offline:** No cloud services and no telemetry. The release installer bundles its own Python runtime, all dependency wheels, and the two OpenCV Zoo ONNX models (`YuNet` + `SFace`, SHA-256 pinned), so installing needs no network access at all. The only outbound call is checking GitHub Releases for lightweight (~350 KB) SHA-256-verified delta updates (on startup or via the version pill).
 - **Strict IR-Only Pipeline:** Enrollment and verification refuse non-IR cameras and never fall back to an RGB webcam.
 - **Multi-Layer Physical 3D IR Anti-Spoofing:**
   1. **Active IR Illuminator Delta (`IR - Ambient`):** Subtracts ambient dark frames from LED-illuminated frames. OLED and LCD phone or tablet screens emit visible light rather than reflected 850nm IR, yielding near-zero delta and immediate rejection.
@@ -48,7 +48,7 @@ WinIRFaceID is designed to be auditable, isolated, and safe to run on a daily-dr
 - **Local & Microsoft Account Support:** Works with local Windows accounts (`Domain = .`) and Microsoft Accounts (`MicrosoftAccount\...` resolved automatically from your Windows account password).
 - **Guided Enrollment:** Enrollment walks you through 7 head poses (center, left, right, relaxed, chin up, chin down, back to center) with an animated pose guide and a hold-still ring; a sample is only captured after your face has been steady and live for a moment.
 - **Alternate Appearances (Glasses, Beard, Lighting):** Clicking **Add Appearance** enrolls another look (7 more IR captures, up to 32 samples per user) so recognition stays reliable both with and without prescription glasses. Each look is listed under **Account** with its date and can be deleted individually. *(Near-IR passes through most clear prescription lenses; IR-blocking sunglasses will block 850nm light.)*
-- **Minimalist Edge WebView2 Desktop App:** Keeps the IR camera and flood LED on standby until you actively start enrollment, live testing, or preview. Includes live SVG corner-bracket face tracking, a collapsible monospace IR diagnostics strip (`IR Δ`, `BG`, `3D`, `Eyes`), and live match scores. Security settings (match strictness 0.60–0.80, liveness options) apply to the service immediately — no restart needed.
+- **Minimalist Edge WebView2 Desktop App:** Keeps the IR camera and flood LED on standby until you actively start enrollment, live testing, or preview. Includes live SVG corner-bracket face tracking, a collapsible monospace IR diagnostics strip (`IR Δ`, `BG`, `3D`, `Eyes`), live match scores, and 1-click SHA-256-verified delta updates (~350 KB) from GitHub Releases. Security settings (match strictness 0.60–0.80, liveness options) apply to the service immediately — no restart needed.
 
 <details>
 <summary>Screenshot: Local-only DPAPI Logon Password modal</summary>

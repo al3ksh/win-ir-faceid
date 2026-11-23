@@ -112,6 +112,21 @@
     pwInput: $("pwInput"),
     pwConfirmInput: $("pwConfirmInput"),
     pwModalError: $("pwModalError"),
+
+    updateModal: $("updateModal"),
+    btnUpdateClose: $("btnUpdateClose"),
+    updateVersionLine: $("updateVersionLine"),
+    updateMetaLine: $("updateMetaLine"),
+    updateNotesBox: $("updateNotesBox"),
+    updateNotesList: $("updateNotesList"),
+    updateProgressRow: $("updateProgressRow"),
+    updateProgressLabel: $("updateProgressLabel"),
+    updateProgressPct: $("updateProgressPct"),
+    updateProgressFill: $("updateProgressFill"),
+    updateModalError: $("updateModalError"),
+    btnUpdateLater: $("btnUpdateLater"),
+    btnUpdateGithub: $("btnUpdateGithub"),
+    btnUpdateInstall: $("btnUpdateInstall"),
   };
 
   const state = {
@@ -138,7 +153,7 @@
     startupNoIrDismissed: false,
     currentErrorInfo: null,
     isRescanning: false,
-    updateReleaseUrl: "",
+    updateInfo: null,
     testScores: [],
     lastMatchSeq: 0,
     wasTesting: false,
@@ -1048,11 +1063,16 @@
     }
     state.wasDownloading = Boolean(dl.active);
 
+    const upd = live.update || {};
+    if (isUpdateModalOpen()) {
+      renderUpdateProgress(upd);
+    }
+
     if (live.error && !live.error_info) {
       showFeedback(live.error, "error", 6000);
     }
 
-    scheduleNextPoll(active || Boolean(dl.active));
+    scheduleNextPoll(active || Boolean(dl.active) || Boolean(upd.active));
   }
 
   function scheduleNextPoll(fast) {
@@ -1177,6 +1197,125 @@
     els.pwModalError.classList.add("hidden");
     els.passwordModal.dataset.open = "false";
     els.passwordModal.setAttribute("aria-hidden", "true");
+  }
+
+  function formatAssetSize(bytes) {
+    const n = Number(bytes);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    if (n < 1024 * 1024) {
+      return `${Math.max(1, Math.round(n / 1024))} KB`;
+    }
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function isUpdateModalOpen() {
+    return Boolean(els.updateModal && els.updateModal.dataset.open === "true");
+  }
+
+  function renderUpdateNotes(notesText) {
+    if (!els.updateNotesBox || !els.updateNotesList) return;
+    els.updateNotesList.textContent = "";
+    const raw = typeof notesText === "string" ? notesText.trim() : "";
+    if (!raw) {
+      els.updateNotesBox.classList.add("hidden");
+      return;
+    }
+    const lines = raw.split(/\r?\n/);
+    let appended = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const p = document.createElement("p");
+      const isHeading = trimmed.startsWith("#");
+      p.className = isHeading ? "update-note-line update-note-heading" : "update-note-line";
+      p.textContent = isHeading ? trimmed.replace(/^#{1,6}\s+/, "") : trimmed;
+      els.updateNotesList.appendChild(p);
+      appended += 1;
+    }
+    els.updateNotesBox.classList.toggle("hidden", appended === 0);
+  }
+
+  function renderUpdateProgress(upd) {
+    if (!els.updateProgressRow || !els.btnUpdateInstall) return;
+    const stateObj = upd || {};
+    const stage = stateObj.stage || "idle";
+    const isWorking = Boolean(stateObj.active) || stage === "launching";
+
+    if (isWorking) {
+      els.updateProgressRow.classList.remove("hidden");
+      els.updateModalError.classList.add("hidden");
+      els.btnUpdateInstall.disabled = true;
+      els.btnUpdateInstall.textContent = "Installing...";
+
+      const stageLabels = {
+        downloading: "Downloading delta package...",
+        verifying: "Verifying SHA-256 checksum...",
+        extracting: "Extracting package...",
+        launching: "Launching elevated updater...",
+      };
+      els.updateProgressLabel.textContent = stageLabels[stage] || "Preparing update...";
+
+      let pct = 0;
+      if (stage === "verifying" || stage === "extracting" || stage === "launching") {
+        pct = 100;
+      } else if (stateObj.total && stateObj.total > 0) {
+        pct = Math.min(100, Math.round((Number(stateObj.downloaded || 0) / Number(stateObj.total)) * 100));
+      }
+      els.updateProgressPct.textContent = `${pct}%`;
+      els.updateProgressFill.style.width = `${pct}%`;
+      return;
+    }
+
+    els.updateProgressRow.classList.add("hidden");
+    els.btnUpdateInstall.disabled = false;
+    els.btnUpdateInstall.textContent = "Install Update";
+
+    if (stage === "error" && stateObj.error) {
+      els.updateModalError.textContent = stateObj.error;
+      els.updateModalError.classList.remove("hidden");
+    }
+  }
+
+  function applyUpdateBadge(info) {
+    state.updateInfo = info;
+    if (!els.btnVersion || !info || !info.latest_version) return;
+    els.btnVersion.textContent = `Update v${info.latest_version}`;
+    els.btnVersion.dataset.state = "update";
+    els.btnVersion.title = "View update details";
+  }
+
+  function openUpdateModal(info) {
+    if (!els.updateModal || !info) return;
+    closeCameraDropdown(false);
+    const current = info.current_version || (state.bootstrap && state.bootstrap.version) || "0.2.3";
+    const latest = info.latest_version || current;
+    els.updateVersionLine.textContent = `v${current} -> v${latest}`;
+
+    if (info.can_auto_update) {
+      const sizeStr = formatAssetSize(info.update_asset && info.update_asset.size);
+      els.updateMetaLine.textContent = sizeStr
+        ? `Delta update \u00b7 ${sizeStr} \u00b7 SHA-256 verified`
+        : "Delta update \u00b7 SHA-256 verified";
+    } else if (info.is_git_checkout) {
+      els.updateMetaLine.textContent = "Git checkout detected \u2014 update via git pull";
+    } else {
+      els.updateMetaLine.textContent = "Full release on GitHub";
+    }
+
+    renderUpdateNotes(info.release_notes || "");
+    els.btnUpdateInstall.classList.toggle("hidden", !info.can_auto_update);
+    els.updateModalError.textContent = "";
+    els.updateModalError.classList.add("hidden");
+    renderUpdateProgress(state.live && state.live.update);
+
+    els.updateModal.dataset.open = "true";
+    els.updateModal.setAttribute("aria-hidden", "false");
+  }
+
+  function closeUpdateModal() {
+    if (!els.updateModal) return;
+    els.updateModal.dataset.open = "false";
+    els.updateModal.setAttribute("aria-hidden", "true");
   }
 
   async function runEnrollAction(user, append) {
@@ -1367,6 +1506,10 @@
 
     document.addEventListener("keydown", (ev) => {
       if (ev.key === "Escape") {
+        if (isUpdateModalOpen()) {
+          closeUpdateModal();
+          return;
+        }
         if (isPasswordModalOpen()) {
           closePasswordModal();
           return;
@@ -1558,30 +1701,20 @@
       els.btnVersion.addEventListener("click", async () => {
         const a = api();
         if (!a) return;
-        if (state.updateReleaseUrl) {
-          const openRes = await a.open_external_url(state.updateReleaseUrl);
-          if (openRes && !openRes.ok && openRes.error) {
-            showFeedback(openRes.error, "warn");
-          }
+        if (state.updateInfo && state.updateInfo.update_available) {
+          openUpdateModal(state.updateInfo);
           return;
         }
         if (typeof a.check_for_updates !== "function") return;
 
-        const current = (state.bootstrap && state.bootstrap.version) || "0.1.0";
+        const current = (state.bootstrap && state.bootstrap.version) || "0.2.3";
         els.btnVersion.disabled = true;
         els.btnVersion.textContent = "Checking...";
         try {
           const res = await a.check_for_updates();
           if (res && res.ok && res.update_available) {
-            els.btnVersion.textContent = `Update v${res.latest_version}`;
-            els.btnVersion.dataset.state = "update";
-            els.btnVersion.title = "Open GitHub release page";
-            state.updateReleaseUrl = res.release_url || "";
-            showFeedback(
-              `Update available: v${res.latest_version} (click badge to download).`,
-              "ok",
-              6000
-            );
+            applyUpdateBadge(res);
+            openUpdateModal(res);
           } else if (res && res.ok && res.no_releases) {
             els.btnVersion.textContent = `v${current}`;
             showFeedback("No GitHub releases published yet.", "neutral");
@@ -1597,6 +1730,58 @@
           showFeedback("Unable to check for updates.", "warn");
         } finally {
           els.btnVersion.disabled = false;
+        }
+      });
+    }
+
+    if (els.btnUpdateClose) {
+      els.btnUpdateClose.addEventListener("click", closeUpdateModal);
+    }
+    if (els.btnUpdateLater) {
+      els.btnUpdateLater.addEventListener("click", closeUpdateModal);
+    }
+    if (els.updateModal) {
+      els.updateModal.addEventListener("click", (ev) => {
+        if (ev.target === els.updateModal) closeUpdateModal();
+      });
+    }
+    if (els.btnUpdateGithub) {
+      els.btnUpdateGithub.addEventListener("click", async () => {
+        const a = api();
+        if (!a || typeof a.open_external_url !== "function") return;
+        const url = (state.updateInfo && state.updateInfo.release_url) || null;
+        const res = await a.open_external_url(url);
+        if (res && !res.ok && res.error) {
+          els.updateModalError.textContent = res.error;
+          els.updateModalError.classList.remove("hidden");
+        }
+      });
+    }
+    if (els.btnUpdateInstall) {
+      els.btnUpdateInstall.addEventListener("click", async () => {
+        const a = api();
+        if (!a || typeof a.install_update !== "function") return;
+        els.updateModalError.classList.add("hidden");
+        els.btnUpdateInstall.disabled = true;
+        els.btnUpdateInstall.textContent = "Starting...";
+        try {
+          const res = await a.install_update();
+          if (res && res.state) {
+            renderLiveState(res.state);
+          }
+          if (res && res.started) {
+            pollLiveState();
+          } else if (res && !res.ok) {
+            els.updateModalError.textContent = res.error || "Unable to install update.";
+            els.updateModalError.classList.remove("hidden");
+            els.btnUpdateInstall.disabled = false;
+            els.btnUpdateInstall.textContent = "Install Update";
+          }
+        } catch (_err) {
+          els.updateModalError.textContent = "Unable to install update.";
+          els.updateModalError.classList.remove("hidden");
+          els.btnUpdateInstall.disabled = false;
+          els.btnUpdateInstall.textContent = "Install Update";
         }
       });
     }
@@ -1651,6 +1836,20 @@
         // Ignore
       }
     }, 8000);
+
+    // Silent, non-blocking startup update check (never shows errors when offline).
+    setTimeout(async () => {
+      const currApi = api();
+      if (!currApi || typeof currApi.check_for_updates !== "function") return;
+      try {
+        const res = await currApi.check_for_updates();
+        if (res && res.ok && res.update_available) {
+          applyUpdateBadge(res);
+        }
+      } catch (_err) {
+        // Ignore silent startup check failures
+      }
+    }, 1200);
   }
 
   init().catch((err) => {

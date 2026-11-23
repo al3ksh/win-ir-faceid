@@ -75,6 +75,7 @@ jobs:
           path: |
             dist/WinIRFaceID-Setup-v*.exe
             dist/WinIRFaceID-v*-win64.zip
+            dist/WinIRFaceID-Update-v*.zip
             dist/SHA256SUMS.txt
 
       - name: Publish GitHub Release
@@ -85,4 +86,5 @@ jobs:
           files: |
             dist/WinIRFaceID-Setup-v*.exe
             dist/WinIRFaceID-v*-win64.zip
+            dist/WinIRFaceID-Update-v*.zip
             dist/SHA256SUMS.txt

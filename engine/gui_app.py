@@ -8,8 +8,9 @@ import json
 import logging
 import mimetypes
 import os
-import re
 import secrets
+import shutil
+import tempfile
 import threading
 import time
 import urllib.error
@@ -51,6 +52,13 @@ from engine.service_client import (
     ServiceProfileClient,
     ServiceRequestError,
     ServiceUnavailableError,
+)
+from engine.updater import (
+    download_and_verify_update,
+    fetch_latest_release,
+    is_newer_version,
+    launch_elevated_update,
+    parse_semver,
 )
 
 logger = logging.getLogger(__name__)
@@ -135,124 +143,18 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
 
 
-_SEMVER_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
-
-
-def parse_semver(version_str: str) -> tuple[int, int, int] | None:
-    """Parse a semantic version string (e.g. 'v0.1.0', '1.0.0-rc1') into (major, minor, patch)."""
-    if not isinstance(version_str, str):
-        return None
-    cleaned = version_str.strip()
-    if not cleaned:
-        return None
-    match = _SEMVER_RE.fullmatch(cleaned)
-    if match is None:
-        return None
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-
-
-def is_newer_version(latest: str, current: str) -> bool:
-    """Return True if *latest* represents a strictly newer semantic version than *current*."""
-    latest_tuple = parse_semver(latest)
-    current_tuple = parse_semver(current)
-    if latest_tuple is None or current_tuple is None:
-        return False
-    return latest_tuple > current_tuple
-
-
 def check_github_latest_release(
     current_version: str = __version__,
     api_url: str = RELEASES_API_URL,
     timeout: float = 4.0,
 ) -> dict[str, Any]:
-    """Query GitHub Releases API once on explicit user action for a newer release."""
-    fallback_url = f"{REPO_URL}/releases"
-    req = urllib.request.Request(
-        api_url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": f"WinIRFaceID/{current_version}",
-        },
+    """Query GitHub Releases API for the latest release and delta update metadata."""
+    return fetch_latest_release(
+        current_version=current_version,
+        api_url=api_url,
+        timeout=timeout,
+        urlopen_fn=urllib.request.urlopen,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = getattr(resp, "status", 200)
-            if status == 404:
-                return {
-                    "ok": True,
-                    "current_version": current_version,
-                    "latest_version": current_version,
-                    "update_available": False,
-                    "release_url": fallback_url,
-                    "no_releases": True,
-                    "error": None,
-                }
-            if status is not None and status >= 400:
-                return {
-                    "ok": False,
-                    "current_version": current_version,
-                    "latest_version": "",
-                    "update_available": False,
-                    "release_url": fallback_url,
-                    "error": "Unable to reach GitHub.",
-                }
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return {
-                "ok": True,
-                "current_version": current_version,
-                "latest_version": current_version,
-                "update_available": False,
-                "release_url": fallback_url,
-                "no_releases": True,
-                "error": None,
-            }
-        return {
-            "ok": False,
-            "current_version": current_version,
-            "latest_version": "",
-            "update_available": False,
-            "release_url": fallback_url,
-            "error": "Unable to reach GitHub.",
-        }
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError):
-        return {
-            "ok": False,
-            "current_version": current_version,
-            "latest_version": "",
-            "update_available": False,
-            "release_url": fallback_url,
-            "error": "Unable to reach GitHub.",
-        }
-
-    if not isinstance(payload, dict):
-        return {
-            "ok": False,
-            "current_version": current_version,
-            "latest_version": "",
-            "update_available": False,
-            "release_url": fallback_url,
-            "error": "Unable to reach GitHub.",
-        }
-
-    raw_tag = str(payload.get("tag_name") or "").strip()
-    latest_clean = raw_tag[1:] if raw_tag.startswith(("v", "V")) else raw_tag
-    raw_html_url = str(payload.get("html_url") or "").strip()
-    safe_url = (
-        raw_html_url
-        if (raw_html_url == REPO_URL or raw_html_url.startswith(f"{REPO_URL}/"))
-        else fallback_url
-    )
-    update_available = is_newer_version(latest_clean, current_version)
-    return {
-        "ok": True,
-        "current_version": current_version,
-        "latest_version": latest_clean,
-        "update_available": update_available,
-        "release_url": safe_url,
-        "error": None,
-    }
 
 
 _ERROR_CLASSIFIERS: tuple[tuple[str, tuple[str, ...], str, list[str]], ...] = (
@@ -788,6 +690,9 @@ class WinIRFaceIDController:
         service_restarter: Callable[[], dict[str, Any]] | None = None,
         url_opener: Callable[[str], Any] | None = None,
         update_checker: Callable[[], dict[str, Any]] | None = None,
+        update_downloader: Callable[..., Path] | None = None,
+        update_launcher: Callable[..., dict[str, Any]] | None = None,
+        app_root: Path | str | None = None,
         disk_encryption_provider: Callable[[], dict[str, Any]] | None = None,
         settings_opener: Callable[[str], Any] | None = None,
         auto_start_server: bool = True,
@@ -798,6 +703,7 @@ class WinIRFaceIDController:
         self._service_config = config_path is None and hasattr(self._store, "load_config")
         self._models_dir = Path(models_dir) if models_dir is not None else None
         self._ui_dir = Path(ui_dir) if ui_dir is not None else (Path(__file__).resolve().parent / "ui")
+        self._app_root = Path(app_root) if app_root is not None else Path(__file__).resolve().parent.parent
         self._camera_discoverer = camera_discoverer
         self._worker_factory = worker_factory
         self._recognizer_factory = recognizer_factory
@@ -805,8 +711,11 @@ class WinIRFaceIDController:
         self._service_restarter = service_restarter or restart_service_uac
         self._url_opener = url_opener or webbrowser.open
         self._update_checker = update_checker or check_github_latest_release
+        self._update_downloader = update_downloader or download_and_verify_update
+        self._update_launcher = update_launcher or launch_elevated_update
         self._disk_encryption_provider = disk_encryption_provider or get_disk_encryption_status
         self._settings_opener = settings_opener
+        self._close_callback: Callable[[], None] | None = None
 
         self._lock = threading.RLock()
         self._frame_cond = threading.Condition()
@@ -854,6 +763,15 @@ class WinIRFaceIDController:
             "downloaded": 0,
             "total": None,
             "error": None,
+        }
+        self._latest_release: dict[str, Any] | None = None
+        self._update_state: dict[str, Any] = {
+            "active": False,
+            "stage": "idle",
+            "downloaded": 0,
+            "total": None,
+            "error": None,
+            "ready_to_close": False,
         }
 
         self._state: dict[str, Any] = self._build_standby_state()
@@ -1535,6 +1453,7 @@ class WinIRFaceIDController:
             snap = json.loads(json.dumps(self._state))
             snap["models_ready"] = self._models_ready()
             snap["download"] = dict(self._download_state)
+            snap["update"] = dict(self._update_state)
             snap["config_dirty"] = self._config_dirty
             return snap
 
@@ -1953,9 +1872,151 @@ class WinIRFaceIDController:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "url": target, "error": None}
 
+    def set_close_callback(self, callback: Callable[[], None] | None) -> None:
+        """Register the window close callback invoked after launching an elevated update."""
+        with self._lock:
+            self._close_callback = callback
+
     def check_for_updates(self) -> dict[str, Any]:
-        """Manually check GitHub Releases for a newer version on user demand."""
-        return dict(self._update_checker())
+        """Check GitHub Releases for a newer version and cache release metadata."""
+        res = dict(self._update_checker())
+        with self._lock:
+            if res.get("ok"):
+                self._latest_release = dict(res)
+        return res
+
+    def install_update(self) -> dict[str, Any]:
+        """Download, SHA-256 verify, extract, and launch the elevated delta update installer."""
+        with self._lock:
+            if self._update_state["active"]:
+                return {"ok": True, "started": False, "state": self.get_state()}
+            cached = dict(self._latest_release) if self._latest_release is not None else None
+
+        rel = cached if cached is not None else self.check_for_updates()
+        if not rel.get("ok"):
+            return {
+                "ok": False,
+                "started": False,
+                "error": rel.get("error") or "Unable to reach GitHub.",
+                "state": self.get_state(),
+            }
+        if not rel.get("update_available"):
+            return {
+                "ok": False,
+                "started": False,
+                "error": "No update is currently available.",
+                "state": self.get_state(),
+            }
+        if rel.get("is_git_checkout") or (self._app_root / ".git").exists():
+            return {
+                "ok": False,
+                "started": False,
+                "error": "Cannot overwrite a git checkout. Update with git pull instead.",
+                "state": self.get_state(),
+            }
+
+        asset = rel.get("update_asset")
+        checksums_url = rel.get("checksums_url")
+        if (
+            not rel.get("can_auto_update")
+            or not isinstance(asset, dict)
+            or not asset.get("url")
+            or not asset.get("name")
+            or not checksums_url
+        ):
+            return {
+                "ok": False,
+                "started": False,
+                "error": "Delta update package is unavailable for this release.",
+                "state": self.get_state(),
+            }
+
+        zip_url = str(asset["url"])
+        zip_name = str(asset["name"])
+        total_bytes = int(asset.get("size") or 0) or None
+
+        with self._lock:
+            if self._update_state["active"]:
+                return {"ok": True, "started": False, "state": self.get_state()}
+            self._update_state = {
+                "active": True,
+                "stage": "downloading",
+                "downloaded": 0,
+                "total": total_bytes,
+                "error": None,
+                "ready_to_close": False,
+            }
+
+        def _on_progress(downloaded: int, total: int | None) -> None:
+            with self._lock:
+                self._update_state["downloaded"] = int(downloaded)
+                if total is not None and total > 0:
+                    self._update_state["total"] = int(total)
+
+        def _on_stage(stage: str) -> None:
+            with self._lock:
+                self._update_state["stage"] = stage
+
+        def _worker() -> None:
+            work_dir = Path(tempfile.mkdtemp(prefix="winirfaceid-update-"))
+            try:
+                if self._update_downloader is download_and_verify_update:
+                    extracted_dir = self._update_downloader(
+                        zip_url,
+                        str(checksums_url),
+                        zip_name,
+                        work_dir,
+                        progress_cb=_on_progress,
+                        stage_cb=_on_stage,
+                    )
+                else:
+                    extracted_dir = self._update_downloader(
+                        zip_url,
+                        str(checksums_url),
+                        zip_name,
+                        work_dir,
+                        progress_cb=_on_progress,
+                    )
+
+                with self._lock:
+                    self._update_state["stage"] = "launching"
+
+                self._stop_camera_and_loop()
+                launch_res = self._update_launcher(
+                    extracted_dir,
+                    self._app_root,
+                    work_dir,
+                    os.getpid(),
+                )
+                if not launch_res.get("ok"):
+                    raise RuntimeError(launch_res.get("error") or "Failed to launch updater.")
+
+                with self._lock:
+                    self._update_state["active"] = False
+                    self._update_state["stage"] = "launching"
+                    self._update_state["error"] = None
+                    self._update_state["ready_to_close"] = True
+                    close_cb = self._close_callback
+
+                if close_cb is not None:
+                    def _close_window() -> None:
+                        try:
+                            close_cb()
+                        except Exception:  # noqa: BLE001
+                            logger.debug("Window close callback skipped after update launch.")
+
+                    threading.Timer(0.25, _close_window).start()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Delta update failed: %s", exc)
+                shutil.rmtree(work_dir, ignore_errors=True)
+                with self._lock:
+                    self._update_state["active"] = False
+                    self._update_state["stage"] = "error"
+                    self._update_state["error"] = str(exc) or "Update failed."
+                    self._update_state["ready_to_close"] = False
+
+        threading.Thread(target=_worker, name="WinIRFaceID-Update", daemon=True).start()
+        return {"ok": True, "started": True, "state": self.get_state()}
 
     def shutdown(self) -> None:
         """Stop camera worker, processing loop, and loopback HTTP server cleanly."""
@@ -2054,6 +2115,9 @@ class _JsApiBridge:
     def check_for_updates(self) -> dict[str, Any]:
         return self._ctrl.check_for_updates()
 
+    def install_update(self) -> dict[str, Any]:
+        return self._ctrl.install_update()
+
     def shutdown(self) -> None:
         self._ctrl.shutdown()
 
@@ -2096,6 +2160,7 @@ def main() -> None:
         controller.shutdown()
 
     if window is not None:
+        controller.set_close_callback(window.destroy)
         window.events.shown += _on_shown
         window.events.closed += _on_closed
 

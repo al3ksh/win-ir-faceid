@@ -491,6 +491,49 @@
     </div>
   </div>
 
+  <!-- Minimalist Delta Update Modal -->
+  <div class="modal-backdrop" id="updateModal" role="dialog" aria-modal="true" aria-labelledby="updateModalTitle" data-open="false" aria-hidden="true">
+    <div class="modal-sheet modal-sheet-wide">
+      <div class="modal-header">
+        <h3 class="modal-title" id="updateModalTitle">Update available</h3>
+        <button class="modal-close" id="btnUpdateClose" type="button" aria-label="Close">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 4l8 8M12 4l-8 8"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="update-version-row">
+        <span class="update-version-line tabular" id="updateVersionLine">v0.2.3 -> v0.3.0</span>
+        <span class="update-meta-line tabular" id="updateMetaLine"></span>
+      </div>
+
+      <div class="update-notes-box hidden" id="updateNotesBox">
+        <div class="update-notes-list" id="updateNotesList"></div>
+      </div>
+
+      <div class="update-progress-row hidden" id="updateProgressRow">
+        <div class="update-progress-header">
+          <span class="update-progress-label" id="updateProgressLabel">Downloading update...</span>
+          <span class="update-progress-pct tabular" id="updateProgressPct">0%</span>
+        </div>
+        <div class="update-progress-track">
+          <div class="update-progress-fill" id="updateProgressFill"></div>
+        </div>
+      </div>
+
+      <div class="modal-error hidden" id="updateModalError"></div>
+
+      <div class="modal-actions update-modal-actions">
+        <button class="btn-ghost" id="btnUpdateLater" type="button">Later</button>
+        <div class="update-actions-right">
+          <button class="btn-secondary" id="btnUpdateGithub" type="button">View on GitHub</button>
+          <button class="btn-primary" id="btnUpdateInstall" type="button">Install Update</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="/app.js"></script>
 </body>
 </html>

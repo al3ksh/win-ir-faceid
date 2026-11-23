@@ -2035,6 +2035,106 @@ input::-ms-clear {
   margin-top: 4px;
 }
 
+/* Delta Update Modal */
+.modal-sheet-wide {
+  max-width: 440px;
+}
+
+.update-version-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.update-version-line {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.update-meta-line {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.update-notes-box {
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-canvas);
+  padding: 10px 12px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.update-notes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  user-select: text;
+}
+
+.update-note-line {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.update-note-heading {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.update-progress-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.update-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.update-progress-label {
+  color: var(--text-secondary);
+}
+
+.update-progress-pct {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.update-progress-track {
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.update-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--emerald);
+  transition: width 160ms var(--ease-fluid);
+}
+
+.update-modal-actions {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.update-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 /* Reduced Motion Accessibility */
 @media (prefers-reduced-motion: reduce) {
   .app-header,
@@ -2102,7 +2202,8 @@ input::-ms-clear {
   .switch-track,
   .switch-track::after,
   .dropdown-chevron,
-  .dropdown-check {
+  .dropdown-check,
+  .update-progress-fill {
     transition-duration: 120ms !important;
   }
 
