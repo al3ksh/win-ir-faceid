@@ -24,11 +24,11 @@ constexpr wchar_t kStatusServiceOffline[] = L"Face ID service offline - use Fing
 constexpr wchar_t kStatusNoPassword[] = L"Face recognized, but no saved credential - use Fingerprint or PIN";
 constexpr wchar_t kStatusSignInFailed[] = L"Sign-in failed - use Fingerprint or PIN";
 
-constexpr DWORD kEnterFrameMs = 45;
-constexpr DWORD kScanFrameMs = 70;
-constexpr DWORD kUnlockFrameMs = 45;
-constexpr DWORD kFailFrameMs = 50;
-constexpr DWORD kUnlockPreviewWaitMs = 280;
+constexpr DWORD kEnterFrameMs = 25;
+constexpr DWORD kScanFrameMs = 28;
+constexpr DWORD kUnlockFrameMs = 25;
+constexpr DWORD kFailFrameMs = 25;
+constexpr DWORD kUnlockPreviewWaitMs = 300;
 
 std::wstring GetLocalComputerNetbiosName()
 {
@@ -1420,8 +1420,10 @@ void WinIRFaceIDCredential::RunAnimation()
 
         const AnimSequenceSpec spec = getSpec(activeState);
 
+        ULONGLONG frameStart = 0;
         if (!settled)
         {
+            frameStart = GetTickCount64();
             PushHeroFrame(spec.baseResId + frameIdx);
         }
 
@@ -1430,7 +1432,11 @@ void WinIRFaceIDCredential::RunAnimation()
         {
             if (spec.loop || (frameIdx + 1 < spec.frameCount) || spec.advanceToScanning)
             {
-                waitMs = spec.frameDelayMs;
+                // Compensate for PNG decode/push overhead inside LogonUI.exe to maintain steady ~32 FPS pacing.
+                const ULONGLONG elapsed = GetTickCount64() - frameStart;
+                waitMs = (elapsed < spec.frameDelayMs)
+                             ? static_cast<DWORD>(spec.frameDelayMs - elapsed)
+                             : 1;
             }
             else
             {

@@ -146,11 +146,11 @@ def _render_face_alpha(
     )
 
     if frown:
-        # Frown circular arc centered at (256, 360) radius 56 (top apex y=304, stroke top 295)
-        # leaving a clean ~21.5px gap below the nose at 512px (~5.4px at 128px).
+        # Softer, wider gentle frown arc centered at (256, 378) radius 72 (top apex y=306,
+        # stroke top 297), leaving a ~23.5px gap below the nose at 512px (~5.9px at 128px).
         dist = np.minimum(
             dist,
-            _sd_arc(x_grid, y_grid, 256.0 + ox, 360.0 + oy, 56.0, 225.0, 315.0) - stroke_r,
+            _sd_arc(x_grid, y_grid, 256.0 + ox, 378.0 + oy, 72.0, 232.0, 308.0) - stroke_r,
         )
     else:
         dist = np.minimum(
@@ -235,12 +235,15 @@ def generate_animation_frames(
     contact_sheet_path: Path | None = None,
     size: int = 128,
 ) -> list[Path]:
-    """Generate all 34 analytical SDF animation frames into ``frames_dir``."""
+    """Generate all 86 analytical SDF animation frames into ``frames_dir``."""
     scale = 4
     hi_size = size * scale
     y_grid, x_grid = np.mgrid[0:hi_size, 0:hi_size].astype(np.float64) + 0.5
 
     frames_dir.mkdir(parents=True, exist_ok=True)
+    for old_png in frames_dir.glob("*.png"):
+        old_png.unlink()
+
     generated: list[tuple[str, Image.Image]] = []
 
     def emit(name: str, alpha_hi: np.ndarray) -> None:
@@ -248,12 +251,12 @@ def generate_animation_frames(
         img = _save_alpha_mask_as_white_png(alpha_hi, out_path, size=size)
         generated.append((name, img))
 
-    # 1. Entrance (enter_00..enter_05, 6 frames)
-    for i in range(6):
-        t = i / 5.0
-        ease = 1.0 - (1.0 - t) ** 2
+    # 1. Entrance (enter_00..enter_11, 12 frames)
+    for i in range(12):
+        t = i / 11.0
+        ease = 1.0 - (1.0 - t) ** 3
         b_scale = 0.84 + 0.16 * ease
-        b_alpha = 0.25 + 0.75 * ease
+        b_alpha = 0.2 + 0.8 * ease
         f_oy = 16.0 * (1.0 - ease)
         f_alpha = ease
 
@@ -261,47 +264,67 @@ def generate_animation_frames(
         a_face = _render_face_alpha(x_grid, y_grid, oy=f_oy) * f_alpha
         emit(f"enter_{i:02d}.png", np.maximum(a_brackets, a_face))
 
-    # 2. Scanning loop (scan_00..scan_15, 16 frames, seamless 2pi loop)
-    for i in range(16):
-        theta = 2.0 * math.pi * i / 16.0
+    # 2. Scanning loop (scan_00..scan_47, 48 frames, seamless 2pi loop)
+    blink_scale_y = {
+        36: 0.55,
+        37: 0.20,
+        38: 0.08,
+        39: 0.20,
+        40: 0.55,
+    }
+    for i in range(48):
+        theta = 2.0 * math.pi * i / 48.0
         ox = math.sin(theta) * 26.0
-        oy = math.sin(2.0 * theta) * 5.0
-        b_scale = 1.0 + math.sin(theta) * 0.025
-        if i == 12:
-            eye_sy = 0.08
-        elif i == 13:
-            eye_sy = 0.50
-        else:
-            eye_sy = 1.0
+        oy = math.sin(2.0 * theta) * 4.5
+        b_scale = 1.0 + math.sin(theta) * 0.024
+        eye_sy = blink_scale_y.get(i, 1.0)
 
         a_brackets = _render_brackets_alpha(x_grid, y_grid, scale=b_scale)
         a_face = _render_face_alpha(x_grid, y_grid, ox=ox, oy=oy, eye_scale_y=eye_sy)
         emit(f"scan_{i:02d}.png", np.maximum(a_brackets, a_face))
 
-    # 3. Unlock checkmark morph (unlock_00..unlock_05, 6 frames)
-    check_progress_table = [0.0, 0.0, 0.25, 0.55, 0.82, 1.0]
-    face_alpha_table = [1.0, 0.45, 0.0, 0.0, 0.0, 0.0]
-    face_oy_table = [0.0, -7.0, -14.0, -14.0, -14.0, -14.0]
-    smile_lift_table = [0.0, 5.0, 10.0, 10.0, 10.0, 10.0]
-    for i in range(6):
-        t = i / 5.0
+    # 3. Unlock checkmark morph (unlock_00..unlock_11, 12 frames)
+    for i in range(12):
+        t = i / 11.0
         b_scale = 1.0 + 0.04 * math.sin(math.pi * t)
+
+        if i <= 4:
+            u = i / 4.0
+            face_ease = 1.0 - (1.0 - u) ** 2
+            face_alpha = 1.0 - face_ease
+            face_oy = -14.0 * face_ease
+            smile_lift = 10.0 * face_ease
+        else:
+            face_alpha = 0.0
+            face_oy = -14.0
+            smile_lift = 10.0
+
+        if i < 4:
+            check_progress = 0.0
+        else:
+            c = (i - 3) / 8.0
+            check_progress = 1.0 - (1.0 - c) ** 2
+
         a_brackets = _render_brackets_alpha(x_grid, y_grid, scale=b_scale)
         a_face = (
             _render_face_alpha(
                 x_grid,
                 y_grid,
-                oy=face_oy_table[i],
-                smile_lift=smile_lift_table[i],
+                oy=face_oy,
+                smile_lift=smile_lift,
             )
-            * face_alpha_table[i]
+            * face_alpha
         )
-        a_check = _render_checkmark_alpha(x_grid, y_grid, check_progress_table[i])
+        a_check = _render_checkmark_alpha(x_grid, y_grid, check_progress)
         emit(f"unlock_{i:02d}.png", np.maximum.reduce([a_brackets, a_face, a_check]))
 
-    # 4. Failed / Not recognized shake (fail_00..fail_05, 6 frames)
-    shake_offsets = [-28.0, 24.0, -16.0, 10.0, -4.0, 0.0]
-    for i, ox in enumerate(shake_offsets):
+    # 4. Failed / Not recognized shake (fail_00..fail_13, 14 frames)
+    for i in range(14):
+        if i == 13:
+            ox = 0.0
+        else:
+            t = i / 13.0
+            ox = -28.0 * ((1.0 - t) ** 1.4) * math.cos(3.5 * math.pi * t)
         a_brackets = _render_brackets_alpha(x_grid, y_grid, ox=ox) * 0.80
         a_face = _render_face_alpha(x_grid, y_grid, ox=ox, frown=True)
         emit(f"fail_{i:02d}.png", np.maximum(a_brackets, a_face))
