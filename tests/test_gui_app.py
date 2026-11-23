@@ -38,6 +38,8 @@ from engine.gui_app import (  # noqa: E402
     check_github_latest_release,
     classify_error,
     compose_rgb_ir_split_frame,
+    estimate_head_pose,
+    evaluate_enroll_pose,
     evaluate_enroll_position,
     get_disk_encryption_status,
     is_newer_version,
@@ -167,13 +169,13 @@ def _make_active_ir_pair(timestamp: float) -> _DummyPair:
     )
 
 
-def _make_det() -> FaceDetection:
+def _make_det_with_pose(yaw_offset: float = 0.0, pitch_offset: float = 0.0) -> FaceDetection:
     bbox = (220, 90, 160, 180)
     landmarks = np.array(
         [
             (270.0, 150.0),
             (330.0, 150.0),
-            (300.0, 185.0),
+            (300.0 + yaw_offset * 60.0, 185.0 + pitch_offset * 75.0),
             (275.0, 225.0),
             (325.0, 225.0),
         ],
@@ -184,6 +186,10 @@ def _make_det() -> FaceDetection:
     raw[4:14] = landmarks.reshape(-1)
     raw[14] = 0.95
     return FaceDetection(bbox=bbox, score=0.95, landmarks=landmarks, raw_row=raw)
+
+
+def _make_det() -> FaceDetection:
+    return _make_det_with_pose(0.0, 0.0)
 
 
 def test_start_enroll_append_adds_appearance_and_enforces_cap(
@@ -758,10 +764,22 @@ def test_enroll_state_exposes_just_captured_pause_beat(
         w.get_frame.return_value = _make_active_ir_pair(0.0).diff_bgr
         return w
 
+    pose_dets = [
+        _make_det_with_pose(0.0, 0.0),   # center
+        _make_det_with_pose(0.18, 0.0),  # left
+        _make_det_with_pose(-0.18, 0.0), # right
+        _make_det_with_pose(0.0, 0.0),   # relax
+        _make_det_with_pose(0.0, -0.12), # up
+        _make_det_with_pose(0.0, 0.12),  # down
+        _make_det_with_pose(0.0, 0.0),   # center
+    ]
+    ctrl_ref: list[WinIRFaceIDController | None] = [None]
     vec = np.zeros(128, dtype=np.float32)
     vec[0] = 1.0
     mock_rec = MagicMock()
-    mock_rec.detect_largest.return_value = _make_det()
+    mock_rec.detect_largest.side_effect = lambda _img: pose_dets[
+        min(len(ctrl_ref[0]._enroll_embeddings) if ctrl_ref[0] is not None else 0, len(pose_dets) - 1)
+    ]
     mock_rec.extract_embedding.return_value = vec
 
     ctrl = WinIRFaceIDController(
@@ -775,6 +793,7 @@ def test_enroll_state_exposes_just_captured_pause_beat(
         disk_encryption_provider=lambda: {"status": "encrypted", "code": 1, "detail": "protected"},
         auto_start_server=False,
     )
+    ctrl_ref[0] = ctrl
     bridge = _JsApiBridge(ctrl)
     try:
         assert ctrl.get_state()["enroll"]["just_captured"] is False
@@ -1494,3 +1513,236 @@ def test_toggle_preview_falls_back_when_rgb_absent_or_runtime_error(tmp_path: Pa
         rgb_workers[0].stop.assert_called_once()
     finally:
         ctrl2.shutdown()
+
+
+def test_estimate_head_pose_and_evaluate_enroll_pose() -> None:
+    assert estimate_head_pose(None) is None
+    assert estimate_head_pose(SimpleNamespace(landmarks=None)) is None
+    assert estimate_head_pose(SimpleNamespace(landmarks=np.zeros((3, 2), dtype=np.float32))) is None
+    # Zero eye distance -> None
+    zero_eyes = FaceDetection(
+        bbox=(100, 100, 100, 100),
+        score=0.9,
+        landmarks=np.array([(200, 150), (200, 150), (200, 180), (185, 210), (215, 210)], dtype=np.float32),
+        raw_row=np.zeros(15, dtype=np.float32),
+    )
+    assert estimate_head_pose(zero_eyes) is None
+
+    center_pose = estimate_head_pose(_make_det_with_pose(0.0, 0.0))
+    assert center_pose == (0.0, 0.4667)
+
+    left_pose = estimate_head_pose(_make_det_with_pose(0.18, 0.0))
+    right_pose = estimate_head_pose(_make_det_with_pose(-0.18, 0.0))
+    up_pose = estimate_head_pose(_make_det_with_pose(0.0, -0.10))
+    down_pose = estimate_head_pose(_make_det_with_pose(0.0, 0.10))
+    assert left_pose is not None and left_pose[0] > 0.15
+    assert right_pose is not None and right_pose[0] < -0.15
+    assert up_pose is not None and up_pose[1] < center_pose[1] - 0.08
+    assert down_pose is not None and down_pose[1] > center_pose[1] + 0.08
+
+    # Missing pose_angles falls back gracefully to ok
+    assert evaluate_enroll_pose("left", None) == {"ok": True, "code": "ok", "hint": ""}
+
+    # Center & relax
+    assert evaluate_enroll_pose("center", (0.05, 0.52)) == {"ok": True, "code": "ok", "hint": ""}
+    assert evaluate_enroll_pose("relax", (0.05, 0.52)) == {"ok": True, "code": "ok", "hint": ""}
+    assert evaluate_enroll_pose("center", (0.20, 0.52)) == {
+        "ok": False,
+        "code": "look_center",
+        "hint": "Look straight at the camera",
+    }
+    assert evaluate_enroll_pose("center", (0.20, 0.52), relaxed=True) == {
+        "ok": True,
+        "code": "ok",
+        "hint": "",
+    }
+
+    # Left (user turns toward +yaw)
+    assert evaluate_enroll_pose("left", (-0.10, 0.52)) == {
+        "ok": False,
+        "code": "wrong_way_left",
+        "hint": "Turn the other way (left)",
+    }
+    assert evaluate_enroll_pose("left", (0.04, 0.52)) == {
+        "ok": False,
+        "code": "turn_left",
+        "hint": "Turn your head slightly left",
+    }
+    assert evaluate_enroll_pose("left", (0.12, 0.52)) == {"ok": True, "code": "ok", "hint": ""}
+    assert evaluate_enroll_pose("left", (0.06, 0.52), relaxed=True) == {
+        "ok": True,
+        "code": "ok",
+        "hint": "",
+    }
+
+    # Right (user turns toward -yaw)
+    assert evaluate_enroll_pose("right", (0.10, 0.52)) == {
+        "ok": False,
+        "code": "wrong_way_right",
+        "hint": "Turn the other way (right)",
+    }
+    assert evaluate_enroll_pose("right", (-0.04, 0.52)) == {
+        "ok": False,
+        "code": "turn_right",
+        "hint": "Turn your head slightly right",
+    }
+    assert evaluate_enroll_pose("right", (-0.12, 0.52)) == {"ok": True, "code": "ok", "hint": ""}
+    assert evaluate_enroll_pose("right", (-0.06, 0.52), relaxed=True) == {
+        "ok": True,
+        "code": "ok",
+        "hint": "",
+    }
+
+    # Up (chin up -> lower pitch)
+    assert evaluate_enroll_pose("up", (0.0, 0.58)) == {
+        "ok": False,
+        "code": "wrong_way_up",
+        "hint": "Tilt chin up, not down",
+    }
+    assert evaluate_enroll_pose("up", (0.0, 0.50)) == {
+        "ok": False,
+        "code": "tilt_up",
+        "hint": "Tilt your chin slightly up",
+    }
+    assert evaluate_enroll_pose("up", (0.0, 0.44)) == {"ok": True, "code": "ok", "hint": ""}
+    assert evaluate_enroll_pose("up", (0.0, 0.48), relaxed=True) == {
+        "ok": True,
+        "code": "ok",
+        "hint": "",
+    }
+
+    # Down (chin down -> higher pitch)
+    assert evaluate_enroll_pose("down", (0.0, 0.45)) == {
+        "ok": False,
+        "code": "wrong_way_down",
+        "hint": "Tilt chin down, not up",
+    }
+    assert evaluate_enroll_pose("down", (0.0, 0.55)) == {
+        "ok": False,
+        "code": "tilt_down",
+        "hint": "Tilt your chin slightly down",
+    }
+    assert evaluate_enroll_pose("down", (0.0, 0.60)) == {"ok": True, "code": "ok", "hint": ""}
+    assert evaluate_enroll_pose("down", (0.0, 0.56), relaxed=True) == {
+        "ok": True,
+        "code": "ok",
+        "hint": "",
+    }
+
+    # Personalized baseline shifts relative thresholds
+    assert evaluate_enroll_pose("up", (0.0, 0.49), baseline=(0.0, 0.57)) == {
+        "ok": True,
+        "code": "ok",
+        "hint": "",
+    }
+    assert evaluate_enroll_pose("unknown_pose", (0.9, 0.9)) == {
+        "ok": True,
+        "code": "ok",
+        "hint": "",
+    }
+
+
+def test_enroll_pose_gating_waits_calibrates_and_relaxes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("engine.gui_app._ENROLL_MIN_INTERVAL", 0.08)
+    monkeypatch.setattr("engine.gui_app._ENROLL_CAPTURE_PAUSE", 0.02)
+    monkeypatch.setattr("engine.gui_app._ENROLL_POSE_RELAX_SEC", 0.25)
+
+    store = ProfileStore(tmp_path / "profiles.enc")
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "face_detection_yunet_2023mar.onnx").write_bytes(b"y" * 2048)
+    (models_dir / "face_recognition_sface_2021dec.onnx").write_bytes(b"s" * 2048)
+
+    cam_ir = MagicMock(group="g1", source_id="s1", label="IR Cam", is_ir=True, is_virtual=False)
+    ts_counter = [1.0]
+
+    def _make_worker(**_kw: object) -> MagicMock:
+        w = MagicMock()
+        w.error = None
+
+        def _next_pair() -> _DummyPair:
+            ts_counter[0] += 1.0
+            return _make_active_ir_pair(ts_counter[0])
+
+        w.get_ir_pair.side_effect = _next_pair
+        w.get_frame.return_value = _make_active_ir_pair(0.0).diff_bgr
+        return w
+
+    # Start with a slightly tilted natural center baseline (yaw=+0.02, pitch_offset=+0.02).
+    current_det = [_make_det_with_pose(0.02, 0.02)]
+    vec = np.zeros(128, dtype=np.float32)
+    vec[0] = 1.0
+    mock_rec = MagicMock()
+    mock_rec.detect_largest.side_effect = lambda _img: current_det[0]
+    mock_rec.extract_embedding.return_value = vec
+
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=models_dir,
+        camera_discoverer=lambda: [cam_ir],
+        worker_factory=_make_worker,
+        recognizer_factory=lambda: mock_rec,
+        service_status_provider=lambda: "not_installed",
+        disk_encryption_provider=lambda: {"status": "encrypted", "code": 1, "detail": "protected"},
+        auto_start_server=False,
+    )
+    try:
+        res = ctrl.start_enroll("Alice")
+        assert res["ok"] is True
+
+        # Wait for Step 0 (center) capture -> baseline calibrated, now at Step 1 (left).
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            st = ctrl.get_state()
+            if st["enroll"]["count"] >= 1 and not st["enroll"]["just_captured"]:
+                break
+            time.sleep(0.015)
+        assert ctrl.get_state()["enroll"]["count"] == 1
+        assert ctrl._enroll_baseline_set is True
+        assert ctrl._enroll_baseline_pose[0] == pytest.approx(0.02, abs=1e-4)
+
+        # User turns the WRONG way (right) on Step 1 (left): must stay at count=1 and warn.
+        current_det[0] = _make_det_with_pose(-0.15, 0.02)
+        deadline = time.monotonic() + 2.0
+        saw_wrong_way = False
+        while time.monotonic() < deadline:
+            st = ctrl.get_state()
+            enr = st["enroll"]
+            if enr["position_code"] == "wrong_way_left":
+                saw_wrong_way = True
+                assert enr["pose_ok"] is False
+                assert enr["face_ok"] is False
+                assert enr["position_hint"] == "Turn the other way (left)"
+                break
+            time.sleep(0.015)
+        assert saw_wrong_way is True
+        assert ctrl.get_state()["enroll"]["count"] == 1
+
+        # User turns LEFT: Step 1 captures smoothly and advances to Step 2 (right).
+        current_det[0] = _make_det_with_pose(0.20, 0.02)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            st = ctrl.get_state()
+            if st["enroll"]["count"] >= 2 and not st["enroll"]["just_captured"]:
+                break
+            time.sleep(0.015)
+        assert ctrl.get_state()["enroll"]["count"] == 2
+
+        # On Step 2 (right), provide only a subtle right turn (-0.06 vs baseline +0.02 -> dyaw=-0.08? Use -0.04 -> dyaw=-0.06):
+        # Strictly requires 0.10 initially, then relaxes to 0.05 after _ENROLL_POSE_RELAX_SEC=0.25s.
+        current_det[0] = _make_det_with_pose(-0.04, 0.02)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if ctrl.get_state()["enroll"]["count"] >= 3:
+                break
+            time.sleep(0.015)
+        assert ctrl.get_state()["enroll"]["count"] >= 3
+    finally:
+        ctrl.shutdown()

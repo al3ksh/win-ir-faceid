@@ -6,6 +6,7 @@ import ctypes
 import hmac
 import json
 import logging
+import math
 import mimetypes
 import os
 import secrets
@@ -113,12 +114,13 @@ _POSE_PROMPTS = tuple(text for _pose, text in _POSE_STEPS)
 
 _ENROLL_TARGET = len(_POSE_STEPS)
 _MAX_EMBEDDINGS_PER_USER = 32
-# Time each pose prompt stays on screen before its sample is taken, so the user can
-# read it and move. The first pose gets extra "get ready" time.
-# Only counts while a live face is in frame, so stepping away never skips a pose.
-_ENROLL_MIN_INTERVAL = 3.2
+# Time each pose prompt stays on screen once aligned before its sample is taken.
+# The first pose gets extra "get ready" time.
+# Only counts while a live, pose-aligned face is in frame.
+_ENROLL_MIN_INTERVAL = 1.2
 _ENROLL_GET_READY_FACTOR = 1.5
 _ENROLL_CAPTURE_PAUSE = 0.65
+_ENROLL_POSE_RELAX_SEC = 7.0
 _JPEG_QUALITY = 88
 _DEVICE_ENCRYPTION_SETTINGS_URI = "ms-settings:deviceencryption"
 
@@ -373,6 +375,89 @@ def evaluate_enroll_position(
             "code": liveness_reason or "liveness",
             "hint": "Look directly at the IR sensor",
         }
+    return {"ok": True, "code": "ok", "hint": ""}
+
+
+def estimate_head_pose(det: FaceDetection | None) -> tuple[float, float] | None:
+    """Estimate normalized yaw and pitch ratios from YuNet 5-point landmarks."""
+    if det is None:
+        return None
+    landmarks = getattr(det, "landmarks", None)
+    if landmarks is None:
+        return None
+    pts = np.asarray(landmarks, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 5 or pts.shape[1] < 2:
+        return None
+    if not np.all(np.isfinite(pts[:5, :2])):
+        return None
+
+    rx, ry = float(pts[0, 0]), float(pts[0, 1])
+    lx, ly = float(pts[1, 0]), float(pts[1, 1])
+    nose_x, nose_y = float(pts[2, 0]), float(pts[2, 1])
+    rm_y = float(pts[3, 1])
+    lm_y = float(pts[4, 1])
+
+    eye_mid_x = 0.5 * (rx + lx)
+    eye_mid_y = 0.5 * (ry + ly)
+    eye_dist = math.hypot(lx - rx, ly - ry)
+    if eye_dist < 1e-3:
+        return None
+
+    mouth_mid_y = 0.5 * (rm_y + lm_y)
+    face_vert = max(1.0, mouth_mid_y - eye_mid_y)
+    # Raw unmirrored frame: turning to user's left shifts nose toward +x (yaw > 0).
+    yaw = (nose_x - eye_mid_x) / eye_dist
+    pitch = (nose_y - eye_mid_y) / face_vert
+    return (round(yaw, 4), round(pitch, 4))
+
+
+def evaluate_enroll_pose(
+    target_pose: str,
+    pose_angles: tuple[float, float] | None,
+    *,
+    baseline: tuple[float, float] = (0.0, 0.52),
+    relaxed: bool = False,
+) -> dict[str, Any]:
+    """Evaluate whether estimated head pose matches the requested enrollment pose."""
+    if pose_angles is None:
+        return {"ok": True, "code": "ok", "hint": ""}
+
+    dyaw = pose_angles[0] - baseline[0]
+    dpitch = pose_angles[1] - baseline[1]
+
+    yaw_req = 0.05 if relaxed else 0.10
+    pitch_req = 0.03 if relaxed else 0.06
+    center_max_yaw = 0.24 if relaxed else 0.16
+
+    pose = (target_pose or "").strip().lower()
+    if pose in ("center", "relax"):
+        if abs(dyaw) > center_max_yaw:
+            return {"ok": False, "code": "look_center", "hint": "Look straight at the camera"}
+        return {"ok": True, "code": "ok", "hint": ""}
+    if pose == "left":
+        if dyaw <= -0.07:
+            return {"ok": False, "code": "wrong_way_left", "hint": "Turn the other way (left)"}
+        if dyaw < yaw_req:
+            return {"ok": False, "code": "turn_left", "hint": "Turn your head slightly left"}
+        return {"ok": True, "code": "ok", "hint": ""}
+    if pose == "right":
+        if dyaw >= 0.07:
+            return {"ok": False, "code": "wrong_way_right", "hint": "Turn the other way (right)"}
+        if dyaw > -yaw_req:
+            return {"ok": False, "code": "turn_right", "hint": "Turn your head slightly right"}
+        return {"ok": True, "code": "ok", "hint": ""}
+    if pose == "up":
+        if dpitch >= 0.05:
+            return {"ok": False, "code": "wrong_way_up", "hint": "Tilt chin up, not down"}
+        if dpitch > -pitch_req:
+            return {"ok": False, "code": "tilt_up", "hint": "Tilt your chin slightly up"}
+        return {"ok": True, "code": "ok", "hint": ""}
+    if pose == "down":
+        if dpitch <= -0.05:
+            return {"ok": False, "code": "wrong_way_down", "hint": "Tilt chin down, not up"}
+        if dpitch < pitch_req:
+            return {"ok": False, "code": "tilt_down", "hint": "Tilt your chin slightly down"}
+        return {"ok": True, "code": "ok", "hint": ""}
     return {"ok": True, "code": "ok", "hint": ""}
 
 
@@ -872,6 +957,9 @@ class WinIRFaceIDController:
         self._last_enroll_capture_ts: float = 0.0
         self._enroll_hold: float = 0.0
         self._enroll_pause_until: float = 0.0
+        self._enroll_baseline_pose: tuple[float, float] = (0.0, 0.52)
+        self._enroll_baseline_set: bool = False
+        self._enroll_pose_wait: float = 0.0
         self._last_processed_pair_ts: float | None = None
 
         self._proc_stop = threading.Event()
@@ -943,6 +1031,7 @@ class WinIRFaceIDController:
                 "target": _ENROLL_TARGET,
                 "prompt": "",
                 "just_captured": False,
+                "pose_ok": False,
                 "position_code": "no_face",
                 "position_hint": "",
                 "completed_user": completed_user,
@@ -1148,6 +1237,9 @@ class WinIRFaceIDController:
             self._enroll_username = ""
             self._enroll_append = False
             self._enroll_pause_until = 0.0
+            self._enroll_baseline_pose = (0.0, 0.52)
+            self._enroll_baseline_set = False
+            self._enroll_pose_wait = 0.0
             self._last_processed_pair_ts = None
             self._motion_tracker.reset()
             self._state = self._build_standby_state(
@@ -1423,6 +1515,7 @@ class WinIRFaceIDController:
                     "code": "ok" if (det is not None and liveness is not None and liveness.passed) else "no_face",
                     "hint": "",
                 }
+                live_face = False
                 if mode == "enroll":
                     now_tick = time.monotonic()
                     enroll_pos = evaluate_enroll_position(
@@ -1430,13 +1523,46 @@ class WinIRFaceIDController:
                         liveness_passed=bool(liveness and liveness.passed),
                         liveness_reason=liveness.reason if liveness is not None else "",
                     )
-                    face_ok = bool(enroll_pos["ok"])
+                    live_face = bool(enroll_pos["ok"])
+                    pose_angles: tuple[float, float] | None = None
                     with self._lock:
-                        in_pause = now_tick < self._enroll_pause_until
-                        if not in_pause and face_ok:
-                            # Accumulate hold time only while a live face is well-positioned and not in transition beat.
-                            self._enroll_hold += min(0.25, max(0.0, now_tick - self._last_enroll_capture_ts))
+                        dt = min(0.25, max(0.0, now_tick - self._last_enroll_capture_ts))
                         self._last_enroll_capture_ts = now_tick
+                        in_pause = now_tick < self._enroll_pause_until
+                        captured_so_far = len(self._enroll_embeddings)
+                        baseline_pose = self._enroll_baseline_pose
+
+                    if live_face and _ENROLL_MIN_INTERVAL > 0.05:
+                        pose_angles = estimate_head_pose(det)
+                        target_pose = _POSE_STEPS[min(captured_so_far, len(_POSE_STEPS) - 1)][0]
+                        if not in_pause:
+                            with self._lock:
+                                self._enroll_pose_wait += dt
+                                pose_wait = self._enroll_pose_wait
+                        else:
+                            with self._lock:
+                                pose_wait = self._enroll_pose_wait
+                        pose_eval = evaluate_enroll_pose(
+                            target_pose,
+                            pose_angles,
+                            baseline=baseline_pose,
+                            relaxed=(pose_wait >= _ENROLL_POSE_RELAX_SEC),
+                        )
+                        if not pose_eval["ok"]:
+                            if not in_pause:
+                                with self._lock:
+                                    self._enroll_hold = max(0.0, self._enroll_hold - dt * 1.5)
+                            enroll_pos = {
+                                "ok": False,
+                                "code": pose_eval["code"],
+                                "hint": pose_eval["hint"],
+                            }
+                            live_face = False
+
+                    with self._lock:
+                        if not in_pause and live_face:
+                            # Accumulate hold time only while a live, pose-aligned face is in frame.
+                            self._enroll_hold += dt
                     completed_user = ""
                     completed_append = False
                     enroll_done = False
@@ -1449,14 +1575,18 @@ class WinIRFaceIDController:
                         and is_new_pair
                         and rec is not None
                         and det is not None
-                        and face_ok
+                        and live_face
                     ):
                         if self._enroll_hold >= self._enroll_dwell():
                             emb = rec.extract_embedding(eval_src, det)
                             with self._lock:
                                 self._enroll_embeddings.append(emb)
                                 self._enroll_hold = 0.0
+                                self._enroll_pose_wait = 0.0
                                 captured = len(self._enroll_embeddings)
+                                if captured == 1 and pose_angles is not None:
+                                    self._enroll_baseline_pose = pose_angles
+                                    self._enroll_baseline_set = True
                                 if captured >= _ENROLL_TARGET:
                                     target_user = self._enroll_username
                                     append_mode = self._enroll_append
@@ -1622,7 +1752,8 @@ class WinIRFaceIDController:
                             "prompt": prompt,
                             "ready_in": round(ready_in, 2),
                             "pose": pose,
-                            "face_ok": bool(enroll_pos["ok"]),
+                            "face_ok": bool(live_face),
+                            "pose_ok": bool(live_face),
                             "position_code": enroll_pos["code"],
                             "position_hint": enroll_pos["hint"],
                             "just_captured": just_captured,
@@ -1781,6 +1912,9 @@ class WinIRFaceIDController:
             self._last_enroll_capture_ts = time.monotonic()
             self._enroll_hold = 0.0
             self._enroll_pause_until = 0.0
+            self._enroll_baseline_pose = (0.0, 0.52)
+            self._enroll_baseline_set = False
+            self._enroll_pose_wait = 0.0
             self._state = {
                 **self._build_standby_state(),
                 "mode": "enroll",
@@ -1791,6 +1925,7 @@ class WinIRFaceIDController:
                     "prompt": _POSE_PROMPTS[0],
                     "pose": _POSE_STEPS[0][0],
                     "face_ok": False,
+                    "pose_ok": False,
                     "position_code": "no_face",
                     "position_hint": "Center your face in the frame",
                     "just_captured": False,

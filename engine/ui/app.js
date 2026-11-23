@@ -1092,13 +1092,14 @@
       const readyIn = Number(enr.ready_in) || 0;
       const dwell = Number(enr.dwell) || 0;
       const justCaptured = Boolean(enr.just_captured);
+      const poseAligned = Boolean(enr.face_ok) && enr.pose_ok !== false;
       const pose = enr.pose || "center";
       els.enrollCounter.textContent = `${enr.count} / ${enr.target}`;
       const holdPct = dwell > 0 ? Math.round(100 * (1 - Math.min(1, readyIn / dwell))) : 100;
       let sub;
       if (justCaptured) {
         sub = `Captured · Next: ${promptText}`;
-      } else if (!enr.face_ok) {
+      } else if (!poseAligned) {
         sub = enr.position_hint || "Center your face in the frame";
       } else if (enr.count === 0 && holdPct < 40) {
         sub = "Get ready";
@@ -1106,15 +1107,15 @@
         sub = `Hold still… ${Math.max(1, Math.ceil(readyIn))}`;
       }
       els.enrollSub.textContent = sub;
-      els.enrollSub.dataset.tone = justCaptured || enr.face_ok ? "ok" : "warn";
+      els.enrollSub.dataset.tone = justCaptured || poseAligned ? "ok" : "warn";
       els.poseGuide.dataset.pose = pose;
-      els.poseGuide.dataset.face = justCaptured || enr.face_ok ? "ok" : "none";
+      els.poseGuide.dataset.face = justCaptured || poseAligned ? "ok" : "none";
       const ringPct = justCaptured ? 100 : holdPct;
       els.poseRing.style.strokeDashoffset = String(100 - ringPct);
       if (els.enrollStageGuide) {
         els.enrollStageGuide.dataset.visible = state.streamFrameReady ? "true" : "false";
         els.enrollStageGuide.dataset.pose = pose;
-        els.enrollStageGuide.dataset.face = enr.face_ok ? "ok" : "none";
+        els.enrollStageGuide.dataset.face = poseAligned ? "ok" : "none";
         els.enrollStageGuide.dataset.pos = enr.position_code || "ok";
         els.enrollStageGuide.dataset.captured = justCaptured ? "true" : "false";
       }
