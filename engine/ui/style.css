@@ -1272,6 +1272,11 @@ button:disabled {
 
 /* Diagnostics Strip */
 .diagnostics-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
   padding: 8px 12px;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -1280,10 +1285,19 @@ button:disabled {
 }
 
 .diag-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: var(--font-mono);
   font-size: 11.5px;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+}
+
+#btnDiagRestart {
+  flex-shrink: 0;
+  user-select: none;
 }
 
 .stage-feedback {
@@ -1754,18 +1768,12 @@ input::-ms-clear {
   color: var(--text-secondary);
 }
 
-/* Sensor & Service */
+/* Sensor */
 .control-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-}
-
-.service-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
 }
 
 .segmented {

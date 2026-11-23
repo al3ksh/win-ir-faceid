@@ -43,6 +43,7 @@
     btnVersion: $("btnVersion"),
     btnBitlockerPill: $("btnBitlockerPill"),
     bitlockerPillText: $("bitlockerPillText"),
+    headerServicePill: $("headerServicePill"),
     headerServiceDot: $("headerServiceDot"),
     headerServiceText: $("headerServiceText"),
     btnHeaderRestart: $("btnHeaderRestart"),
@@ -80,6 +81,7 @@
     diagnosticsDrawer: $("diagnosticsDrawer"),
     diagnosticsStrip: $("diagnosticsStrip"),
     diagnosticsText: $("diagnosticsText"),
+    btnDiagRestart: $("btnDiagRestart"),
     feedbackDrawer: $("feedbackDrawer"),
     stageFeedback: $("stageFeedback"),
     stageFeedbackText: $("stageFeedbackText"),
@@ -118,8 +120,6 @@
     cameraDropdownBtn: $("cameraDropdownBtn"),
     cameraDropdownLabel: $("cameraDropdownLabel"),
     cameraDropdownMenu: $("cameraDropdownMenu"),
-    paneServiceDesc: $("paneServiceDesc"),
-    btnPaneRestart: $("btnPaneRestart"),
 
     passwordModal: $("passwordModal"),
     btnPwClose: $("btnPwClose"),
@@ -561,32 +561,46 @@
       not_installed: "Service not installed",
       unknown: "Service unknown",
     };
-    const paneDescs = {
+    const statusDescs = {
       running: configDirty ? "Restart required to apply settings" : "Running in background",
       stopped: "Stopped · Lock screen sign-in paused",
       not_installed: "Not installed · Run Install.bat for lock screen",
       unknown: "Unable to query Service Control Manager",
     };
+    const desc = statusDescs[status] || statusDescs.unknown;
 
     els.headerServiceDot.dataset.status = status || "unknown";
     els.headerServiceText.textContent = labels[status] || "Service unknown";
-    els.paneServiceDesc.textContent = paneDescs[status] || paneDescs.unknown;
+    if (els.headerServicePill) {
+      els.headerServicePill.title = desc;
+    }
 
-    if (configDirty && status === "running") {
-      els.btnHeaderRestart.classList.remove("hidden");
-      els.btnPaneRestart.textContent = "Apply & Restart";
-      els.btnPaneRestart.classList.remove("hidden");
-    } else if (status === "running") {
-      els.btnHeaderRestart.classList.add("hidden");
-      els.btnPaneRestart.textContent = "Restart";
-      els.btnPaneRestart.classList.remove("hidden");
-    } else if (status === "stopped") {
-      els.btnHeaderRestart.classList.add("hidden");
-      els.btnPaneRestart.textContent = "Start";
-      els.btnPaneRestart.classList.remove("hidden");
-    } else {
-      els.btnHeaderRestart.classList.add("hidden");
-      els.btnPaneRestart.classList.add("hidden");
+    if (els.btnHeaderRestart) {
+      if (configDirty && status === "running") {
+        els.btnHeaderRestart.textContent = "Apply & Restart";
+        els.btnHeaderRestart.classList.remove("hidden");
+      } else if (status === "stopped") {
+        els.btnHeaderRestart.textContent = "Start";
+        els.btnHeaderRestart.classList.remove("hidden");
+      } else {
+        els.btnHeaderRestart.classList.add("hidden");
+      }
+    }
+
+    if (els.btnDiagRestart) {
+      els.btnDiagRestart.title = desc;
+      if (configDirty && status === "running") {
+        els.btnDiagRestart.textContent = "Apply & Restart";
+        els.btnDiagRestart.classList.remove("hidden");
+      } else if (status === "running") {
+        els.btnDiagRestart.textContent = "Restart service";
+        els.btnDiagRestart.classList.remove("hidden");
+      } else if (status === "stopped") {
+        els.btnDiagRestart.textContent = "Start service";
+        els.btnDiagRestart.classList.remove("hidden");
+      } else {
+        els.btnDiagRestart.classList.add("hidden");
+      }
     }
   }
 
@@ -1892,8 +1906,12 @@
         showFeedback(res.error, "warn");
       }
     };
-    els.btnHeaderRestart.addEventListener("click", handleRestart);
-    els.btnPaneRestart.addEventListener("click", handleRestart);
+    if (els.btnHeaderRestart) {
+      els.btnHeaderRestart.addEventListener("click", handleRestart);
+    }
+    if (els.btnDiagRestart) {
+      els.btnDiagRestart.addEventListener("click", handleRestart);
+    }
 
     if (els.btnBrandRepo) {
       els.btnBrandRepo.addEventListener("click", async () => {
