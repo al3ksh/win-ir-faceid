@@ -49,6 +49,7 @@
 
     viewport: $("viewport"),
     streamImg: $("streamImg"),
+    splitPreviewOverlay: $("splitPreviewOverlay"),
     standbyOverlay: $("standbyOverlay"),
     standbyTitle: $("standbyTitle"),
     stageErrorOverlay: $("stageErrorOverlay"),
@@ -902,6 +903,10 @@
     els.faceReticle.dataset.visible = "true";
   }
 
+  function isSplitPreviewActive(live) {
+    return Boolean(live && live.camera_active && live.mode === "preview" && live.preview_split);
+  }
+
   function revealStreamFrame() {
     if (!state.streamActiveUrl) return;
     state.streamFrameReady = true;
@@ -911,6 +916,7 @@
     if (els.enrollStageGuide && state.live && state.live.mode === "enroll") {
       els.enrollStageGuide.dataset.visible = "true";
     }
+    setVisible(els.splitPreviewOverlay, isSplitPreviewActive(state.live));
   }
 
   function renderStageErrorOverlay(errorInfo) {
@@ -1009,6 +1015,8 @@
     }
 
     // Buttons state
+    const splitPreview = isSplitPreviewActive(live);
+    setVisible(els.splitPreviewOverlay, splitPreview && state.streamFrameReady);
     collectTestScore(mode, active, live.match);
 
     const prof = findProfile(currentUsername());
@@ -1064,7 +1072,7 @@
       }
     }
 
-    if (active && mode !== "enroll") {
+    if (active && mode !== "enroll" && !splitPreview) {
       updateReticlePosition(live.bbox_norm, reticleTone);
     } else {
       els.faceReticle.dataset.visible = "false";
@@ -1585,7 +1593,13 @@
   function wireEvents() {
     els.streamImg.addEventListener("load", () => {
       revealStreamFrame();
-      if (state.live && state.live.camera_active && state.live.mode !== "enroll" && state.live.bbox_norm) {
+      if (
+        state.live &&
+        state.live.camera_active &&
+        state.live.mode !== "enroll" &&
+        !isSplitPreviewActive(state.live) &&
+        state.live.bbox_norm
+      ) {
         updateReticlePosition(state.live.bbox_norm, els.faceReticle.dataset.tone || "neutral");
       }
     });

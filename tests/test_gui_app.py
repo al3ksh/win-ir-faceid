@@ -13,6 +13,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -33,8 +34,10 @@ from engine.gui_app import (  # noqa: E402
     _get_window_hwnd,
     _load_hicon,
     _resolve_window_icon_path,
+    _select_preferred_rgb_camera,
     check_github_latest_release,
     classify_error,
+    compose_rgb_ir_split_frame,
     evaluate_enroll_position,
     get_disk_encryption_status,
     is_newer_version,
@@ -1199,3 +1202,295 @@ def test_evaluate_enroll_position_all_states() -> None:
         "code": "ok",
         "hint": "",
     }
+
+
+def test_select_preferred_rgb_camera_and_compose_split_frame() -> None:
+    cam_ir = SimpleNamespace(source_id="ir0", is_ir=True, is_virtual=False)
+    cam_virt_rgb = SimpleNamespace(source_id="rgb_v", is_ir=False, is_virtual=True)
+    cam_real_rgb = SimpleNamespace(source_id="rgb_r", is_ir=False, is_virtual=False)
+
+    assert _select_preferred_rgb_camera([cam_ir, cam_virt_rgb, cam_real_rgb]) is cam_real_rgb
+    assert _select_preferred_rgb_camera([cam_ir, cam_virt_rgb]) is cam_virt_rgb
+    assert (
+        _select_preferred_rgb_camera(
+            [cam_ir, cam_real_rgb],
+            exclude_source_id="rgb_r",
+        )
+        is None
+    )
+    assert _select_preferred_rgb_camera([cam_ir]) is None
+
+    # 2D grayscale IR frame (tall/portrait-ish) + 16:9 BGR RGB frame
+    # Solid distinct values let us verify raw-left=IR and raw-right=RGB and zero black bars.
+    ir_gray = np.full((480, 480), 210, dtype=np.uint8)
+    rgb_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+    rgb_bgr[:, :] = (30, 120, 220)  # BGR
+
+    composed = compose_rgb_ir_split_frame(rgb_bgr, ir_gray)
+    assert composed.shape == (360, 640, 3)
+    assert composed.dtype == np.uint8
+
+    # Raw left half ([:, :320]) holds IR so CSS scaleX(-1) places IR on screen-right
+    left_half = composed[:, :320]
+    assert np.all(left_half == 210)
+
+    # Raw right half ([:, 320:]) holds RGB so CSS scaleX(-1) places RGB on screen-left
+    right_half = composed[:, 320:]
+    assert np.all(right_half[:, :, 0] == 30)
+    assert np.all(right_half[:, :, 1] == 120)
+    assert np.all(right_half[:, :, 2] == 220)
+
+
+def test_compose_rgb_ir_split_frame_preserves_center_and_aspect() -> None:
+    # Wide 2:1 RGB frame (200x400) with a bright center stripe and black outer edges;
+    # cover-crop to 320x360 crops the left/right edges while keeping the center intact.
+    rgb = np.zeros((200, 400, 3), dtype=np.uint8)
+    rgb[:, 140:260] = (40, 180, 90)
+    ir = np.full((100, 300), 150, dtype=np.uint8)
+
+    composed = compose_rgb_ir_split_frame(rgb, ir)
+    assert composed.shape == (360, 640, 3)
+    assert np.all(composed[:, :320] == 150)
+    # Center of right half must carry the centered RGB stripe without black letterbox bars
+    assert int(composed[180, 480, 1]) > 150
+
+
+def test_toggle_preview_dual_workers_split_and_stop(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    store = ProfileStore(tmp_path / "profiles.enc")
+
+    cam_ir = MagicMock(group="g_ir", source_id="s_ir", label="IR Cam", is_ir=True, is_virtual=False)
+    cam_rgb = MagicMock(group="g_rgb", source_id="s_rgb", label="RGB Cam", is_ir=False, is_virtual=False)
+
+    ir_pair = _make_active_ir_pair(100.0)
+    rgb_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    rgb_frame[:, :] = (20, 90, 210)
+
+    created: list[dict[str, Any]] = []
+
+    def _make_worker(*, group: Any, source_id: str, is_ir: bool, ir_led_enabled: bool) -> MagicMock:
+        w = MagicMock()
+        w.error = None
+        if is_ir:
+            w.get_ir_pair.return_value = ir_pair
+            w.get_frame.return_value = ir_pair.diff_bgr
+        else:
+            w.get_ir_pair.return_value = None
+            w.get_frame.return_value = rgb_frame
+        created.append(
+            {
+                "worker": w,
+                "group": group,
+                "source_id": source_id,
+                "is_ir": is_ir,
+                "ir_led_enabled": ir_led_enabled,
+            }
+        )
+        return w
+
+    mock_rec = MagicMock()
+    mock_rec.detect_largest.return_value = _make_det()
+
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: [cam_ir, cam_rgb],
+        worker_factory=_make_worker,
+        recognizer_factory=lambda: mock_rec,
+        service_status_provider=lambda: "not_installed",
+        auto_start_server=False,
+    )
+    ctrl._models_ready = lambda: True  # type: ignore[method-assign]
+    bridge = _JsApiBridge(ctrl)
+
+    try:
+        res = bridge.toggle_preview()
+        assert res["ok"] is True
+        assert len(created) == 2
+
+        ir_call, rgb_call = created
+        assert ir_call["source_id"] == "s_ir"
+        assert ir_call["is_ir"] is True
+        assert ir_call["ir_led_enabled"] is True
+        assert rgb_call["source_id"] == "s_rgb"
+        assert rgb_call["is_ir"] is False
+        assert rgb_call["ir_led_enabled"] is False
+        ir_call["worker"].start.assert_called_once()
+        rgb_call["worker"].start.assert_called_once()
+
+        deadline = time.monotonic() + 3.0
+        st = ctrl.get_state()
+        while time.monotonic() < deadline:
+            st = ctrl.get_state()
+            if st.get("preview_split") is True and ctrl._latest_jpeg is not None:
+                break
+            time.sleep(0.02)
+
+        assert st["mode"] == "preview"
+        assert st["camera_active"] is True
+        assert st["preview_split"] is True
+        assert st["bbox_norm"] is not None
+        assert st["liveness"]["delta"] > 0.0
+
+        # Verify published JPEG is 640x360 with IR on raw-left and RGB on raw-right
+        jpeg_bytes = ctrl._latest_jpeg
+        assert jpeg_bytes is not None
+        with Image.open(io.BytesIO(jpeg_bytes)) as img:
+            assert img.size == (640, 360)
+            arr = np.asarray(img)
+            # Raw right half came from rgb_bgr=(20, 90, 210) -> RGB=(210, 90, 20)
+            right_center = arr[180, 480]
+            assert int(right_center[0]) > 180
+            assert int(right_center[2]) < 50
+
+        # Stopping preview stops both workers and resets preview_split
+        stop_res = bridge.toggle_preview()
+        assert stop_res["ok"] is True
+        assert stop_res["state"]["mode"] == "standby"
+        assert stop_res["state"]["preview_split"] is False
+        ir_call["worker"].stop.assert_called_once()
+        rgb_call["worker"].stop.assert_called_once()
+    finally:
+        ctrl.shutdown()
+
+
+def test_toggle_preview_falls_back_gracefully_when_rgb_fails_or_absent(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    store = ProfileStore(tmp_path / "profiles.enc")
+
+    cam_ir = MagicMock(group="g_ir", source_id="s_ir", label="IR Cam", is_ir=True, is_virtual=False)
+    cam_rgb = MagicMock(group="g_rgb", source_id="s_rgb", label="RGB Cam", is_ir=False, is_virtual=False)
+
+    ir_pair = _make_active_ir_pair(200.0)
+    ir_workers: list[MagicMock] = []
+
+    def _make_worker_rgb_fails(*, group: Any, source_id: str, is_ir: bool, ir_led_enabled: bool) -> MagicMock:
+        w = MagicMock()
+        w.error = None
+        if is_ir:
+            w.get_ir_pair.return_value = ir_pair
+            w.get_frame.return_value = ir_pair.diff_bgr
+            ir_workers.append(w)
+        else:
+            w.start.side_effect = RuntimeError("RGB camera busy")
+        return w
+
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: [cam_ir, cam_rgb],
+        worker_factory=_make_worker_rgb_fails,
+        service_status_provider=lambda: "not_installed",
+        auto_start_server=False,
+    )
+    bridge = _JsApiBridge(ctrl)
+
+    try:
+        res = bridge.toggle_preview()
+        assert res["ok"] is True
+
+        deadline = time.monotonic() + 3.0
+        st = ctrl.get_state()
+        while time.monotonic() < deadline:
+            st = ctrl.get_state()
+            if st["mode"] == "preview" and ctrl._latest_jpeg is not None:
+                break
+            time.sleep(0.02)
+
+        assert st["mode"] == "preview"
+        assert st["camera_active"] is True
+        assert st["preview_split"] is False
+        assert st["error"] is None
+
+        cancel_res = bridge.cancel_action()
+        assert cancel_res["ok"] is True
+        assert cancel_res["state"]["mode"] == "standby"
+        assert cancel_res["state"]["preview_split"] is False
+        ir_workers[0].stop.assert_called_once()
+    finally:
+        ctrl.shutdown()
+
+
+def test_toggle_preview_falls_back_when_rgb_absent_or_runtime_error(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    store = ProfileStore(tmp_path / "profiles.enc")
+
+    cam_ir = MagicMock(group="g_ir", source_id="s_ir", label="IR Cam", is_ir=True, is_virtual=False)
+    cam_rgb = MagicMock(group="g_rgb", source_id="s_rgb", label="RGB Cam", is_ir=False, is_virtual=False)
+    ir_pair = _make_active_ir_pair(300.0)
+
+    # Case 1: Only IR camera exists (no RGB camera) -> single IR preview
+    workers_ir_only: list[MagicMock] = []
+
+    def _make_ir_only(*, group: Any, source_id: str, is_ir: bool, ir_led_enabled: bool) -> MagicMock:
+        w = MagicMock()
+        w.error = None
+        w.get_ir_pair.return_value = ir_pair
+        w.get_frame.return_value = ir_pair.diff_bgr
+        workers_ir_only.append(w)
+        return w
+
+    ctrl1 = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: [cam_ir],
+        worker_factory=_make_ir_only,
+        service_status_provider=lambda: "not_installed",
+        auto_start_server=False,
+    )
+    try:
+        assert ctrl1.toggle_preview()["ok"] is True
+        assert len(workers_ir_only) == 1
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and ctrl1._latest_jpeg is None:
+            time.sleep(0.02)
+        st1 = ctrl1.get_state()
+        assert st1["mode"] == "preview"
+        assert st1["preview_split"] is False
+    finally:
+        ctrl1.shutdown()
+
+    # Case 2: RGB worker reports runtime error -> falls back cleanly to single IR
+    rgb_workers: list[MagicMock] = []
+
+    def _make_rgb_runtime_error(*, group: Any, source_id: str, is_ir: bool, ir_led_enabled: bool) -> MagicMock:
+        w = MagicMock()
+        if is_ir:
+            w.error = None
+            w.get_ir_pair.return_value = ir_pair
+            w.get_frame.return_value = ir_pair.diff_bgr
+        else:
+            w.error = "RGB stream lost"
+            w.get_frame.return_value = None
+            rgb_workers.append(w)
+        return w
+
+    ctrl2 = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: [cam_ir, cam_rgb],
+        worker_factory=_make_rgb_runtime_error,
+        service_status_provider=lambda: "not_installed",
+        auto_start_server=False,
+    )
+    try:
+        assert ctrl2.toggle_preview()["ok"] is True
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and ctrl2._latest_jpeg is None:
+            time.sleep(0.02)
+        st2 = ctrl2.get_state()
+        assert st2["mode"] == "preview"
+        assert st2["camera_active"] is True
+        assert st2["preview_split"] is False
+        assert st2["error"] is None
+        assert len(rgb_workers) == 1
+        rgb_workers[0].stop.assert_called_once()
+    finally:
+        ctrl2.shutdown()

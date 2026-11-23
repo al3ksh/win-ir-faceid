@@ -348,6 +348,61 @@ body {
   transform: scaleX(-1) scale(1);
 }
 
+/* Split RGB | IR Preview Overlay */
+.split-preview-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 200ms var(--ease-fluid),
+    visibility 0s linear 200ms;
+}
+
+.split-preview-overlay[data-visible="true"] {
+  opacity: 1;
+  visibility: visible;
+  transition:
+    opacity 200ms var(--ease-fluid),
+    visibility 0s linear 0s;
+}
+
+.split-preview-overlay::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-0.5px);
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.split-badge {
+  position: absolute;
+  top: 12px;
+  background: rgba(11, 12, 14, 0.72);
+  border: 1px solid var(--border-hover);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+  color: var(--text-primary);
+  padding: 3px 9px;
+  backdrop-filter: blur(6px);
+}
+
+.split-badge-left {
+  left: 12px;
+}
+
+.split-badge-right {
+  right: 12px;
+}
+
 .standby-overlay {
   position: absolute;
   inset: 0;
@@ -2271,6 +2326,7 @@ input::-ms-clear {
   }
 
   .standby-overlay,
+  .split-preview-overlay,
   .stage-error-overlay,
   .hud-pill,
   .enroll-hud,

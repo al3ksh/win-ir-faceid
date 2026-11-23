@@ -59,6 +59,12 @@
           <div class="viewport" id="viewport">
             <img class="stream-img" id="streamImg" data-visible="false" alt="Active infrared camera feed">
 
+            <!-- Split RGB | IR Preview Overlay (non-mirrored HTML/CSS badges + hairline) -->
+            <div class="split-preview-overlay" id="splitPreviewOverlay" data-visible="false" aria-hidden="true">
+              <span class="split-badge split-badge-left">RGB</span>
+              <span class="split-badge split-badge-right">IR</span>
+            </div>
+
             <!-- Standby Placeholder -->
             <div class="standby-overlay" id="standbyOverlay" data-visible="true" data-starting="false">
               <svg class="standby-reticle" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

@@ -255,6 +255,89 @@ def _select_preferred_camera_index(cameras: list[Any]) -> int:
     return 0
 
 
+def _select_preferred_rgb_camera(
+    cameras: list[Any],
+    exclude_source_id: str | None = None,
+) -> Any | None:
+    """Return first non-IR non-virtual camera, else first non-IR camera, else ``None``."""
+    for cam in cameras:
+        if (
+            not getattr(cam, "is_ir", False)
+            and not getattr(cam, "is_virtual", False)
+            and (exclude_source_id is None or getattr(cam, "source_id", None) != exclude_source_id)
+        ):
+            return cam
+    for cam in cameras:
+        if (
+            not getattr(cam, "is_ir", False)
+            and (exclude_source_id is None or getattr(cam, "source_id", None) != exclude_source_id)
+        ):
+            return cam
+    return None
+
+
+def _to_bgr_image(frame: np.ndarray) -> np.ndarray:
+    """Normalize a 2D grayscale or 3/4-channel image to 3-channel BGR."""
+    arr = np.asarray(frame)
+    if arr.ndim == 2:
+        return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        return cv2.cvtColor(arr[:, :, 0], cv2.COLOR_GRAY2BGR)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        return arr
+    raise ValueError(f"Unsupported frame shape: {arr.shape}")
+
+
+def _cover_crop_resize(frame: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+    """Resize and center-crop a frame to fill ``(target_w, target_h)`` without distortion or bars."""
+    bgr = _to_bgr_image(frame)
+    src_h, src_w = bgr.shape[:2]
+    if src_h <= 0 or src_w <= 0:
+        raise ValueError("Cannot resize empty frame.")
+    if src_w == target_w and src_h == target_h:
+        return bgr.copy()
+
+    scale = max(target_w / float(src_w), target_h / float(src_h))
+    scaled_w = max(target_w, int(round(src_w * scale)))
+    scaled_h = max(target_h, int(round(src_h * scale)))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(bgr, (scaled_w, scaled_h), interpolation=interp)
+
+    x0 = max(0, (scaled_w - target_w) // 2)
+    y0 = max(0, (scaled_h - target_h) // 2)
+    return resized[y0 : y0 + target_h, x0 : x0 + target_w].copy()
+
+
+def compose_rgb_ir_split_frame(
+    rgb_frame: np.ndarray,
+    ir_frame: np.ndarray,
+    target_size: tuple[int, int] = (640, 360),
+) -> np.ndarray:
+    """Compose a side-by-side IR (raw-left) | RGB (raw-right) frame for CSS-mirrored preview.
+
+    Because ``.stream-img`` applies ``transform: scaleX(-1)`` in CSS, placing IR on the
+    raw left half and RGB on the raw right half renders mirrored RGB on screen-left and
+    mirrored Active IR on screen-right.
+    """
+    target_w, target_h = int(target_size[0]), int(target_size[1])
+    if target_w < 2 or target_h < 1:
+        raise ValueError(f"Invalid target_size: {target_size}")
+
+    left_w = target_w // 2
+    right_w = target_w - left_w
+
+    ir_half = _cover_crop_resize(ir_frame, left_w, target_h)
+    rgb_half = _cover_crop_resize(rgb_frame, right_w, target_h)
+
+    out_dtype = np.result_type(ir_half.dtype, rgb_half.dtype)
+    canvas = np.empty((target_h, target_w, 3), dtype=out_dtype)
+    canvas[:, :left_w] = ir_half
+    canvas[:, left_w:] = rgb_half
+    return canvas
+
+
 def evaluate_enroll_position(
     bbox_norm: list[float] | None,
     *,
@@ -774,6 +857,8 @@ class WinIRFaceIDController:
         self._feed_mode: str = "subtract"
         self._camera_active: bool = False
         self._worker: Any | None = None
+        self._rgb_worker: Any | None = None
+        self._preview_split: bool = False
         self._cameras: list[Any] = []
         self._selected_camera_idx: int = 0
         self._current_cam_is_ir: bool = False
@@ -834,6 +919,7 @@ class WinIRFaceIDController:
         return {
             "mode": "standby",
             "camera_active": False,
+            "preview_split": False,
             "ae_settling": False,
             "bbox_norm": None,
             "liveness": {
@@ -1042,6 +1128,7 @@ class WinIRFaceIDController:
         self._proc_stop.set()
         proc_thread: threading.Thread | None
         worker: Any | None
+        rgb_worker: Any | None
         with self._lock:
             proc_thread = self._proc_thread
             self._proc_thread = None
@@ -1052,6 +1139,9 @@ class WinIRFaceIDController:
         with self._lock:
             worker = self._worker
             self._worker = None
+            rgb_worker = self._rgb_worker
+            self._rgb_worker = None
+            self._preview_split = False
             self._mode = "standby"
             self._camera_active = False
             self._enroll_embeddings = []
@@ -1070,11 +1160,91 @@ class WinIRFaceIDController:
             self._latest_jpeg = None
             self._frame_cond.notify_all()
 
-        if worker is not None:
+        for active_worker, label in ((worker, "camera"), (rgb_worker, "RGB preview")):
+            if active_worker is not None:
+                try:
+                    active_worker.stop()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Error stopping %s worker: %s", label, exc)
+
+    def _create_camera_worker(
+        self,
+        cam: Any,
+        *,
+        is_ir: bool,
+        ir_led_enabled: bool,
+    ) -> Any:
+        if self._worker_factory is not None:
+            return self._worker_factory(
+                group=cam.group,
+                source_id=cam.source_id,
+                is_ir=is_ir,
+                ir_led_enabled=ir_led_enabled,
+            )
+        from engine.ir_camera import WinRTCameraWorker
+
+        return WinRTCameraWorker(
+            group=cam.group,
+            source_id=cam.source_id,
+            is_ir=is_ir,
+            ir_led_enabled=ir_led_enabled,
+        )
+
+    def _stop_rgb_preview_worker(self) -> None:
+        with self._lock:
+            rgb_worker = self._rgb_worker
+            self._rgb_worker = None
+            self._preview_split = False
+        if rgb_worker is not None:
             try:
-                worker.stop()
+                rgb_worker.stop()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Error stopping camera worker: %s", exc)
+                logger.debug("Error stopping optional RGB preview worker: %s", exc)
+
+    def _start_preview_rgb_worker_best_effort(self) -> None:
+        with self._lock:
+            if not self._cameras:
+                return
+            idx = max(0, min(self._selected_camera_idx, len(self._cameras) - 1))
+            primary = self._cameras[idx]
+            if not getattr(primary, "is_ir", False):
+                return
+            rgb_cam = _select_preferred_rgb_camera(
+                list(self._cameras),
+                exclude_source_id=getattr(primary, "source_id", None),
+            )
+        if rgb_cam is None:
+            return
+
+        rgb_worker: Any | None = None
+        try:
+            rgb_worker = self._create_camera_worker(
+                rgb_cam,
+                is_ir=False,
+                ir_led_enabled=False,
+            )
+            rgb_worker.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Optional RGB preview worker failed to start: %s", exc)
+            if rgb_worker is not None:
+                try:
+                    rgb_worker.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        with self._lock:
+            if self._shutting_down or not self._camera_active:
+                pass
+            else:
+                old_rgb = self._rgb_worker
+                self._rgb_worker = rgb_worker
+                rgb_worker = old_rgb
+        if rgb_worker is not None:
+            try:
+                rgb_worker.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _start_camera_worker(self) -> tuple[bool, str | None]:
         with self._lock:
@@ -1097,22 +1267,11 @@ class WinIRFaceIDController:
                 pass
 
         try:
-            if self._worker_factory is not None:
-                worker = self._worker_factory(
-                    group=cam.group,
-                    source_id=cam.source_id,
-                    is_ir=is_ir,
-                    ir_led_enabled=is_ir,
-                )
-            else:
-                from engine.ir_camera import WinRTCameraWorker
-
-                worker = WinRTCameraWorker(
-                    group=cam.group,
-                    source_id=cam.source_id,
-                    is_ir=is_ir,
-                    ir_led_enabled=is_ir,
-                )
+            worker = self._create_camera_worker(
+                cam,
+                is_ir=is_ir,
+                ir_led_enabled=is_ir,
+            )
             worker.anti_flicker_mode = feed_mode
             worker.start()
         except Exception as exc:  # noqa: BLE001
@@ -1143,6 +1302,7 @@ class WinIRFaceIDController:
                 with self._lock:
                     mode = self._mode
                     worker = self._worker
+                    rgb_worker = self._rgb_worker if mode == "preview" else None
                     is_ir = self._current_cam_is_ir
                     feed_mode = self._feed_mode
                     rec = self._recognizer
@@ -1172,8 +1332,38 @@ class WinIRFaceIDController:
                     time.sleep(0.015)
                     continue
 
+                preview_split = False
+                publish_frame = display_frame
+                if mode == "preview" and rgb_worker is not None:
+                    rgb_err = getattr(rgb_worker, "error", None)
+                    if rgb_err:
+                        logger.debug(
+                            "Optional RGB preview worker error (falling back to single IR): %s",
+                            rgb_err,
+                        )
+                        with self._lock:
+                            if self._rgb_worker is rgb_worker:
+                                self._rgb_worker = None
+                        try:
+                            rgb_worker.stop()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    else:
+                        try:
+                            rgb_frame = rgb_worker.get_frame()
+                            if rgb_frame is not None:
+                                publish_frame = compose_rgb_ir_split_frame(rgb_frame, display_frame)
+                                preview_split = True
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug(
+                                "Split frame composition failed (falling back to single IR): %s",
+                                exc,
+                            )
+                            publish_frame = display_frame
+                            preview_split = False
+
                 # Publish clean raw video frame without OpenCV drawings
-                self._publish_jpeg(display_frame)
+                self._publish_jpeg(publish_frame)
 
                 h_img, w_img = display_frame.shape[:2]
                 ae_settling = bool(pair is not None and pair.bright_mean > 225.0)
@@ -1417,9 +1607,11 @@ class WinIRFaceIDController:
                     if match_dict["state"] != "idle":
                         match_seq += 1
                     match_dict["seq"] = match_seq
+                    self._preview_split = preview_split
                     self._state = {
                         "mode": self._mode,
                         "camera_active": True,
+                        "preview_split": preview_split,
                         "ae_settling": ae_settling,
                         "bbox_norm": bbox_norm,
                         "liveness": liveness_dict,
@@ -1653,7 +1845,7 @@ class WinIRFaceIDController:
         return {"ok": True, "error": None, "state": self.get_state()}
 
     def toggle_preview(self) -> dict[str, Any]:
-        """Toggle passive IR camera preview on demand."""
+        """Toggle passive IR (or split RGB | IR) camera preview on demand."""
         with self._lock:
             currently_preview = self._mode == "preview"
 
@@ -1668,12 +1860,16 @@ class WinIRFaceIDController:
         if not ok:
             return self._set_standby_error(err or "Camera failed to start.")
 
+        self._start_preview_rgb_worker_best_effort()
+
         with self._lock:
             self._mode = "preview"
+            self._preview_split = False
             self._state = {
                 **self._build_standby_state(),
                 "mode": "preview",
                 "camera_active": True,
+                "preview_split": False,
             }
 
         self._ensure_processing_thread()
@@ -1696,8 +1892,10 @@ class WinIRFaceIDController:
             self._selected_camera_idx = int(index)
             self._current_cam_is_ir = bool(getattr(self._cameras[int(index)], "is_ir", False))
             active = self._camera_active and self._mode != "standby"
+            mode = self._mode
 
         if active:
+            self._stop_rgb_preview_worker()
             ok, err = self._start_camera_worker()
             if not ok:
                 err_msg = err or "Camera failed to start."
@@ -1709,6 +1907,8 @@ class WinIRFaceIDController:
                     "selected_camera": int(index),
                     "state": self.get_state(),
                 }
+            if mode == "preview":
+                self._start_preview_rgb_worker_best_effort()
             return {"ok": True, "error": None, "selected_camera": int(index)}
         return {"ok": True, "error": None, "selected_camera": int(index)}
 
