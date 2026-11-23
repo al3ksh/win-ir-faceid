@@ -255,6 +255,44 @@ def _select_preferred_camera_index(cameras: list[Any]) -> int:
     return 0
 
 
+def evaluate_enroll_position(
+    bbox_norm: list[float] | None,
+    *,
+    liveness_passed: bool,
+    liveness_reason: str = "",
+) -> dict[str, Any]:
+    """Evaluate normalized face position and liveness for enrollment guidance."""
+    if bbox_norm is None:
+        return {"ok": False, "code": "no_face", "hint": "Center your face in the frame"}
+    if liveness_reason == "overexposed_ae_settling":
+        return {"ok": False, "code": "ae_settling", "hint": "Settling IR exposure..."}
+
+    nx, ny, nw, nh = bbox_norm
+    cx = nx + nw * 0.5
+    cy = ny + nh * 0.5
+
+    if nh < 0.28 or liveness_reason == "face_too_small":
+        return {"ok": False, "code": "too_far", "hint": "Move closer"}
+    if nh > 0.74:
+        return {"ok": False, "code": "too_close", "hint": "Move slightly back"}
+    # Camera preview is horizontally mirrored: raw cx > 0.64 sits on the user's left.
+    if cx > 0.64:
+        return {"ok": False, "code": "move_right", "hint": "Move slightly right"}
+    if cx < 0.36:
+        return {"ok": False, "code": "move_left", "hint": "Move slightly left"}
+    if cy < 0.28:
+        return {"ok": False, "code": "move_down", "hint": "Move slightly down"}
+    if cy > 0.68:
+        return {"ok": False, "code": "move_up", "hint": "Move slightly up"}
+    if not liveness_passed:
+        return {
+            "ok": False,
+            "code": liveness_reason or "liveness",
+            "hint": "Look directly at the IR sensor",
+        }
+    return {"ok": True, "code": "ok", "hint": ""}
+
+
 def get_service_status(service_name: str = SERVICE_NAME) -> str:
     """Query Windows SCM read-only for the background service status."""
     try:
@@ -819,6 +857,8 @@ class WinIRFaceIDController:
                 "target": _ENROLL_TARGET,
                 "prompt": "",
                 "just_captured": False,
+                "position_code": "no_face",
+                "position_hint": "",
                 "completed_user": completed_user,
                 "completed_append": bool(completed_append),
             },
@@ -932,6 +972,7 @@ class WinIRFaceIDController:
                             "id": str(look.get("id", "")),
                             "added_at": str(look.get("added_at", "")),
                             "count": int(look.get("count", 0)),
+                            "label": str(look.get("label") or ""),
                         }
                         for look in getattr(p, "looks", []) or []
                     ],
@@ -1187,13 +1228,23 @@ class WinIRFaceIDController:
                 is_new_pair = pair is not None and pair.timestamp != self._last_processed_pair_ts
 
                 # Enrollment capture flow
+                enroll_pos = {
+                    "ok": bool(det is not None and liveness is not None and liveness.passed),
+                    "code": "ok" if (det is not None and liveness is not None and liveness.passed) else "no_face",
+                    "hint": "",
+                }
                 if mode == "enroll":
                     now_tick = time.monotonic()
-                    face_ok = det is not None and liveness is not None and liveness.passed
+                    enroll_pos = evaluate_enroll_position(
+                        bbox_norm,
+                        liveness_passed=bool(liveness and liveness.passed),
+                        liveness_reason=liveness.reason if liveness is not None else "",
+                    )
+                    face_ok = bool(enroll_pos["ok"])
                     with self._lock:
                         in_pause = now_tick < self._enroll_pause_until
                         if not in_pause and face_ok:
-                            # Accumulate hold time only while a live face is visible and not in transition beat.
+                            # Accumulate hold time only while a live face is well-positioned and not in transition beat.
                             self._enroll_hold += min(0.25, max(0.0, now_tick - self._last_enroll_capture_ts))
                         self._last_enroll_capture_ts = now_tick
                     completed_user = ""
@@ -1208,8 +1259,7 @@ class WinIRFaceIDController:
                         and is_new_pair
                         and rec is not None
                         and det is not None
-                        and liveness is not None
-                        and liveness.passed
+                        and face_ok
                     ):
                         if self._enroll_hold >= self._enroll_dwell():
                             emb = rec.extract_embedding(eval_src, det)
@@ -1380,7 +1430,9 @@ class WinIRFaceIDController:
                             "prompt": prompt,
                             "ready_in": round(ready_in, 2),
                             "pose": pose,
-                            "face_ok": bool(det is not None and liveness is not None and liveness.passed),
+                            "face_ok": bool(enroll_pos["ok"]),
+                            "position_code": enroll_pos["code"],
+                            "position_hint": enroll_pos["hint"],
                             "just_captured": just_captured,
                             "dwell": round(self._enroll_dwell(), 2) if self._mode == "enroll" else 0.0,
                             "completed_user": "",
@@ -1547,6 +1599,8 @@ class WinIRFaceIDController:
                     "prompt": _POSE_PROMPTS[0],
                     "pose": _POSE_STEPS[0][0],
                     "face_ok": False,
+                    "position_code": "no_face",
+                    "position_hint": "Center your face in the frame",
                     "just_captured": False,
                     "ready_in": round(_ENROLL_MIN_INTERVAL * _ENROLL_GET_READY_FACTOR, 2),
                     "dwell": round(_ENROLL_MIN_INTERVAL * _ENROLL_GET_READY_FACTOR, 2),
@@ -1779,6 +1833,26 @@ class WinIRFaceIDController:
         except Exception as exc:
             return {"ok": False, "error": _store_error_message(exc), "profiles": self._serialize_profiles()}
         return {"ok": True, "profiles": self._serialize_profiles()}
+
+    def rename_look(self, username: str, look_id: str, label: str) -> dict[str, Any]:
+        """Rename one enrolled look (enrollment pass) in the caller's profile."""
+        clean_user = str(username or "").strip()
+        owner_err = self._owner_error(clean_user)
+        if owner_err:
+            return {"ok": False, "error": owner_err, "profiles": self._serialize_profiles()}
+        try:
+            self._store.rename_look(clean_user, str(look_id or ""), str(label or ""))
+        except KeyError:
+            return {"ok": False, "error": _SERVICE_ERROR_MESSAGES["not_found"], "profiles": self._serialize_profiles()}
+        except ValueError:
+            return {
+                "ok": False,
+                "error": "Appearance name must be 1 to 32 characters.",
+                "profiles": self._serialize_profiles(),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": _store_error_message(exc), "profiles": self._serialize_profiles()}
+        return {"ok": True, "error": None, "profiles": self._serialize_profiles()}
 
     def download_models(self) -> dict[str, Any]:
         """Download YuNet and SFace ONNX models in a background thread."""
@@ -2096,6 +2170,9 @@ class _JsApiBridge:
 
     def delete_look(self, username: str, look_id: str) -> dict[str, Any]:
         return self._ctrl.delete_look(username, look_id)
+
+    def rename_look(self, username: str, look_id: str, label: str) -> dict[str, Any]:
+        return self._ctrl.rename_look(username, look_id, label)
 
     def download_models(self) -> dict[str, Any]:
         return self._ctrl.download_models()

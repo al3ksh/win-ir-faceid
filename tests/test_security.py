@@ -297,6 +297,45 @@ def test_delete_look_over_pipe_is_bound_to_caller(tmp_path: Path) -> None:
     assert handle_request({"cmd": "profile_delete_look", "look_id": 5}, store, client=alice)["reason"] == "bad_request"
 
 
+def test_rename_look_store_and_ipc_bound_to_caller(tmp_path: Path) -> None:
+    path = tmp_path / "p.enc"
+    store = ProfileStore(path, local_machine=False)
+    alice = _user()
+    handle_request({"cmd": "profile_enroll", "embeddings": [_emb()] * 2, "append": False}, store, client=alice)
+    r = handle_request({"cmd": "profile_enroll", "embeddings": [_emb()] * 2, "append": True}, store, client=alice)
+    look_id = r["profile"]["looks"][1]["id"]
+
+    # Direct store validation & persistence
+    updated = store.rename_look("alice", look_id, "  With glasses  ")
+    assert updated.looks[1]["label"] == "With glasses"
+    reloaded = ProfileStore(path, local_machine=False).get_user("alice")
+    assert reloaded is not None and reloaded.looks[1]["label"] == "With glasses"
+
+    with pytest.raises(ValueError):
+        store.rename_look("alice", look_id, "   ")
+    with pytest.raises(ValueError):
+        store.rename_look("alice", look_id, "x" * 33)
+    with pytest.raises(KeyError):
+        store.rename_look("alice", "missing-look", "Desk")
+    with pytest.raises(KeyError):
+        store.rename_look("nobody", look_id, "Desk")
+
+    # IPC authorization & validation
+    impostor = _user("alice", sid="S-1-5-21-9-9-9-1001")
+    msg = {"cmd": "profile_rename_look", "look_id": look_id, "label": "Morning"}
+    assert handle_request(msg, store, client=impostor)["reason"] == "forbidden"
+    assert handle_request(msg, store, client=SYSTEM)["reason"] == "forbidden"
+
+    ok_resp = handle_request(msg, store, client=alice)
+    assert ok_resp["status"] == "ok"
+    assert ok_resp["profile"]["looks"][1]["label"] == "Morning"
+
+    assert handle_request({"cmd": "profile_rename_look", "look_id": "nope", "label": "Morning"}, store, client=alice)["reason"] == "not_found"
+    assert handle_request({"cmd": "profile_rename_look", "look_id": look_id, "label": "   "}, store, client=alice)["reason"] == "bad_request"
+    assert handle_request({"cmd": "profile_rename_look", "look_id": look_id, "label": "a" * 33}, store, client=alice)["reason"] == "bad_request"
+    assert handle_request({"cmd": "profile_rename_look", "look_id": 5, "label": "Morning"}, store, client=alice)["reason"] == "bad_request"
+
+
 def test_purge_data_requires_yes_and_removes_data_dir(tmp_path, monkeypatch, capsys):
     import engine.store as store_mod
     import engine.tpm as tpm_mod

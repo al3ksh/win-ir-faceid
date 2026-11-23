@@ -172,7 +172,17 @@ def normalize_looks(looks: Any, total: int, fallback_added_at: str) -> list[dict
                 out = []
                 break
             seen.add(look_id)
-            out.append({"id": look_id, "added_at": str(item.get("added_at") or fallback_added_at), "count": count})
+            entry: dict[str, Any] = {
+                "id": look_id,
+                "added_at": str(item.get("added_at") or fallback_added_at),
+                "count": count,
+            }
+            raw_label = item.get("label")
+            if isinstance(raw_label, str):
+                clean_label = raw_label.strip()[:32]
+                if clean_label:
+                    entry["label"] = clean_label
+            out.append(entry)
     if out and sum(l["count"] for l in out) == total:
         return out
     legacy: list[dict[str, Any]] = []
@@ -610,6 +620,37 @@ class ProfileStore:
         count = looks[idx]["count"]
         del profile.embeddings[start:start + count]
         del looks[idx]
+        profile.looks = looks
+        profile.updated_at = _utc_now_iso()
+        users[key] = profile
+        self._save_all(users)
+        return profile
+
+    def rename_look(self, username: str, look_id: str, label: str) -> UserProfile:
+        """Assign a custom display label (1..32 chars) to one look on a profile.
+
+        Raises ``ValueError("invalid_label")`` if ``label`` is empty after stripping
+        or longer than 32 characters, and ``KeyError("not_found")`` if the user or
+        look does not exist.
+        """
+        if not isinstance(label, str):
+            raise ValueError("invalid_label")
+        clean_label = label.strip()
+        if not clean_label or len(clean_label) > 32:
+            raise ValueError("invalid_label")
+        clean = username.strip()
+        users = self._load_all()
+        key = clean.lower()
+        profile = users.get(key)
+        if profile is None:
+            raise KeyError("not_found")
+        looks = normalize_looks(profile.looks, len(profile.embeddings), profile.created_at)
+        for look in looks:
+            if look["id"] == look_id:
+                look["label"] = clean_label
+                break
+        else:
+            raise KeyError("not_found")
         profile.looks = looks
         profile.updated_at = _utc_now_iso()
         users[key] = profile

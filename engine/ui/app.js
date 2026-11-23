@@ -3,8 +3,26 @@
 
   const $ = (id) => document.getElementById(id);
 
+  const BITLOCKER_DISMISSED_KEY = "winirfaceid.bitlockerDismissed";
+
   const CHECK_SVG =
     '<svg class="dropdown-check" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.8 7.3 5.7 10.2 11.2 4.2"/></svg>';
+
+  function createPencilSvg() {
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.5");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", "M11.3 2.5a1.5 1.5 0 0 1 2.2 2.2L5.2 13l-2.9.7.7-2.9 8.3-8.3Z");
+    svg.appendChild(path);
+    return svg;
+  }
 
   const NO_IR_ERROR_INFO = {
     code: "no_ir_camera",
@@ -23,6 +41,8 @@
 
     btnBrandRepo: $("btnBrandRepo"),
     btnVersion: $("btnVersion"),
+    btnBitlockerPill: $("btnBitlockerPill"),
+    bitlockerPillText: $("bitlockerPillText"),
     headerServiceDot: $("headerServiceDot"),
     headerServiceText: $("headerServiceText"),
     btnHeaderRestart: $("btnHeaderRestart"),
@@ -88,9 +108,6 @@
     scoreMedian: $("scoreMedian"),
     scoreThresh: $("scoreThresh"),
     scoreStatsText: $("scoreStatsText"),
-    bitlockerNotice: $("bitlockerNotice"),
-    bitlockerSub: $("bitlockerSub"),
-    btnBitlockerSettings: $("btnBitlockerSettings"),
 
     feedSegThumb: $("feedSegThumb"),
     btnFeedSubtract: $("btnFeedSubtract"),
@@ -127,6 +144,13 @@
     btnUpdateLater: $("btnUpdateLater"),
     btnUpdateGithub: $("btnUpdateGithub"),
     btnUpdateInstall: $("btnUpdateInstall"),
+
+    bitlockerModal: $("bitlockerModal"),
+    bitlockerModalTitle: $("bitlockerModalTitle"),
+    btnBitlockerClose: $("btnBitlockerClose"),
+    btnBitlockerDismissForever: $("btnBitlockerDismissForever"),
+    btnBitlockerCancel: $("btnBitlockerCancel"),
+    btnBitlockerOpenSettings: $("btnBitlockerOpenSettings"),
   };
 
   const state = {
@@ -379,7 +403,7 @@
     const list = els.looksList;
     if (!list) return;
     // Only rebuild when the looks actually change (this runs on every poll tick).
-    const key = user + "|" + looks.map((l) => `${l.id}:${l.count}`).join(",");
+    const key = user + "|" + looks.map((l) => `${l.id}:${l.count}:${l.label || ""}`).join(",");
     if (list.dataset.key === key) return;
     list.dataset.key = key;
     list.textContent = "";
@@ -394,14 +418,95 @@
       li.className = "look-row";
       const label = document.createElement("span");
       label.className = "look-label";
+      const displayLabel = look.label && String(look.label).trim() ? String(look.label).trim() : `Look ${i + 1}`;
       const name = document.createElement("span");
       name.className = "look-name";
-      name.textContent = `Look ${i + 1}`;
+      name.textContent = displayLabel;
+      name.title = "Double-click to rename";
       const meta = document.createElement("span");
       meta.className = "look-meta";
       const samples = look.count === 1 ? "1 sample" : `${look.count} samples`;
       meta.textContent = `${formatLookDate(look.added_at)} · ${samples}`;
       label.append(name, meta);
+
+      const startInlineRename = () => {
+        if (label.querySelector(".look-rename-input")) return;
+        const input = document.createElement("input");
+        input.type = "text";
+        input.maxLength = 32;
+        input.className = "look-rename-input";
+        input.value = displayLabel;
+        input.setAttribute("aria-label", "Appearance name");
+        label.replaceChild(input, name);
+        meta.classList.add("hidden");
+        input.focus();
+        input.select();
+
+        let settled = false;
+        const cancelRename = () => {
+          if (settled) return;
+          settled = true;
+          if (input.parentNode === label) {
+            label.replaceChild(name, input);
+          }
+          meta.classList.remove("hidden");
+        };
+        const commitRename = async () => {
+          if (settled) return;
+          settled = true;
+          const nextLabel = input.value.trim();
+          if (!nextLabel || nextLabel === displayLabel) {
+            if (input.parentNode === label) {
+              label.replaceChild(name, input);
+            }
+            meta.classList.remove("hidden");
+            return;
+          }
+          const a = api();
+          if (!a || typeof a.rename_look !== "function") {
+            if (input.parentNode === label) {
+              label.replaceChild(name, input);
+            }
+            meta.classList.remove("hidden");
+            return;
+          }
+          input.disabled = true;
+          const res = await a.rename_look(user, look.id, nextLabel);
+          if (res && res.profiles) state.profiles = res.profiles;
+          list.dataset.key = "";
+          renderProfileDatalist();
+          renderAccountSection();
+          if (res && res.ok) {
+            showFeedback(`Renamed appearance to '${nextLabel}'.`, "neutral");
+          } else if (res && res.error) {
+            showFeedback(res.error, "error");
+          }
+        };
+
+        input.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            commitRename();
+          } else if (ev.key === "Escape") {
+            ev.preventDefault();
+            cancelRename();
+          }
+        });
+        input.addEventListener("blur", commitRename);
+      };
+
+      name.addEventListener("dblclick", startInlineRename);
+
+      const actions = document.createElement("div");
+      actions.className = "look-actions";
+
+      const renameBtn = document.createElement("button");
+      renameBtn.type = "button";
+      renameBtn.className = "look-rename-btn";
+      renameBtn.title = "Rename appearance";
+      renameBtn.setAttribute("aria-label", "Rename appearance");
+      renameBtn.appendChild(createPencilSvg());
+      renameBtn.addEventListener("click", startInlineRename);
 
       const btn = document.createElement("button");
       btn.type = "button";
@@ -430,12 +535,13 @@
         renderProfileDatalist();
         renderAccountSection();
         if (res && res.ok) {
-          showFeedback(`Deleted look ${i + 1}.`, "neutral");
+          showFeedback(`Deleted '${displayLabel}'.`, "neutral");
         } else if (res && res.error) {
           showFeedback(res.error, "error");
         }
       });
-      li.append(label, btn);
+      actions.append(renameBtn, btn);
+      li.append(label, actions);
       list.appendChild(li);
     });
   }
@@ -499,19 +605,30 @@
     }
   }
 
-  function renderBitlockerNotice(diskEncryption) {
-    if (!els.bitlockerNotice) return;
-    if (!diskEncryption || diskEncryption.status !== "unencrypted") {
-      els.bitlockerNotice.classList.add("hidden");
+  function isBitlockerDismissed() {
+    try {
+      return window.localStorage.getItem(BITLOCKER_DISMISSED_KEY) === "1";
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  function renderBitlockerPill(diskEncryption) {
+    if (!els.btnBitlockerPill) return;
+    if (!diskEncryption || diskEncryption.status !== "unencrypted" || isBitlockerDismissed()) {
+      els.btnBitlockerPill.classList.add("hidden");
       return;
     }
-    if (els.bitlockerSub) {
-      els.bitlockerSub.textContent =
-        diskEncryption.detail === "suspended"
-          ? "BitLocker protection is suspended on drive C:."
-          : "Turn on BitLocker to protect stored credentials offline.";
+    const isSuspended = diskEncryption.detail === "suspended";
+    if (els.bitlockerPillText) {
+      els.bitlockerPillText.textContent = isSuspended ? "BitLocker paused" : "Disk unencrypted";
     }
-    els.bitlockerNotice.classList.remove("hidden");
+    if (els.bitlockerModalTitle) {
+      els.bitlockerModalTitle.textContent = isSuspended
+        ? "BitLocker protection is suspended"
+        : "System drive C: is not encrypted";
+    }
+    els.btnBitlockerPill.classList.remove("hidden");
   }
 
   function positionSegThumb(animate = true) {
@@ -762,7 +879,8 @@
     const offsetY = (vpH - drawH) * 0.5;
 
     const [nx, ny, nw, nh] = bboxNorm;
-    const x = offsetX + nx * drawW;
+    const displayNx = Math.max(0, Math.min(1 - nw, 1 - nx - nw));
+    const x = offsetX + displayNx * drawW;
     const y = offsetY + ny * drawH;
     const w = Math.max(16, nw * drawW);
     const h = Math.max(16, nh * drawH);
@@ -973,7 +1091,7 @@
       if (justCaptured) {
         sub = `Captured · Next: ${promptText}`;
       } else if (!enr.face_ok) {
-        sub = "Waiting for your face…";
+        sub = enr.position_hint || "Center your face in the frame";
       } else if (enr.count === 0 && holdPct < 40) {
         sub = "Get ready";
       } else {
@@ -989,6 +1107,7 @@
         els.enrollStageGuide.dataset.visible = state.streamFrameReady ? "true" : "false";
         els.enrollStageGuide.dataset.pose = pose;
         els.enrollStageGuide.dataset.face = enr.face_ok ? "ok" : "none";
+        els.enrollStageGuide.dataset.pos = enr.position_code || "ok";
         els.enrollStageGuide.dataset.captured = justCaptured ? "true" : "false";
       }
       if (els.stageGuideProgress) {
@@ -1017,6 +1136,7 @@
     } else {
       if (els.enrollStageGuide) {
         els.enrollStageGuide.dataset.visible = "false";
+        els.enrollStageGuide.dataset.pos = "ok";
         els.enrollStageGuide.dataset.captured = "false";
       }
       setVisible(els.enrollHud, false);
@@ -1103,7 +1223,7 @@
     renderProfileDatalist();
     renderAccountSection();
     renderServiceStatus(boot.service_status, boot.config_dirty);
-    renderBitlockerNotice(boot.disk_encryption);
+    renderBitlockerPill(boot.disk_encryption);
   }
 
   function applyBootstrap(boot) {
@@ -1137,7 +1257,7 @@
     renderFeedMode(boot.feed_mode || "subtract");
     renderModelsRow(Boolean(boot.models_ready), null);
     renderServiceStatus(boot.service_status, boot.config_dirty);
-    renderBitlockerNotice(boot.disk_encryption);
+    renderBitlockerPill(boot.disk_encryption);
     renderCameraDropdown(boot.cameras || [], boot.selected_camera ?? 0);
     state.hasIrCamera =
       boot.has_ir_camera !== undefined
@@ -1316,6 +1436,30 @@
     if (!els.updateModal) return;
     els.updateModal.dataset.open = "false";
     els.updateModal.setAttribute("aria-hidden", "true");
+  }
+
+  function isBitlockerModalOpen() {
+    return Boolean(els.bitlockerModal && els.bitlockerModal.dataset.open === "true");
+  }
+
+  function openBitlockerModal() {
+    if (!els.bitlockerModal) return;
+    closeCameraDropdown(false);
+    const disk = state.bootstrap && state.bootstrap.disk_encryption;
+    if (els.bitlockerModalTitle) {
+      els.bitlockerModalTitle.textContent =
+        disk && disk.detail === "suspended"
+          ? "BitLocker protection is suspended"
+          : "System drive C: is not encrypted";
+    }
+    els.bitlockerModal.dataset.open = "true";
+    els.bitlockerModal.setAttribute("aria-hidden", "false");
+  }
+
+  function closeBitlockerModal() {
+    if (!els.bitlockerModal) return;
+    els.bitlockerModal.dataset.open = "false";
+    els.bitlockerModal.setAttribute("aria-hidden", "true");
   }
 
   async function runEnrollAction(user, append) {
@@ -1506,6 +1650,10 @@
 
     document.addEventListener("keydown", (ev) => {
       if (ev.key === "Escape") {
+        if (isBitlockerModalOpen()) {
+          closeBitlockerModal();
+          return;
+        }
         if (isUpdateModalOpen()) {
           closeUpdateModal();
           return;
@@ -1600,8 +1748,35 @@
     });
     els.thresholdSlider.addEventListener("change", persistSecurityConfig);
 
-    if (els.btnBitlockerSettings) {
-      els.btnBitlockerSettings.addEventListener("click", async () => {
+    if (els.btnBitlockerPill) {
+      els.btnBitlockerPill.addEventListener("click", openBitlockerModal);
+    }
+    if (els.btnBitlockerClose) {
+      els.btnBitlockerClose.addEventListener("click", closeBitlockerModal);
+    }
+    if (els.btnBitlockerCancel) {
+      els.btnBitlockerCancel.addEventListener("click", closeBitlockerModal);
+    }
+    if (els.bitlockerModal) {
+      els.bitlockerModal.addEventListener("click", (ev) => {
+        if (ev.target === els.bitlockerModal) closeBitlockerModal();
+      });
+    }
+    if (els.btnBitlockerDismissForever) {
+      els.btnBitlockerDismissForever.addEventListener("click", () => {
+        try {
+          window.localStorage.setItem(BITLOCKER_DISMISSED_KEY, "1");
+        } catch (_err) {
+          // Ignore storage write errors
+        }
+        closeBitlockerModal();
+        if (els.btnBitlockerPill) {
+          els.btnBitlockerPill.classList.add("hidden");
+        }
+      });
+    }
+    if (els.btnBitlockerOpenSettings) {
+      els.btnBitlockerOpenSettings.addEventListener("click", async () => {
         const a = api();
         if (!a || typeof a.open_disk_encryption_settings !== "function") return;
         const res = await a.open_disk_encryption_settings();

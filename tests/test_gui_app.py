@@ -35,6 +35,7 @@ from engine.gui_app import (  # noqa: E402
     _resolve_window_icon_path,
     check_github_latest_release,
     classify_error,
+    evaluate_enroll_position,
     get_disk_encryption_status,
     is_newer_version,
     parse_semver,
@@ -1087,3 +1088,114 @@ def test_git_checkout_guard_and_controller_install_update(tmp_path: Path) -> Non
         assert closed_event == [True]
     finally:
         ctrl_prod.shutdown()
+
+
+def test_controller_rename_look(tmp_path: Path) -> None:
+    store = ProfileStore(tmp_path / "profiles.enc", local_machine=False)
+    vec = np.zeros(128, dtype=np.float32)
+    vec[0] = 1.0
+    store.upsert_embeddings("Alice", [vec] * 2, append=False)
+    prof = store.upsert_embeddings("Alice", [vec] * 2, append=True)
+    look_id = prof.looks[1]["id"]
+
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: [],
+        service_status_provider=lambda: "not_installed",
+        auto_start_server=False,
+    )
+    bridge = _JsApiBridge(ctrl)
+    try:
+        res = bridge.rename_look("Alice", look_id, "Glasses")
+        assert res["ok"] is True
+        assert res["error"] is None
+        alice_prof = next(p for p in res["profiles"] if p["username"] == "Alice")
+        assert alice_prof["looks"][1]["label"] == "Glasses"
+
+        empty_res = bridge.rename_look("Alice", look_id, "   ")
+        assert empty_res["ok"] is False
+        assert "1 to 32" in empty_res["error"]
+
+        long_res = bridge.rename_look("Alice", look_id, "x" * 33)
+        assert long_res["ok"] is False
+
+        missing_res = bridge.rename_look("Alice", "nonexistent", "Desk")
+        assert missing_res["ok"] is False
+    finally:
+        ctrl.shutdown()
+
+
+def test_evaluate_enroll_position_all_states() -> None:
+    assert evaluate_enroll_position(None, liveness_passed=False) == {
+        "ok": False,
+        "code": "no_face",
+        "hint": "Center your face in the frame",
+    }
+    assert evaluate_enroll_position(
+        [0.35, 0.25, 0.30, 0.48],
+        liveness_passed=False,
+        liveness_reason="overexposed_ae_settling",
+    ) == {
+        "ok": False,
+        "code": "ae_settling",
+        "hint": "Settling IR exposure...",
+    }
+    assert evaluate_enroll_position([0.38, 0.35, 0.20, 0.24], liveness_passed=True) == {
+        "ok": False,
+        "code": "too_far",
+        "hint": "Move closer",
+    }
+    assert evaluate_enroll_position(
+        [0.38, 0.30, 0.24, 0.32],
+        liveness_passed=False,
+        liveness_reason="face_too_small",
+    ) == {
+        "ok": False,
+        "code": "too_far",
+        "hint": "Move closer",
+    }
+    assert evaluate_enroll_position([0.25, 0.10, 0.50, 0.78], liveness_passed=True) == {
+        "ok": False,
+        "code": "too_close",
+        "hint": "Move slightly back",
+    }
+    # Raw cx > 0.64 sits on user's left in mirrored preview -> move right
+    assert evaluate_enroll_position([0.55, 0.25, 0.25, 0.45], liveness_passed=True) == {
+        "ok": False,
+        "code": "move_right",
+        "hint": "Move slightly right",
+    }
+    # Raw cx < 0.36 sits on user's right in mirrored preview -> move left
+    assert evaluate_enroll_position([0.10, 0.25, 0.25, 0.45], liveness_passed=True) == {
+        "ok": False,
+        "code": "move_left",
+        "hint": "Move slightly left",
+    }
+    assert evaluate_enroll_position([0.35, 0.02, 0.30, 0.40], liveness_passed=True) == {
+        "ok": False,
+        "code": "move_down",
+        "hint": "Move slightly down",
+    }
+    assert evaluate_enroll_position([0.35, 0.52, 0.30, 0.40], liveness_passed=True) == {
+        "ok": False,
+        "code": "move_up",
+        "hint": "Move slightly up",
+    }
+    assert evaluate_enroll_position(
+        [0.35, 0.25, 0.30, 0.48],
+        liveness_passed=False,
+        liveness_reason="low_ir_delta",
+    ) == {
+        "ok": False,
+        "code": "low_ir_delta",
+        "hint": "Look directly at the IR sensor",
+    }
+    assert evaluate_enroll_position([0.35, 0.25, 0.30, 0.48], liveness_passed=True) == {
+        "ok": True,
+        "code": "ok",
+        "hint": "",
+    }

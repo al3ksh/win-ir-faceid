@@ -229,6 +229,32 @@ body {
   gap: 10px;
 }
 
+.bitlocker-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 158, 11, 0.34);
+  background: rgba(245, 158, 11, 0.08);
+  color: var(--amber);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+}
+
+.bitlocker-pill:hover {
+  border-color: rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.14);
+}
+
+.bitlocker-pill-icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+}
+
 .service-pill {
   display: inline-flex;
   align-items: center;
@@ -312,14 +338,14 @@ body {
   display: block;
   background: var(--bg-stage);
   opacity: 0;
-  transform: scale(0.992);
+  transform: scaleX(-1) scale(0.992);
   pointer-events: none;
   transition: opacity 260ms var(--ease-fluid), transform 260ms var(--ease-fluid);
 }
 
 .stream-img[data-visible="true"] {
   opacity: 1;
-  transform: scale(1);
+  transform: scaleX(-1) scale(1);
 }
 
 .standby-overlay {
@@ -826,6 +852,38 @@ body {
   stroke: rgba(255, 255, 255, 0.22);
   stroke-width: 1.5;
   stroke-dasharray: 4 5;
+  transform-origin: 140px 136px;
+  transition: stroke 180ms ease, transform 240ms var(--ease-fluid);
+}
+
+.enroll-stage-guide[data-face="none"] .guide-oval-bg {
+  stroke: rgba(245, 158, 11, 0.45);
+}
+
+.enroll-stage-guide[data-pos="too_far"] .guide-oval-bg {
+  transform: scale(0.92);
+  stroke: rgba(245, 158, 11, 0.58);
+}
+
+.enroll-stage-guide[data-pos="too_close"] .guide-oval-bg {
+  transform: scale(1.08);
+  stroke: rgba(245, 158, 11, 0.58);
+}
+
+.enroll-stage-guide[data-pos="move_left"] .guide-oval-bg {
+  transform: translateX(-6px);
+}
+
+.enroll-stage-guide[data-pos="move_right"] .guide-oval-bg {
+  transform: translateX(6px);
+}
+
+.enroll-stage-guide[data-pos="move_up"] .guide-oval-bg {
+  transform: translateY(-6px);
+}
+
+.enroll-stage-guide[data-pos="move_down"] .guide-oval-bg {
+  transform: translateY(6px);
 }
 
 .guide-oval-progress {
@@ -1310,15 +1368,22 @@ input::-ms-clear {
 
 .look-label {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  flex: 1;
   min-width: 0;
 }
 
 .look-name {
+  max-width: 100%;
   color: var(--text-primary, inherit);
   font-weight: 500;
+  line-height: 1.25;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
 }
 
 .look-meta {
@@ -1327,6 +1392,56 @@ input::-ms-clear {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.look-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.look-rename-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.look-rename-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--border);
+}
+
+.look-rename-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+.look-rename-input {
+  width: 100%;
+  max-width: 148px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  outline: none;
+}
+
+.look-rename-input:focus {
+  border-color: rgba(243, 244, 246, 0.45);
 }
 
 .look-delete:disabled {
@@ -1570,45 +1685,6 @@ input::-ms-clear {
 .score-stats-text {
   font-size: 11px;
   line-height: 1.45;
-  color: var(--text-secondary);
-}
-
-/* Inline BitLocker / Disk Encryption Notice */
-.bitlocker-notice {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: 7px;
-  border: 1px solid rgba(245, 158, 11, 0.25);
-  background: rgba(245, 158, 11, 0.06);
-}
-
-.bitlocker-icon {
-  width: 14px;
-  height: 14px;
-  flex-shrink: 0;
-  color: var(--amber);
-}
-
-.bitlocker-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  flex: 1;
-  min-width: 0;
-}
-
-.bitlocker-title {
-  font-size: 11.5px;
-  font-weight: 600;
-  line-height: 1.3;
-  color: var(--text-primary);
-}
-
-.bitlocker-sub {
-  font-size: 11px;
-  line-height: 1.3;
   color: var(--text-secondary);
 }
 
@@ -2135,6 +2211,38 @@ input::-ms-clear {
   gap: 8px;
 }
 
+/* BitLocker Info Modal */
+.bitlocker-modal-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bitlocker-modal-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: var(--amber);
+}
+
+.bitlocker-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.bitlocker-modal-para {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.bitlocker-modal-para strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
 /* Reduced Motion Accessibility */
 @media (prefers-reduced-motion: reduce) {
   .app-header,
@@ -2157,7 +2265,11 @@ input::-ms-clear {
     animation: none !important;
   }
 
-  .stream-img,
+  .stream-img {
+    transform: scaleX(-1) !important;
+    transition-duration: 120ms !important;
+  }
+
   .standby-overlay,
   .stage-error-overlay,
   .hud-pill,
@@ -2187,6 +2299,7 @@ input::-ms-clear {
     transition-duration: 120ms !important;
   }
 
+  .guide-oval-bg,
   .guide-wireframe,
   .guide-captured-check {
     transition-duration: 120ms !important;

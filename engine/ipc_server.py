@@ -471,7 +471,16 @@ def _config_to_dict(cfg: ServiceConfig) -> dict[str, Any]:
 
 
 _MANAGEMENT_COMMANDS = frozenset(
-    {"profile_get", "profile_enroll", "profile_set_password", "profile_delete", "profile_delete_look", "config_get", "config_set"}
+    {
+        "profile_get",
+        "profile_enroll",
+        "profile_set_password",
+        "profile_delete",
+        "profile_delete_look",
+        "profile_rename_look",
+        "config_get",
+        "config_set",
+    }
 )
 
 
@@ -564,6 +573,29 @@ def _handle_management(
                 return _fail("not_found")
             except ValueError:
                 return _fail("last_look")
+            return {"status": "ok", "username": username, "profile": _public_profile(profile)}
+
+        if cmd == "profile_rename_look":
+            look_id = msg.get("look_id")
+            label = msg.get("label")
+            if (
+                not isinstance(look_id, str)
+                or not look_id
+                or len(look_id) > 64
+                or not isinstance(label, str)
+            ):
+                return _fail("bad_request")
+            clean_label = label.strip()
+            if not clean_label or len(clean_label) > 32:
+                return _fail("bad_request")
+            if existing is None:
+                return _fail("not_found")
+            try:
+                profile = store.rename_look(username, look_id, clean_label)
+            except KeyError:
+                return _fail("not_found")
+            except ValueError:
+                return _fail("bad_request")
             return {"status": "ok", "username": username, "profile": _public_profile(profile)}
 
         if cmd == "profile_delete":

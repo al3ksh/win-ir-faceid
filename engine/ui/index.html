@@ -29,6 +29,18 @@
       </div>
 
       <div class="header-right">
+        <button
+          class="bitlocker-pill hidden"
+          id="btnBitlockerPill"
+          type="button"
+          title="System drive encryption warning"
+        >
+          <svg class="bitlocker-pill-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="7.5" width="10" height="6.5" rx="1.5"/>
+            <path d="M5.5 7.5V5.2a2.5 2.5 0 0 1 4.7-1.2"/>
+          </svg>
+          <span id="bitlockerPillText">Disk unencrypted</span>
+        </button>
         <div class="service-pill" id="headerServicePill" title="Windows Lock Screen Service Status">
           <span class="status-dot" id="headerServiceDot"></span>
           <span id="headerServiceText">Checking service</span>
@@ -102,6 +114,7 @@
               data-visible="false"
               data-pose="center"
               data-face="none"
+              data-pos="ok"
               data-captured="false"
               aria-hidden="true"
             >
@@ -335,18 +348,6 @@
               <div class="score-stats-text tabular" id="scoreStatsText"></div>
             </div>
           </div>
-
-          <div class="bitlocker-notice hidden" id="bitlockerNotice" role="status">
-            <svg class="bitlocker-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="3" y="7.5" width="10" height="6.5" rx="1.5"/>
-              <path d="M5.5 7.5V5.2a2.5 2.5 0 0 1 4.7-1.2"/>
-            </svg>
-            <div class="bitlocker-copy">
-              <span class="bitlocker-title">Drive C: is not encrypted</span>
-              <span class="bitlocker-sub" id="bitlockerSub">Turn on BitLocker to protect stored credentials offline.</span>
-            </div>
-            <button class="btn-subtle btn-xs" id="btnBitlockerSettings" type="button">Settings</button>
-          </div>
         </section>
 
         <!-- Section: Sensor & Service -->
@@ -529,6 +530,43 @@
         <div class="update-actions-right">
           <button class="btn-secondary" id="btnUpdateGithub" type="button">View on GitHub</button>
           <button class="btn-primary" id="btnUpdateInstall" type="button">Install Update</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Minimalist BitLocker / Disk Encryption Modal -->
+  <div class="modal-backdrop" id="bitlockerModal" role="dialog" aria-modal="true" aria-labelledby="bitlockerModalTitle" data-open="false" aria-hidden="true">
+    <div class="modal-sheet modal-sheet-wide">
+      <div class="modal-header">
+        <div class="bitlocker-modal-heading">
+          <svg class="bitlocker-modal-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="7.5" width="10" height="6.5" rx="1.5"/>
+            <path d="M5.5 7.5V5.2a2.5 2.5 0 0 1 4.7-1.2"/>
+          </svg>
+          <h3 class="modal-title" id="bitlockerModalTitle">System drive C: is not encrypted</h3>
+        </div>
+        <button class="modal-close" id="btnBitlockerClose" type="button" aria-label="Close">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 4l8 8M12 4l-8 8"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="bitlocker-modal-body">
+        <p class="bitlocker-modal-para">
+          <strong>Why this matters:</strong> TPM 2.0 and Windows DPAPI protect your stored logon password while Windows is running, but if someone gains physical access to your laptop and boots another OS from USB, an unencrypted drive can be inspected or tampered with offline.
+        </p>
+        <p class="bitlocker-modal-para">
+          <strong>Recommended steps:</strong> Turn on BitLocker or Windows Device Encryption for drive C: in Windows Settings, and consider using a separate Windows password.
+        </p>
+      </div>
+
+      <div class="modal-actions update-modal-actions">
+        <button class="btn-ghost" id="btnBitlockerDismissForever" type="button">Don't show again</button>
+        <div class="update-actions-right">
+          <button class="btn-secondary" id="btnBitlockerCancel" type="button">Close</button>
+          <button class="btn-primary" id="btnBitlockerOpenSettings" type="button">Open Windows Settings</button>
         </div>
       </div>
     </div>

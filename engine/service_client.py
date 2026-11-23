@@ -236,6 +236,22 @@ class ServiceProfileClient:
             raise ServiceRequestError("not_found")
         return profile
 
+    def rename_look(self, username: str, look_id: str, label: str) -> UserProfile:
+        self._check_owner(username)
+        clean_label = str(label or "").strip()
+        if not clean_label or len(clean_label) > 32:
+            raise ValueError("invalid_label")
+        with self._lock:
+            self._cache = None
+            resp = self._request(
+                {"cmd": "profile_rename_look", "look_id": str(look_id), "label": clean_label}
+            )
+            profile = _profile_from_remote(resp.get("profile"))
+            self._set_cache(profile)
+        if profile is None:
+            raise ServiceRequestError("not_found")
+        return profile
+
     def delete_user(self, username: str) -> bool:
         self._check_owner(username)
         with self._lock:
