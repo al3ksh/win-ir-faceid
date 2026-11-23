@@ -49,6 +49,7 @@ from engine.recognizer import FaceDetection  # noqa: E402
 from engine.store import ProfileStore, ServiceConfig, save_service_config  # noqa: E402
 from engine.ui.generate_app_icon import ICON_SIZES, generate_app_icon  # noqa: E402
 from engine.updater import (  # noqa: E402
+    VerifiedUpdatePackage,
     download_and_verify_update,
     fetch_latest_release,
     is_allowed_release_url,
@@ -929,15 +930,19 @@ def test_download_and_verify_update_passes_and_deletes_on_tampered_hash(
 
     progress_events: list[tuple[int, int | None]] = []
     work_ok = tmp_path / "work_ok"
-    extracted = download_and_verify_update(
+    pkg = download_and_verify_update(
         zip_url,
         sums_url,
         zip_name,
         work_ok,
         progress_cb=lambda d, t: progress_events.append((d, t)),
     )
-    assert extracted == work_ok / "extracted"
-    assert (extracted / "scripts" / "apply_update.ps1").is_file()
+    assert isinstance(pkg, VerifiedUpdatePackage)
+    assert pkg.zip_path == work_ok / zip_name
+    assert pkg.zip_path.is_file()
+    assert pkg.sha256 == valid_hash
+    assert pkg.zip_name == zip_name
+    assert not (work_ok / "extracted").exists()
     assert progress_events and progress_events[-1] == (len(zip_bytes), len(zip_bytes))
 
     # Tampered SHA-256 must fail AND delete the downloaded zip
@@ -1003,23 +1008,93 @@ def test_fetch_latest_release_parses_delta_assets_and_git_flag(
 
 
 def test_git_checkout_guard_and_controller_install_update(tmp_path: Path) -> None:
-    extracted = tmp_path / "extracted"
-    (extracted / "scripts").mkdir(parents=True)
-    (extracted / "scripts" / "apply_update.ps1").write_text("exit 0\n", encoding="utf-8")
+    cleanup_dir = tmp_path / "cleanup"
+    cleanup_dir.mkdir()
+    # Even if an attacker plants a script inside cleanup_dir / %TEMP%, it must never be executed.
+    (cleanup_dir / "scripts").mkdir()
+    (cleanup_dir / "scripts" / "apply_update.ps1").write_text("evil\n", encoding="utf-8")
+
+    zip_path = cleanup_dir / "WinIRFaceID-Update-v0.3.0-win64.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("engine/__init__.py", '__version__ = "0.3.0"\n')
+    valid_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest().upper()
 
     git_target = tmp_path / "dev_repo"
     (git_target / ".git").mkdir(parents=True)
-    called_shell: list[object] = []
+    (git_target / "scripts").mkdir(parents=True)
+    (git_target / "scripts" / "apply_update.ps1").write_text("exit 0\n", encoding="utf-8")
+    called_shell: list[tuple[object, ...]] = []
     guard_res = launch_elevated_update(
-        extracted,
+        zip_path,
+        valid_sha,
         git_target,
-        tmp_path / "cleanup",
+        cleanup_dir,
         1234,
         shell_execute=lambda *args: called_shell.append(args) or 42,
     )
     assert guard_res["ok"] is False
     assert "git checkout" in str(guard_res["error"]).lower()
     assert called_shell == []
+
+    # Valid installed target executes target_dir/scripts/apply_update.ps1 with -ZipPath & -ExpectedSha256
+    prod_target = tmp_path / "prod_install"
+    (prod_target / "scripts").mkdir(parents=True)
+    installed_apply = prod_target / "scripts" / "apply_update.ps1"
+    installed_apply.write_text("exit 0\n", encoding="utf-8")
+
+    # Rejects invalid SHA-256 strings
+    for bad_sha in ("", "abc", "z" * 64, f"{'a' * 63}!", f" {'a' * 64}"):
+        bad_sha_res = launch_elevated_update(
+            zip_path,
+            bad_sha,
+            prod_target,
+            cleanup_dir,
+            1234,
+            shell_execute=lambda *args: called_shell.append(args) or 42,
+        )
+        assert bad_sha_res["ok"] is False
+        assert "sha-256" in str(bad_sha_res["error"]).lower()
+    assert called_shell == []
+
+    # Rejects missing installed scripts/apply_update.ps1
+    missing_script_target = tmp_path / "missing_script_install"
+    missing_script_target.mkdir()
+    missing_res = launch_elevated_update(
+        zip_path,
+        valid_sha,
+        missing_script_target,
+        cleanup_dir,
+        1234,
+        shell_execute=lambda *args: called_shell.append(args) or 42,
+    )
+    assert missing_res["ok"] is False
+    assert "apply_update.ps1" in str(missing_res["error"])
+    assert called_shell == []
+
+    # Launches installed apply_update.ps1 (not cleanup_dir), passes -ZipPath & -ExpectedSha256, no -RelaunchGui / -SourceDir
+    launch_ok = launch_elevated_update(
+        zip_path,
+        valid_sha,
+        prod_target,
+        cleanup_dir,
+        4321,
+        shell_execute=lambda *args: called_shell.append(args) or 42,
+    )
+    assert launch_ok["ok"] is True
+    assert len(called_shell) == 1
+    _hwnd, verb, exe, params, _workdir, show = called_shell[0]
+    assert verb == "runas"
+    assert exe == "powershell.exe"
+    assert show == 0
+    assert f'-File "{installed_apply}"' in str(params)
+    assert str(cleanup_dir / "scripts" / "apply_update.ps1") not in str(params)
+    assert f'-ZipPath "{zip_path}"' in str(params)
+    assert f"-ExpectedSha256 {valid_sha.lower()}" in str(params)
+    assert f'-TargetDir "{prod_target}"' in str(params)
+    assert "-WaitPid 4321" in str(params)
+    assert f'-CleanupDir "{cleanup_dir}"' in str(params)
+    assert "-RelaunchGui" not in str(params)
+    assert "-SourceDir" not in str(params)
 
     # Controller refuses install_update inside a git checkout
     cfg_path = tmp_path / "service_config.json"
@@ -1061,9 +1136,13 @@ def test_git_checkout_guard_and_controller_install_update(tmp_path: Path) -> Non
     finally:
         ctrl_git.shutdown()
 
-    # Non-git install dir succeeds and schedules close_callback
-    prod_target = tmp_path / "prod_install"
-    prod_target.mkdir()
+    # Non-git install dir succeeds, passes VerifiedUpdatePackage fields, and schedules close_callback
+    pkg = VerifiedUpdatePackage(
+        zip_path=zip_path,
+        sha256=valid_sha.lower(),
+        zip_name="WinIRFaceID-Update-v0.3.0-win64.zip",
+    )
+    launcher_calls: list[tuple[object, ...]] = []
     closed_event = []
     ctrl_prod = WinIRFaceIDController(
         store=store,
@@ -1086,8 +1165,8 @@ def test_git_checkout_guard_and_controller_install_update(tmp_path: Path) -> Non
             "no_releases": False,
             "error": None,
         },
-        update_downloader=lambda *_a, **_kw: extracted,
-        update_launcher=lambda *_a, **_kw: {"ok": True, "code": 42, "error": None},
+        update_downloader=lambda *_a, **_kw: pkg,
+        update_launcher=lambda *args, **_kw: launcher_calls.append(args) or {"ok": True, "code": 42, "error": None},
         auto_start_server=False,
     )
     bridge = _JsApiBridge(ctrl_prod)
@@ -1097,7 +1176,7 @@ def test_git_checkout_guard_and_controller_install_update(tmp_path: Path) -> Non
         assert start_res["ok"] is True
         assert start_res["started"] is True
 
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + 4.0
         while time.monotonic() < deadline:
             if closed_event and ctrl_prod.get_state()["update"]["ready_to_close"] is True:
                 break
@@ -1108,8 +1187,33 @@ def test_git_checkout_guard_and_controller_install_update(tmp_path: Path) -> Non
         assert upd_st["ready_to_close"] is True
         assert upd_st["error"] is None
         assert closed_event == [True]
+        assert len(launcher_calls) == 1
+        assert launcher_calls[0][0] == zip_path
+        assert launcher_calls[0][1] == valid_sha.lower()
+        assert launcher_calls[0][2] == prod_target
     finally:
         ctrl_prod.shutdown()
+
+
+def test_apply_update_ps1_syntax_valid() -> None:
+    if sys.platform != "win32":
+        pytest.skip("PowerShell syntax parser only runs on Windows")
+
+    import shutil
+    import subprocess
+
+    ps_exe = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if not ps_exe:
+        pytest.skip("PowerShell executable not available")
+
+    script_path = _REPO_ROOT / "scripts" / "apply_update.ps1"
+    ps_cmd = (
+        "$errs = $null; $tokens = $null; "
+        f"[void][System.Management.Automation.Language.Parser]::ParseFile('{script_path}', [ref]$tokens, [ref]$errs); "
+        "if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_.ToString() }; exit 1 }"
+    )
+    proc = subprocess.run([ps_exe, "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"PowerShell syntax errors: {proc.stderr}\n{proc.stdout}"
 
 
 def test_controller_rename_look(tmp_path: Path) -> None:

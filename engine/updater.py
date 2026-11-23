@@ -11,6 +11,7 @@ import stat
 import urllib.error
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -18,6 +19,7 @@ from urllib.parse import urlparse
 from engine import REPO_URL, RELEASES_API_URL, __version__
 
 _SEMVER_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _SHA256_LINE_RE = re.compile(r"^\s*([0-9a-fA-F]{64})\s+[*]?(.+?)\s*$")
 _ALLOWED_ASSET_HOSTS = frozenset(
     {
@@ -341,6 +343,15 @@ def safe_extract_zip(zip_path: Path, dest_dir: Path) -> Path:
     return dest_dir
 
 
+@dataclass(frozen=True)
+class VerifiedUpdatePackage:
+    """Verified delta update archive ready for admin-only staging and extraction."""
+
+    zip_path: Path
+    sha256: str
+    zip_name: str
+
+
 def download_and_verify_update(
     zip_url: str,
     checksums_url: str,
@@ -352,8 +363,8 @@ def download_and_verify_update(
     stage_cb: Callable[[str], None] | None = None,
     urlopen_fn: Callable[..., Any] | None = None,
     timeout: float = 20.0,
-) -> Path:
-    """Download SHA256SUMS.txt + delta zip, verify SHA-256 strictly, and safely extract."""
+) -> VerifiedUpdatePackage:
+    """Download SHA256SUMS.txt and the delta zip, verify SHA-256 strictly, and keep zip unextracted."""
     if not is_allowed_release_url(zip_url):
         raise ValueError("Update download URL is not allowed.")
     if not is_allowed_release_url(checksums_url):
@@ -439,11 +450,7 @@ def download_and_verify_update(
         zip_path.unlink(missing_ok=True)
         raise ValueError("SHA-256 verification failed")
 
-    if stage_cb is not None:
-        stage_cb("extracting")
-
-    extracted_dir = work_dir / "extracted"
-    return safe_extract_zip(zip_path, extracted_dir)
+    return VerifiedUpdatePackage(zip_path=zip_path, sha256=actual_sha256, zip_name=zip_name)
 
 
 def _ps_quote_arg(value: str) -> str:
@@ -452,14 +459,15 @@ def _ps_quote_arg(value: str) -> str:
 
 
 def launch_elevated_update(
-    extracted_dir: Path,
+    zip_path: Path,
+    expected_sha256: str,
     target_dir: Path,
     cleanup_dir: Path,
     wait_pid: int,
     *,
     shell_execute: Callable[..., int] | None = None,
 ) -> dict[str, Any]:
-    """Launch elevated PowerShell to run apply_update.ps1 in-place (refuses .git checkouts)."""
+    """Launch elevated PowerShell to run installed apply_update.ps1 in-place (refuses .git checkouts)."""
     target_path = Path(target_dir)
     if (target_path / ".git").exists():
         return {
@@ -468,12 +476,27 @@ def launch_elevated_update(
             "error": "Refusing in-place update inside a git checkout.",
         }
 
-    apply_script = Path(extracted_dir) / "scripts" / "apply_update.ps1"
+    if not isinstance(expected_sha256, str) or _SHA256_HEX_RE.fullmatch(expected_sha256) is None:
+        return {
+            "ok": False,
+            "code": 0,
+            "error": "Invalid SHA-256 checksum for update package.",
+        }
+
+    verified_zip = Path(zip_path)
+    if not verified_zip.is_file():
+        return {
+            "ok": False,
+            "code": 0,
+            "error": "Verified update archive was not found.",
+        }
+
+    apply_script = target_path / "scripts" / "apply_update.ps1"
     if not apply_script.is_file():
         return {
             "ok": False,
             "code": 0,
-            "error": "Update package is missing scripts/apply_update.ps1.",
+            "error": "Installed application is missing scripts/apply_update.ps1.",
         }
 
     params = " ".join(
@@ -485,13 +508,14 @@ def launch_elevated_update(
             "Hidden",
             "-File",
             _ps_quote_arg(str(apply_script)),
-            "-SourceDir",
-            _ps_quote_arg(str(Path(extracted_dir))),
+            "-ZipPath",
+            _ps_quote_arg(str(verified_zip)),
+            "-ExpectedSha256",
+            expected_sha256.lower(),
             "-TargetDir",
             _ps_quote_arg(str(target_path)),
             "-WaitPid",
             str(int(wait_pid)),
-            "-RelaunchGui",
             "-CleanupDir",
             _ps_quote_arg(str(Path(cleanup_dir))),
         ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import hmac
 import json
 import logging
@@ -55,6 +56,7 @@ from engine.service_client import (
     ServiceUnavailableError,
 )
 from engine.updater import (
+    VerifiedUpdatePackage,
     download_and_verify_update,
     fetch_latest_release,
     is_newer_version,
@@ -896,7 +898,7 @@ class WinIRFaceIDController:
         service_restarter: Callable[[], dict[str, Any]] | None = None,
         url_opener: Callable[[str], Any] | None = None,
         update_checker: Callable[[], dict[str, Any]] | None = None,
-        update_downloader: Callable[..., Path] | None = None,
+        update_downloader: Callable[..., Any] | None = None,
         update_launcher: Callable[..., dict[str, Any]] | None = None,
         app_root: Path | str | None = None,
         disk_encryption_provider: Callable[[], dict[str, Any]] | None = None,
@@ -2295,7 +2297,7 @@ class WinIRFaceIDController:
         return res
 
     def install_update(self) -> dict[str, Any]:
-        """Download, SHA-256 verify, extract, and launch the elevated delta update installer."""
+        """Download and SHA-256 verify the delta update package, then launch the elevated updater."""
         with self._lock:
             if self._update_state["active"]:
                 return {"ok": True, "started": False, "state": self.get_state()}
@@ -2370,7 +2372,7 @@ class WinIRFaceIDController:
             work_dir = Path(tempfile.mkdtemp(prefix="winirfaceid-update-"))
             try:
                 if self._update_downloader is download_and_verify_update:
-                    extracted_dir = self._update_downloader(
+                    dl_result = self._update_downloader(
                         zip_url,
                         str(checksums_url),
                         zip_name,
@@ -2379,7 +2381,7 @@ class WinIRFaceIDController:
                         stage_cb=_on_stage,
                     )
                 else:
-                    extracted_dir = self._update_downloader(
+                    dl_result = self._update_downloader(
                         zip_url,
                         str(checksums_url),
                         zip_name,
@@ -2387,12 +2389,27 @@ class WinIRFaceIDController:
                         progress_cb=_on_progress,
                     )
 
+                if isinstance(dl_result, VerifiedUpdatePackage):
+                    pkg_zip_path = dl_result.zip_path
+                    pkg_sha256 = dl_result.sha256
+                elif isinstance(dl_result, tuple) and len(dl_result) >= 2:
+                    pkg_zip_path = Path(dl_result[0])
+                    pkg_sha256 = str(dl_result[1])
+                else:
+                    pkg_zip_path = Path(dl_result)
+                    pkg_sha256 = (
+                        hashlib.sha256(pkg_zip_path.read_bytes()).hexdigest()
+                        if pkg_zip_path.is_file()
+                        else ""
+                    )
+
                 with self._lock:
                     self._update_state["stage"] = "launching"
 
                 self._stop_camera_and_loop()
                 launch_res = self._update_launcher(
-                    extracted_dir,
+                    pkg_zip_path,
+                    pkg_sha256,
                     self._app_root,
                     work_dir,
                     os.getpid(),
@@ -2414,7 +2431,7 @@ class WinIRFaceIDController:
                         except Exception:  # noqa: BLE001
                             logger.debug("Window close callback skipped after update launch.")
 
-                    threading.Timer(0.25, _close_window).start()
+                    threading.Timer(1.8, _close_window).start()
             except Exception as exc:  # noqa: BLE001
                 logger.error("Delta update failed: %s", exc)
                 shutil.rmtree(work_dir, ignore_errors=True)

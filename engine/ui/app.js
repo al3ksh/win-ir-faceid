@@ -1400,7 +1400,7 @@
         downloading: "Downloading delta package...",
         verifying: "Verifying SHA-256 checksum...",
         extracting: "Extracting package...",
-        launching: "Launching elevated updater...",
+        launching: "Installing update — closing app. Reopen WinIRFaceID from the Start Menu in a few seconds.",
       };
       els.updateProgressLabel.textContent = stageLabels[stage] || "Preparing update...";
 

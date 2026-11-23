@@ -140,7 +140,7 @@ cd win-ir-faceid
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
 
 *(Tip: After cloning, you can also double-click `Install.bat` or run `.\scripts\setup.ps1` as Administrator — it copies the app into `Program Files\WinIRFaceID`, downloads the private Python runtime, and, if CMake and Visual Studio Build Tools are on `PATH`, builds the C++ targets and completes the full setup automatically.)*
