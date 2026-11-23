@@ -502,6 +502,7 @@ def launch_elevated_update(
     params = " ".join(
         [
             "-NoProfile",
+            "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-WindowStyle",

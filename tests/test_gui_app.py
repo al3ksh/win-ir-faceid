@@ -1086,6 +1086,7 @@ def test_git_checkout_guard_and_controller_install_update(tmp_path: Path) -> Non
     assert verb == "runas"
     assert exe == "powershell.exe"
     assert show == 0
+    assert "-NonInteractive" in str(params)
     assert f'-File "{installed_apply}"' in str(params)
     assert str(cleanup_dir / "scripts" / "apply_update.ps1") not in str(params)
     assert f'-ZipPath "{zip_path}"' in str(params)

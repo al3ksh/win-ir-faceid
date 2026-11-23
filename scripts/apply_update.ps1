@@ -9,6 +9,9 @@
     updates pip dependencies only if requirements.txt changed, registers the updated Credential
     Provider DLL, restarts and verifies the service, and rolls back automatically on failure.
 #>
+# Permanent backward-compatible CLI contract (v0.3.0+): -ZipPath, -ExpectedSha256,
+# -TargetDir, -WaitPid, and -CleanupDir must remain supported because the installed
+# script executes future updates. Any new parameters added later must be optional.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
