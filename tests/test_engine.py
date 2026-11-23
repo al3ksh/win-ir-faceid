@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import sys
 import threading
@@ -1298,6 +1299,12 @@ def test_gui_on_demand_camera_standby_and_open_eyes(tmp_path: Path) -> None:
                 dlg.destroy()
         finally:
             app._on_close()
+            # Clear tk root/dialog references and collect on the main thread so
+            # tk.Variable.__del__ never fires later from a background thread.
+            dlg = None
+            del dlg
+            del app
+            gc.collect()
 
 
 def test_winrt_persistent_loop_reuses_single_thread() -> None:
@@ -1456,6 +1463,7 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
         recognizer_factory=lambda: mock_rec,
         service_status_provider=lambda: svc_state["status"],
         service_restarter=_restart_stub,
+        disk_encryption_provider=lambda: {"status": "encrypted", "code": 1, "detail": "protected"},
     )
 
     try:
