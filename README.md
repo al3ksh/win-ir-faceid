@@ -37,6 +37,9 @@ WinIRFaceID is designed to be auditable, isolated, and safe to run on a daily-dr
 - **No User-Writable Code Runs as SYSTEM:** The service runs from `Program Files\WinIRFaceID` on a private Python runtime (`runtime\python`, official PSF-signed CPython) instead of any per-user Python install, so non-administrators cannot inject code into the `LocalSystem` process.
 - **Strictly Additive Lock Screen Integration:** Does not implement `ICredentialProviderFilter` and never disables Windows Hello PIN, Fingerprint, or Password.
 
+> [!IMPORTANT]
+> **Physical Security (BitLocker & Account Password):** While TPM 2.0, machine-scoped DPAPI, and hardened NTFS ACLs protect stored credentials while Windows is running, **full-disk encryption (BitLocker or Windows Device Encryption on `C:`)** is the only real defense against an attacker with physical access who boots another OS from USB to inspect or tamper with the drive offline. The WinIRFaceID desktop app automatically checks drive `C:` and warns you if BitLocker or Device Encryption is off or suspended. Because WinIRFaceID stores your Windows logon password locally to unlock your session, use a dedicated Windows logon password (or a distinct local account password) rather than reusing a high-value online password.
+
 ---
 
 ## Features & UX Highlights
@@ -118,6 +121,9 @@ Zero Visual Studio, CMake, or manual Python steps required — download from [Gi
 
 - **Wizard Installer (`WinIRFaceID-Setup-vX.Y.Z-x64.exe`):** Run the installer and follow the setup wizard. It installs into `Program Files\WinIRFaceID` with its own bundled Python runtime, dependencies, and ONNX models (works fully offline), sets up `.venv`, installs `WinIRFaceIDService`, registers the lock screen Credential Provider, creates your Start Menu shortcut, and offers to launch **WinIRFaceID**. Setup runs in the background with a progress indicator; if any step fails, the wizard tells you and the full log is in `Program Files\WinIRFaceID\setup.log`. Upgrading over an older version replaces a venv that was built on a per-user Python.
 - **Portable Release ZIP (`WinIRFaceID-vX.Y.Z-win64.zip`):** Extract the archive to a permanent folder and double-click **`Install.bat`** (requests Administrator UAC once, copies itself into `Program Files\WinIRFaceID`, and configures everything automatically).
+
+> [!NOTE]
+> **Windows SmartScreen:** `WinIRFaceID-Setup-vX.Y.Z-x64.exe` is an unsigned open-source binary compiled transparently by GitHub Actions (without a paid EV code-signing certificate), so Windows Defender SmartScreen will show **"Windows protected your PC"**. Click **More info → Run anyway** to run the installer. You can also verify your download against `SHA256SUMS.txt`, inspect [`.github/workflows/release.yml`](.github/workflows/release.yml), or build from source in [Option 2](#option-2-build-from-source-developers).
 
 Once the **WinIRFaceID** desktop window opens:
 1. Verify your Windows username is filled in under **Account** and click **Enroll Face** (7 guided active-IR captures). If you wear glasses, click **Add Appearance** afterwards to enroll an additional look with glasses on.

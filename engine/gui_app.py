@@ -108,9 +108,11 @@ _MAX_EMBEDDINGS_PER_USER = 32
 # Time each pose prompt stays on screen before its sample is taken, so the user can
 # read it and move. The first pose gets extra "get ready" time.
 # Only counts while a live face is in frame, so stepping away never skips a pose.
-_ENROLL_MIN_INTERVAL = 2.8
+_ENROLL_MIN_INTERVAL = 3.2
 _ENROLL_GET_READY_FACTOR = 1.5
+_ENROLL_CAPTURE_PAUSE = 0.65
 _JPEG_QUALITY = 88
+_DEVICE_ENCRYPTION_SETTINGS_URI = "ms-settings:deviceencryption"
 
 _DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19
 _DWMWA_USE_IMMERSIVE_DARK_MODE = 20
@@ -413,6 +415,55 @@ def restart_service_uac(service_name: str = SERVICE_NAME) -> dict[str, Any]:
         "code": rc,
         "error": "Elevation was cancelled or failed." if rc == 5 else f"ShellExecuteW failed ({rc}).",
     }
+
+
+def _map_bitlocker_code(raw_val: Any) -> dict[str, Any]:
+    """Map a Windows ``System.Volume.BitLockerProtection`` integer code to UI status."""
+    if raw_val is None or isinstance(raw_val, (bool, float)):
+        return {"status": "unknown", "code": None, "detail": "unknown"}
+    try:
+        code = int(raw_val)
+    except (TypeError, ValueError):
+        return {"status": "unknown", "code": None, "detail": "unknown"}
+
+    if code in (1, 3, 6):
+        return {"status": "encrypted", "code": code, "detail": "protected"}
+    if code in (2, 4):
+        return {"status": "unencrypted", "code": code, "detail": "off"}
+    if code == 5:
+        return {"status": "unencrypted", "code": code, "detail": "suspended"}
+    if code in (7, 8):
+        return {"status": "unencrypted", "code": code, "detail": "waiting_activation"}
+    return {"status": "unknown", "code": None, "detail": "unknown"}
+
+
+def get_disk_encryption_status(drive: str = "C:\\") -> dict[str, Any]:
+    """Query BitLocker / Device Encryption state for *drive* without Administrator privileges."""
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return {"status": "unknown", "code": None, "detail": "unknown"}
+
+    co_initialized = False
+    try:
+        pythoncom.CoInitialize()
+        co_initialized = True
+        shell = win32com.client.Dispatch("Shell.Application")
+        ns = shell.NameSpace(drive)
+        if ns is None or getattr(ns, "Self", None) is None:
+            return {"status": "unknown", "code": None, "detail": "unknown"}
+        raw_val = ns.Self.ExtendedProperty("System.Volume.BitLockerProtection")
+    except Exception:  # noqa: BLE001
+        return {"status": "unknown", "code": None, "detail": "unknown"}
+    finally:
+        if co_initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return _map_bitlocker_code(raw_val)
 
 
 def _get_window_hwnd(window: Any) -> int:
@@ -737,6 +788,8 @@ class WinIRFaceIDController:
         service_restarter: Callable[[], dict[str, Any]] | None = None,
         url_opener: Callable[[str], Any] | None = None,
         update_checker: Callable[[], dict[str, Any]] | None = None,
+        disk_encryption_provider: Callable[[], dict[str, Any]] | None = None,
+        settings_opener: Callable[[str], Any] | None = None,
         auto_start_server: bool = True,
     ) -> None:
         self._store = store if store is not None else _default_profile_store()
@@ -752,6 +805,8 @@ class WinIRFaceIDController:
         self._service_restarter = service_restarter or restart_service_uac
         self._url_opener = url_opener or webbrowser.open
         self._update_checker = update_checker or check_github_latest_release
+        self._disk_encryption_provider = disk_encryption_provider or get_disk_encryption_status
+        self._settings_opener = settings_opener
 
         self._lock = threading.RLock()
         self._frame_cond = threading.Condition()
@@ -784,6 +839,7 @@ class WinIRFaceIDController:
         self._enroll_embeddings: list[np.ndarray] = []
         self._last_enroll_capture_ts: float = 0.0
         self._enroll_hold: float = 0.0
+        self._enroll_pause_until: float = 0.0
         self._last_processed_pair_ts: float | None = None
 
         self._proc_stop = threading.Event()
@@ -844,6 +900,7 @@ class WinIRFaceIDController:
                 "count": 0,
                 "target": _ENROLL_TARGET,
                 "prompt": "",
+                "just_captured": False,
                 "completed_user": completed_user,
                 "completed_append": bool(completed_append),
             },
@@ -1041,6 +1098,7 @@ class WinIRFaceIDController:
             self._enroll_embeddings = []
             self._enroll_username = ""
             self._enroll_append = False
+            self._enroll_pause_until = 0.0
             self._last_processed_pair_ts = None
             self._motion_tracker.reset()
             self._state = self._build_standby_state(
@@ -1215,8 +1273,9 @@ class WinIRFaceIDController:
                     now_tick = time.monotonic()
                     face_ok = det is not None and liveness is not None and liveness.passed
                     with self._lock:
-                        if face_ok:
-                            # Accumulate hold time only while a live face is visible.
+                        in_pause = now_tick < self._enroll_pause_until
+                        if not in_pause and face_ok:
+                            # Accumulate hold time only while a live face is visible and not in transition beat.
                             self._enroll_hold += min(0.25, max(0.0, now_tick - self._last_enroll_capture_ts))
                         self._last_enroll_capture_ts = now_tick
                     completed_user = ""
@@ -1227,7 +1286,8 @@ class WinIRFaceIDController:
                     append_mode = False
                     samples: list[Any] = []
                     if (
-                        is_new_pair
+                        not in_pause
+                        and is_new_pair
                         and rec is not None
                         and det is not None
                         and liveness is not None
@@ -1244,6 +1304,10 @@ class WinIRFaceIDController:
                                     append_mode = self._enroll_append
                                     samples = list(self._enroll_embeddings)
                                     enroll_done = True
+                                else:
+                                    pause_s = self._enroll_capture_pause()
+                                    if pause_s > 0.0:
+                                        self._enroll_pause_until = time.monotonic() + pause_s
                             if enroll_done:
                                 # Pipe I/O to the service happens outside the state lock.
                                 try:
@@ -1372,8 +1436,10 @@ class WinIRFaceIDController:
                         break
                     count = len(self._enroll_embeddings)
                     ready_in = 0.0
+                    just_captured = False
                     if self._mode == "enroll":
                         ready_in = max(0.0, self._enroll_dwell() - self._enroll_hold)
+                        just_captured = time.monotonic() < self._enroll_pause_until
                     pose = _POSE_STEPS[min(count, len(_POSE_STEPS) - 1)][0] if self._mode == "enroll" else ""
                     prompt = (
                         _POSE_PROMPTS[min(count, len(_POSE_PROMPTS) - 1)]
@@ -1397,6 +1463,7 @@ class WinIRFaceIDController:
                             "ready_in": round(ready_in, 2),
                             "pose": pose,
                             "face_ok": bool(det is not None and liveness is not None and liveness.passed),
+                            "just_captured": just_captured,
                             "dwell": round(self._enroll_dwell(), 2) if self._mode == "enroll" else 0.0,
                             "completed_user": "",
                             "append": self._enroll_append,
@@ -1437,6 +1504,11 @@ class WinIRFaceIDController:
             selected_camera_idx = self._selected_camera_idx
             has_ir_camera = bool(any(getattr(c, "is_ir", False) for c in self._cameras))
 
+        try:
+            disk_encryption = dict(self._disk_encryption_provider())
+        except Exception:  # noqa: BLE001
+            disk_encryption = {"status": "unknown", "code": None, "detail": "unknown"}
+
         return {
             "version": __version__,
             "repo_url": REPO_URL,
@@ -1454,6 +1526,7 @@ class WinIRFaceIDController:
             "selected_camera": selected_camera_idx,
             "has_ir_camera": has_ir_camera,
             "feed_mode": feed_mode,
+            "disk_encryption": disk_encryption,
         }
 
     def get_state(self) -> dict[str, Any]:
@@ -1486,8 +1559,14 @@ class WinIRFaceIDController:
             return _ENROLL_MIN_INTERVAL * _ENROLL_GET_READY_FACTOR
         return _ENROLL_MIN_INTERVAL
 
+    def _enroll_capture_pause(self) -> float:
+        """Brief transition beat after a captured sample before accumulating the next pose."""
+        if _ENROLL_MIN_INTERVAL <= 0.05:
+            return 0.0
+        return float(_ENROLL_CAPTURE_PAUSE)
+
     def start_enroll(self, username: str, append: bool = False) -> dict[str, Any]:
-        """Start 8-sample active-IR face enrollment for *username*."""
+        """Start multi-sample active-IR face enrollment for *username*."""
         clean = str(username or "").strip()
         if not clean:
             return {"ok": False, "error": "Enter a Windows username first.", "state": self.get_state()}
@@ -1538,6 +1617,7 @@ class WinIRFaceIDController:
             # The hold clock starts now: the first prompt is shown before any capture.
             self._last_enroll_capture_ts = time.monotonic()
             self._enroll_hold = 0.0
+            self._enroll_pause_until = 0.0
             self._state = {
                 **self._build_standby_state(),
                 "mode": "enroll",
@@ -1548,6 +1628,7 @@ class WinIRFaceIDController:
                     "prompt": _POSE_PROMPTS[0],
                     "pose": _POSE_STEPS[0][0],
                     "face_ok": False,
+                    "just_captured": False,
                     "ready_in": round(_ENROLL_MIN_INTERVAL * _ENROLL_GET_READY_FACTOR, 2),
                     "dwell": round(_ENROLL_MIN_INTERVAL * _ENROLL_GET_READY_FACTOR, 2),
                     "completed_user": "",
@@ -1844,6 +1925,21 @@ class WinIRFaceIDController:
             "config_dirty": dirty,
         }
 
+    def open_disk_encryption_settings(self) -> dict[str, Any]:
+        """Open Windows Settings -> Device encryption / BitLocker without elevation."""
+        target = _DEVICE_ENCRYPTION_SETTINGS_URI
+        try:
+            if self._settings_opener is not None:
+                self._settings_opener(target)
+            else:
+                startfile = getattr(os, "startfile", None)
+                if startfile is None:
+                    return {"ok": False, "error": "Windows Settings launcher is unavailable."}
+                startfile(target)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "uri": target, "error": None}
+
     def open_external_url(self, url: str | None = None) -> dict[str, Any]:
         """Open a strictly validated GitHub repository or release URL in the default browser."""
         target = str(url).strip() if url else REPO_URL
@@ -1948,6 +2044,9 @@ class _JsApiBridge:
 
     def restart_service(self) -> dict[str, Any]:
         return self._ctrl.restart_service()
+
+    def open_disk_encryption_settings(self) -> dict[str, Any]:
+        return self._ctrl.open_disk_encryption_settings()
 
     def open_external_url(self, url: str | None = None) -> dict[str, Any]:
         return self._ctrl.open_external_url(url)

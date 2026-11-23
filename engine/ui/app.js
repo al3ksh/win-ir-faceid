@@ -39,6 +39,8 @@
     btnErrorRescan: $("btnErrorRescan"),
     btnErrorDismiss: $("btnErrorDismiss"),
     faceReticle: $("faceReticle"),
+    enrollStageGuide: $("enrollStageGuide"),
+    stageGuideProgress: $("stageGuideProgress"),
     aePill: $("aePill"),
     matchPill: $("matchPill"),
     matchPillText: $("matchPillText"),
@@ -86,6 +88,9 @@
     scoreMedian: $("scoreMedian"),
     scoreThresh: $("scoreThresh"),
     scoreStatsText: $("scoreStatsText"),
+    bitlockerNotice: $("bitlockerNotice"),
+    bitlockerSub: $("bitlockerSub"),
+    btnBitlockerSettings: $("btnBitlockerSettings"),
 
     feedSegThumb: $("feedSegThumb"),
     btnFeedSubtract: $("btnFeedSubtract"),
@@ -479,6 +484,21 @@
     }
   }
 
+  function renderBitlockerNotice(diskEncryption) {
+    if (!els.bitlockerNotice) return;
+    if (!diskEncryption || diskEncryption.status !== "unencrypted") {
+      els.bitlockerNotice.classList.add("hidden");
+      return;
+    }
+    if (els.bitlockerSub) {
+      els.bitlockerSub.textContent =
+        diskEncryption.detail === "suspended"
+          ? "BitLocker protection is suspended on drive C:."
+          : "Turn on BitLocker to protect stored credentials offline.";
+    }
+    els.bitlockerNotice.classList.remove("hidden");
+  }
+
   function positionSegThumb(animate = true) {
     const thumb = els.feedSegThumb;
     const activeBtn = els.btnFeedBright.classList.contains("active")
@@ -755,6 +775,9 @@
     els.streamImg.dataset.visible = "true";
     els.standbyOverlay.dataset.visible = "false";
     els.standbyOverlay.dataset.starting = "false";
+    if (els.enrollStageGuide && state.live && state.live.mode === "enroll") {
+      els.enrollStageGuide.dataset.visible = "true";
+    }
   }
 
   function renderStageErrorOverlay(errorInfo) {
@@ -908,11 +931,13 @@
       }
     }
 
-    if (active) {
+    if (active && mode !== "enroll") {
       updateReticlePosition(live.bbox_norm, reticleTone);
+    } else {
+      els.faceReticle.dataset.visible = "false";
     }
 
-    // Enrollment HUD
+    // Enrollment HUD & On-Viewport Stage Guide
     if (active && mode === "enroll") {
       const enr = live.enroll || { count: 0, target: 7, prompt: "" };
       const promptText = enr.prompt || "Look straight at the camera";
@@ -925,10 +950,14 @@
       }
       const readyIn = Number(enr.ready_in) || 0;
       const dwell = Number(enr.dwell) || 0;
+      const justCaptured = Boolean(enr.just_captured);
+      const pose = enr.pose || "center";
       els.enrollCounter.textContent = `${enr.count} / ${enr.target}`;
       const holdPct = dwell > 0 ? Math.round(100 * (1 - Math.min(1, readyIn / dwell))) : 100;
       let sub;
-      if (!enr.face_ok) {
+      if (justCaptured) {
+        sub = `Captured · Next: ${promptText}`;
+      } else if (!enr.face_ok) {
         sub = "Waiting for your face…";
       } else if (enr.count === 0 && holdPct < 40) {
         sub = "Get ready";
@@ -936,10 +965,20 @@
         sub = `Hold still… ${Math.max(1, Math.ceil(readyIn))}`;
       }
       els.enrollSub.textContent = sub;
-      els.enrollSub.dataset.tone = enr.face_ok ? "ok" : "warn";
-      els.poseGuide.dataset.pose = enr.pose || "center";
-      els.poseGuide.dataset.face = enr.face_ok ? "ok" : "none";
-      els.poseRing.style.strokeDashoffset = String(100 - holdPct);
+      els.enrollSub.dataset.tone = justCaptured || enr.face_ok ? "ok" : "warn";
+      els.poseGuide.dataset.pose = pose;
+      els.poseGuide.dataset.face = justCaptured || enr.face_ok ? "ok" : "none";
+      const ringPct = justCaptured ? 100 : holdPct;
+      els.poseRing.style.strokeDashoffset = String(100 - ringPct);
+      if (els.enrollStageGuide) {
+        els.enrollStageGuide.dataset.visible = state.streamFrameReady ? "true" : "false";
+        els.enrollStageGuide.dataset.pose = pose;
+        els.enrollStageGuide.dataset.face = enr.face_ok ? "ok" : "none";
+        els.enrollStageGuide.dataset.captured = justCaptured ? "true" : "false";
+      }
+      if (els.stageGuideProgress) {
+        els.stageGuideProgress.style.strokeDashoffset = String(100 - ringPct);
+      }
       const target = Math.max(1, Number(enr.target) || 7);
       if (els.enrollSegments.children.length !== target) {
         els.enrollSegments.textContent = "";
@@ -951,24 +990,30 @@
         els.enrollSegments.style.setProperty("--seg-count", String(target));
       }
       const segs = els.enrollSegments.querySelectorAll(".seg");
+      const segHoldPct = justCaptured ? 0 : holdPct;
       segs.forEach((seg, idx) => {
         seg.classList.toggle("filled", idx < enr.count);
         const current = idx === enr.count;
         seg.classList.toggle("current", current);
-        seg.style.setProperty("--hold", current ? `${holdPct}%` : "0%");
+        seg.style.setProperty("--hold", current ? `${segHoldPct}%` : "0%");
       });
       setVisible(els.enrollHud, true);
       state.wasEnrolling = true;
     } else {
+      if (els.enrollStageGuide) {
+        els.enrollStageGuide.dataset.visible = "false";
+        els.enrollStageGuide.dataset.captured = "false";
+      }
       setVisible(els.enrollHud, false);
       if (state.wasEnrolling) {
         state.wasEnrolling = false;
         const doneUser = live.enroll && live.enroll.completed_user;
         const doneAppend = Boolean(live.enroll && live.enroll.completed_append);
         if (doneUser) {
+          const target = Math.max(1, Number((live.enroll && live.enroll.target) || 7));
           const msg = doneAppend
             ? `Appearance added for '${doneUser}'.`
-            : `Enrolled 8 IR samples for '${doneUser}'.`;
+            : `Enrolled ${target} IR samples for '${doneUser}'.`;
           showFeedback(msg, "ok", 5000);
           refreshBootstrapData();
         }
@@ -1038,6 +1083,7 @@
     renderProfileDatalist();
     renderAccountSection();
     renderServiceStatus(boot.service_status, boot.config_dirty);
+    renderBitlockerNotice(boot.disk_encryption);
   }
 
   function applyBootstrap(boot) {
@@ -1071,6 +1117,7 @@
     renderFeedMode(boot.feed_mode || "subtract");
     renderModelsRow(Boolean(boot.models_ready), null);
     renderServiceStatus(boot.service_status, boot.config_dirty);
+    renderBitlockerNotice(boot.disk_encryption);
     renderCameraDropdown(boot.cameras || [], boot.selected_camera ?? 0);
     state.hasIrCamera =
       boot.has_ir_camera !== undefined
@@ -1255,7 +1302,7 @@
   function wireEvents() {
     els.streamImg.addEventListener("load", () => {
       revealStreamFrame();
-      if (state.live && state.live.camera_active && state.live.bbox_norm) {
+      if (state.live && state.live.camera_active && state.live.mode !== "enroll" && state.live.bbox_norm) {
         updateReticlePosition(state.live.bbox_norm, els.faceReticle.dataset.tone || "neutral");
       }
     });
@@ -1410,6 +1457,17 @@
     });
     els.thresholdSlider.addEventListener("change", persistSecurityConfig);
 
+    if (els.btnBitlockerSettings) {
+      els.btnBitlockerSettings.addEventListener("click", async () => {
+        const a = api();
+        if (!a || typeof a.open_disk_encryption_settings !== "function") return;
+        const res = await a.open_disk_encryption_settings();
+        if (res && !res.ok && res.error) {
+          showFeedback(res.error, "warn");
+        }
+      });
+    }
+
     const setFeed = async (mode) => {
       const a = api();
       renderFeedMode(mode);
@@ -1546,7 +1604,7 @@
     window.addEventListener("resize", () => {
       positionSegThumb(false);
       if (state.dropdownOpen) positionCameraDropdownMenu();
-      if (state.live && state.live.camera_active && state.live.bbox_norm) {
+      if (state.live && state.live.camera_active && state.live.mode !== "enroll" && state.live.bbox_norm) {
         updateReticlePosition(state.live.bbox_norm, els.faceReticle.dataset.tone || "neutral");
       }
     });

@@ -33,6 +33,7 @@ from engine.gui_app import (  # noqa: E402
     _resolve_window_icon_path,
     check_github_latest_release,
     classify_error,
+    get_disk_encryption_status,
     is_newer_version,
     parse_semver,
 )
@@ -590,3 +591,208 @@ def test_check_github_latest_release_handles_200_404_and_network_errors(
         "release_url": f"{REPO_URL}/releases",
         "error": "Unable to reach GitHub.",
     }
+
+
+def test_get_disk_encryption_status_mappings_and_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"init": 0, "uninit": 0}
+    prop_value: list[object] = [None]
+    raise_on_dispatch = [False]
+    namespace_none = [False]
+
+    class _FakeSelf:
+        def ExtendedProperty(self, name: str) -> object:  # noqa: N802
+            assert name == "System.Volume.BitLockerProtection"
+            return prop_value[0]
+
+    class _FakeNamespace:
+        Self = _FakeSelf()
+
+    class _FakeShell:
+        def NameSpace(self, drive: str) -> object:  # noqa: N802
+            assert drive == "C:\\"
+            if namespace_none[0]:
+                return None
+            return _FakeNamespace()
+
+    fake_pythoncom = SimpleNamespace(
+        CoInitialize=lambda: calls.__setitem__("init", calls["init"] + 1),
+        CoUninitialize=lambda: calls.__setitem__("uninit", calls["uninit"] + 1),
+    )
+
+    def _fake_dispatch(prog_id: str) -> object:
+        assert prog_id == "Shell.Application"
+        if raise_on_dispatch[0]:
+            raise RuntimeError("COM failure")
+        return _FakeShell()
+
+    fake_win32com_client = SimpleNamespace(Dispatch=_fake_dispatch)
+    fake_win32com = SimpleNamespace(client=fake_win32com_client)
+    monkeypatch.setitem(sys.modules, "pythoncom", fake_pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", fake_win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", fake_win32com_client)
+
+    for code in (1, 3, 6):
+        prop_value[0] = code
+        assert get_disk_encryption_status() == {
+            "status": "encrypted",
+            "code": code,
+            "detail": "protected",
+        }
+
+    for code in (2, 4):
+        prop_value[0] = code
+        assert get_disk_encryption_status() == {
+            "status": "unencrypted",
+            "code": code,
+            "detail": "off",
+        }
+
+    prop_value[0] = 5
+    assert get_disk_encryption_status() == {
+        "status": "unencrypted",
+        "code": 5,
+        "detail": "suspended",
+    }
+
+    for code in (7, 8):
+        prop_value[0] = code
+        assert get_disk_encryption_status() == {
+            "status": "unencrypted",
+            "code": code,
+            "detail": "waiting_activation",
+        }
+
+    for bad_val in (None, 0, 99, True, "bad", 1.5):
+        prop_value[0] = bad_val
+        assert get_disk_encryption_status() == {
+            "status": "unknown",
+            "code": None,
+            "detail": "unknown",
+        }
+
+    namespace_none[0] = True
+    assert get_disk_encryption_status() == {
+        "status": "unknown",
+        "code": None,
+        "detail": "unknown",
+    }
+    namespace_none[0] = False
+
+    raise_on_dispatch[0] = True
+    assert get_disk_encryption_status() == {
+        "status": "unknown",
+        "code": None,
+        "detail": "unknown",
+    }
+    assert calls["init"] == calls["uninit"] and calls["init"] > 0
+
+
+def test_bootstrap_disk_encryption_and_open_settings(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+    store = ProfileStore(tmp_path / "profiles.enc")
+    opened_uris: list[str] = []
+
+    fake_status = {"status": "unencrypted", "code": 2, "detail": "off"}
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=tmp_path / "models",
+        camera_discoverer=lambda: [],
+        service_status_provider=lambda: "not_installed",
+        disk_encryption_provider=lambda: fake_status,
+        settings_opener=opened_uris.append,
+        auto_start_server=False,
+    )
+    bridge = _JsApiBridge(ctrl)
+    try:
+        boot = bridge.get_bootstrap()
+        assert boot["disk_encryption"] == fake_status
+
+        res = bridge.open_disk_encryption_settings()
+        assert res == {"ok": True, "uri": "ms-settings:deviceencryption", "error": None}
+        assert opened_uris == ["ms-settings:deviceencryption"]
+    finally:
+        ctrl.shutdown()
+
+
+def test_enroll_state_exposes_just_captured_pause_beat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("engine.gui_app._ENROLL_MIN_INTERVAL", 0.06)
+    monkeypatch.setattr("engine.gui_app._ENROLL_CAPTURE_PAUSE", 0.18)
+
+    store = ProfileStore(tmp_path / "profiles.enc")
+    cfg_path = tmp_path / "service_config.json"
+    save_service_config(ServiceConfig(), cfg_path)
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "face_detection_yunet_2023mar.onnx").write_bytes(b"y" * 2048)
+    (models_dir / "face_recognition_sface_2021dec.onnx").write_bytes(b"s" * 2048)
+
+    cam_ir = MagicMock(group="g1", source_id="s1", label="IR Cam", is_ir=True, is_virtual=False)
+    ts_counter = [1.0]
+
+    def _make_worker(**_kw: object) -> MagicMock:
+        w = MagicMock()
+        w.error = None
+
+        def _next_pair() -> _DummyPair:
+            ts_counter[0] += 1.0
+            return _make_active_ir_pair(ts_counter[0])
+
+        w.get_ir_pair.side_effect = _next_pair
+        w.get_frame.return_value = _make_active_ir_pair(0.0).diff_bgr
+        return w
+
+    vec = np.zeros(128, dtype=np.float32)
+    vec[0] = 1.0
+    mock_rec = MagicMock()
+    mock_rec.detect_largest.return_value = _make_det()
+    mock_rec.extract_embedding.return_value = vec
+
+    ctrl = WinIRFaceIDController(
+        store=store,
+        config_path=cfg_path,
+        models_dir=models_dir,
+        camera_discoverer=lambda: [cam_ir],
+        worker_factory=_make_worker,
+        recognizer_factory=lambda: mock_rec,
+        service_status_provider=lambda: "not_installed",
+        disk_encryption_provider=lambda: {"status": "encrypted", "code": 1, "detail": "protected"},
+        auto_start_server=False,
+    )
+    bridge = _JsApiBridge(ctrl)
+    try:
+        assert ctrl.get_state()["enroll"]["just_captured"] is False
+        res = bridge.start_enroll("Bob", False)
+        assert res["ok"] is True
+        assert res["state"]["enroll"]["just_captured"] is False
+
+        saw_just_captured = False
+        saw_post_pause_resume = False
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            st = ctrl.get_state()
+            enr = st["enroll"]
+            if st["mode"] == "enroll":
+                if enr.get("just_captured") is True and enr["count"] >= 1:
+                    saw_just_captured = True
+                elif saw_just_captured and enr.get("just_captured") is False:
+                    saw_post_pause_resume = True
+            if st["mode"] == "standby" and enr["completed_user"] == "Bob":
+                break
+            time.sleep(0.015)
+
+        final_st = ctrl.get_state()
+        assert final_st["mode"] == "standby"
+        assert final_st["enroll"]["completed_user"] == "Bob"
+        assert final_st["enroll"]["just_captured"] is False
+        assert saw_just_captured is True
+        assert saw_post_pause_resume is True
+    finally:
+        ctrl.shutdown()

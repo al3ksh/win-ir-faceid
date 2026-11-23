@@ -95,6 +95,59 @@
               </div>
             </div>
 
+            <!-- Guided On-Viewport Face Enrollment Oval & Wireframe -->
+            <div
+              class="enroll-stage-guide"
+              id="enrollStageGuide"
+              data-visible="false"
+              data-pose="center"
+              data-face="none"
+              data-captured="false"
+              aria-hidden="true"
+            >
+              <svg viewBox="0 0 280 280" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                <ellipse class="guide-oval-bg" cx="140" cy="136" rx="64" ry="82"/>
+                <path
+                  class="guide-oval-progress"
+                  id="stageGuideProgress"
+                  d="M 140 54 A 64 82 0 0 1 140 218 A 64 82 0 0 1 140 54 Z"
+                  pathLength="100"
+                />
+
+                <g class="guide-wireframe">
+                  <path d="M 102 114 C 102 88, 178 88, 178 114 C 178 152, 162 184, 140 190 C 118 184, 102 152, 102 114 Z"/>
+                  <path d="M 113 114 Q 123 109 132 113"/>
+                  <path d="M 148 113 Q 157 109 167 114"/>
+                  <line x1="108" y1="126" x2="172" y2="126"/>
+                  <line x1="140" y1="108" x2="140" y2="152"/>
+                  <path d="M 135 150 Q 140 155 145 150"/>
+                  <path d="M 127 167 Q 140 173 153 167"/>
+                </g>
+
+                <g class="guide-dir guide-dir-left">
+                  <path d="M 60 128 L 51 136 L 60 144"/>
+                  <path d="M 50 128 L 41 136 L 50 144"/>
+                </g>
+                <g class="guide-dir guide-dir-right">
+                  <path d="M 220 128 L 229 136 L 220 144"/>
+                  <path d="M 230 128 L 239 136 L 230 144"/>
+                </g>
+                <g class="guide-dir guide-dir-up">
+                  <path d="M 132 39 L 140 30 L 148 39"/>
+                  <path d="M 132 29 L 140 20 L 148 29"/>
+                </g>
+                <g class="guide-dir guide-dir-down">
+                  <path d="M 132 233 L 140 242 L 148 233"/>
+                  <path d="M 132 243 L 140 252 L 148 243"/>
+                </g>
+
+                <g class="guide-captured-check">
+                  <circle class="guide-check-bg" cx="140" cy="136" r="24"/>
+                  <path class="guide-check-mark" d="M 129 136.5 L 136.5 144 L 151.5 128"/>
+                </g>
+              </svg>
+            </div>
+
             <!-- Top Floating Status Pill (AE settling or Live Test result) -->
             <div class="viewport-top-hud">
               <div class="hud-pill" id="matchPill" data-tone="neutral" data-visible="false" aria-hidden="true">
@@ -122,7 +175,7 @@
                   <span class="enroll-prompt" id="enrollPrompt">Look straight at the camera</span>
                   <span class="enroll-sub" id="enrollSub">Get ready</span>
                 </div>
-                <span class="enroll-counter tabular" id="enrollCounter">0 / 8</span>
+                <span class="enroll-counter tabular" id="enrollCounter">0 / 7</span>
               </div>
               <div class="enroll-segments" id="enrollSegments" aria-label="Enrollment progress">
               </div>
@@ -281,6 +334,18 @@
               </div>
               <div class="score-stats-text tabular" id="scoreStatsText"></div>
             </div>
+          </div>
+
+          <div class="bitlocker-notice hidden" id="bitlockerNotice" role="status">
+            <svg class="bitlocker-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="7.5" width="10" height="6.5" rx="1.5"/>
+              <path d="M5.5 7.5V5.2a2.5 2.5 0 0 1 4.7-1.2"/>
+            </svg>
+            <div class="bitlocker-copy">
+              <span class="bitlocker-title">Drive C: is not encrypted</span>
+              <span class="bitlocker-sub" id="bitlockerSub">Turn on BitLocker to protect stored credentials offline.</span>
+            </div>
+            <button class="btn-subtle btn-xs" id="btnBitlockerSettings" type="button">Settings</button>
           </div>
         </section>
 
