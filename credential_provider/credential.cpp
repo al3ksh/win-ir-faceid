@@ -16,7 +16,7 @@
 namespace
 {
 
-constexpr wchar_t kStatusReadyDeferred[] = L"IR Face ID";
+constexpr wchar_t kStatusReadyDeferred[] = L"Scan face";
 constexpr wchar_t kStatusScanning[] = L"Looking for you...";
 constexpr wchar_t kStatusRecognized[] = L"Welcome back!";
 constexpr wchar_t kStatusFailed[] = L"Couldn't recognize you";
