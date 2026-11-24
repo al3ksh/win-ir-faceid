@@ -23,6 +23,7 @@ constexpr wchar_t kStatusFailed[] = L"Couldn't recognize you";
 constexpr wchar_t kStatusServiceOffline[] = L"Face ID service offline - use Fingerprint or PIN";
 constexpr wchar_t kStatusNoPassword[] = L"Face recognized, but no saved credential - use Fingerprint or PIN";
 constexpr wchar_t kStatusSignInFailed[] = L"Sign-in failed - use Fingerprint or PIN";
+constexpr wchar_t kStatusLockedOut[] = L"Try another method";
 
 constexpr DWORD kEnterFrameMs = 25;
 constexpr DWORD kScanFrameMs = 28;
@@ -1582,6 +1583,7 @@ void WinIRFaceIDCredential::RunScan()
     }
 
     const pipe_client::VerifyStatus verifyStatus = result.status;
+    const bool lockedOut = (result.reason == L"locked_out");
     result.Clear();
 
     EnterCriticalSection(&_cs);
@@ -1593,6 +1595,10 @@ void WinIRFaceIDCredential::RunScan()
     if (matched)
     {
         UpdateStatusText(kStatusNoPassword, true);
+    }
+    else if (lockedOut)
+    {
+        UpdateStatusText(kStatusLockedOut, true);
     }
     else if (verifyStatus == pipe_client::VerifyStatus::PipeUnavailable)
     {

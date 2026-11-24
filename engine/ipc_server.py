@@ -22,12 +22,14 @@ import win32security
 import winerror
 
 from engine import __version__
+from engine.lockout import LOCKED_OUT_REASON, BiometricLockout
 from engine.liveness import TemporalLivenessTracker, check_eyes_open_ir, check_ir_liveness
 from engine.recognizer import DEFAULT_MATCH_THRESHOLD, FaceRecognizer, enhance_ir_bgr
 from engine.store import (
     ProfileStore,
     ServiceConfig,
     UserProfile,
+    clamp_max_failed_attempts,
     clamp_service_threshold,
     load_service_config,
     save_service_config,
@@ -206,13 +208,16 @@ class IRFaceVerifier:
         consecutive_user: str | None = None
         consecutive_count = 0
         motion_tracker = TemporalLivenessTracker() if self.require_motion else None
+        # Set once any face reaches liveness / matching: only such scans count as failed
+        # attempts for the lockout, so an empty room never locks anyone out.
+        face_detected = False
 
         try:
             worker.start()
 
             while time.monotonic() < deadline:
                 if cancel_event is not None and cancel_event.is_set():
-                    return {"status": "failed", "reason": "cancelled"}
+                    return {"status": "failed", "reason": "cancelled", "face_detected": face_detected}
 
                 worker_err = getattr(worker, "error", None)
                 if worker_err:
@@ -255,6 +260,7 @@ class IRFaceVerifier:
                     consecutive_count = 0
                     continue
 
+                face_detected = True
                 liveness = check_ir_liveness(
                     pair,
                     det.bbox,
@@ -324,7 +330,7 @@ class IRFaceVerifier:
                     consecutive_user = None
                     consecutive_count = 0
 
-            return {"status": "failed", "reason": "timeout"}
+            return {"status": "failed", "reason": "timeout", "face_detected": face_detected}
         except Exception as exc:
             logger.exception("Unexpected verification error: %s", exc)
             return {"status": "failed", "reason": "camera_error"}
@@ -467,6 +473,7 @@ def _config_to_dict(cfg: ServiceConfig) -> dict[str, Any]:
         "threshold": float(cfg.threshold),
         "require_motion": bool(cfg.require_motion),
         "require_open_eyes": bool(cfg.require_open_eyes),
+        "max_failed_attempts": int(cfg.max_failed_attempts),
     }
 
 
@@ -513,6 +520,11 @@ def _handle_management(
                     if not isinstance(msg[key], bool):
                         return _fail("bad_request")
                     setattr(cfg, key, msg[key])
+            if "max_failed_attempts" in msg:
+                raw_limit = msg["max_failed_attempts"]
+                if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+                    return _fail("bad_request")
+                cfg.max_failed_attempts = clamp_max_failed_attempts(raw_limit)
             save_service_config(cfg, config_path)
         if verifier is not None:
             for attr in ("threshold", "require_motion", "require_open_eyes"):
@@ -646,6 +658,40 @@ def _validate_logon_password(username: str, domain: str, password: str) -> str |
 _DEFAULT_STORE_LOCK = threading.Lock()
 
 
+def _apply_lockout(
+    result: Any,
+    lockout: BiometricLockout | None,
+    max_attempts: int,
+) -> Any:
+    """Update the failed-scan counter from a verify result and strip internal fields."""
+    if not isinstance(result, dict):
+        return result
+    face_detected = bool(result.pop("face_detected", False))
+    if lockout is None or max_attempts <= 0:
+        return result
+    status = result.get("status")
+    reason = result.get("reason")
+    if status == "matched":
+        lockout.record_success()
+        return result
+    if status == "failed" and face_detected and reason in ("timeout", "cancelled"):
+        locked = lockout.record_failure(max_attempts)
+        logger.info(
+            "Face scan failed (%s, face seen); failed scans %d/%d.",
+            reason,
+            lockout.status()["failed_attempts"],
+            max_attempts,
+        )
+        if locked:
+            # The scan that hits the limit already reports the lockout to the tile.
+            return _fail(LOCKED_OUT_REASON)
+    elif status == "failed" and reason in ("timeout", "cancelled"):
+        logger.info("Face scan failed (%s, no face seen); not counted toward lockout.", reason)
+    elif status == "failed":
+        logger.info("Face scan failed (%s); not counted toward lockout.", reason)
+    return result
+
+
 def handle_request(
     msg: dict[str, Any],
     store: ProfileStore,
@@ -655,6 +701,7 @@ def handle_request(
     client: ClientIdentity | None = None,
     config_path: Path | str | None = None,
     store_lock: threading.Lock | None = None,
+    lockout: BiometricLockout | None = None,
 ) -> dict[str, Any]:
     """Handle one parsed IPC request dictionary and return a response dictionary.
 
@@ -702,20 +749,28 @@ def handle_request(
             return _fail("bad_request")
         timeout_ms = min(timeout_ms, 60000)
 
+        max_attempts = 0
+        if lockout is not None:
+            max_attempts = load_service_config(config_path).max_failed_attempts
+            if max_attempts > 0 and lockout.is_locked():
+                return _fail(LOCKED_OUT_REASON)
+
         active_verifier = verifier if verifier is not None else IRFaceVerifier(store)
         if hasattr(active_verifier, "verify"):
-            return active_verifier.verify(
+            result = active_verifier.verify(
                 username=username,
                 timeout_ms=timeout_ms,
                 cancel_event=cancel_event,
             )
-        if callable(active_verifier):
-            return active_verifier(
+        elif callable(active_verifier):
+            result = active_verifier(
                 username=username,
                 timeout_ms=timeout_ms,
                 cancel_event=cancel_event,
             )
-        return _fail("camera_error")
+        else:
+            return _fail("camera_error")
+        return _apply_lockout(result, lockout, max_attempts)
 
     if cmd in _MANAGEMENT_COMMANDS:
         if client is None:
@@ -765,8 +820,10 @@ class NamedPipeServer:
         verifier: Any | None = None,
         service_mode: bool = False,
         config_path: Path | str | None = None,
+        lockout: BiometricLockout | None = None,
     ) -> None:
         self.pipe_name = pipe_name
+        self.lockout = lockout
         self.store = store if store is not None else ProfileStore(local_machine=service_mode)
         self.verifier = verifier if verifier is not None else IRFaceVerifier(self.store)
         self.service_mode = service_mode
@@ -920,6 +977,7 @@ class NamedPipeServer:
                         client=client,
                         config_path=self.config_path,
                         store_lock=self._store_lock,
+                        lockout=self.lockout,
                     )
                     if parsed.get("cmd") == "verify" and client.privileged:
                         with self._verify_lock:

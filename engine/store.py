@@ -38,6 +38,10 @@ CRYPTPROTECT_LOCAL_MACHINE = 0x04
 
 MIN_SERVICE_THRESHOLD = 0.60
 MAX_SERVICE_THRESHOLD = 0.80
+# Failed face scans allowed before Face ID locks until another sign-in method is used.
+# 0 disables the lockout entirely.
+MAX_FAILED_ATTEMPTS_LIMIT = 10
+DEFAULT_MAX_FAILED_ATTEMPTS = 5
 
 _default_tpm_protector = TpmKeyProtector()
 
@@ -355,6 +359,18 @@ class ServiceConfig:
     threshold: float = DEFAULT_MATCH_THRESHOLD
     require_motion: bool = False
     require_open_eyes: bool = False
+    max_failed_attempts: int = DEFAULT_MAX_FAILED_ATTEMPTS
+
+
+def clamp_max_failed_attempts(value: Any) -> int:
+    """Clamp the failed-scan limit into 0 (disabled) .. ``MAX_FAILED_ATTEMPTS_LIMIT``."""
+    if isinstance(value, bool):
+        return DEFAULT_MAX_FAILED_ATTEMPTS
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_MAX_FAILED_ATTEMPTS
+    return min(MAX_FAILED_ATTEMPTS_LIMIT, max(0, number))
 
 
 def clamp_service_threshold(value: float) -> float:
@@ -376,10 +392,14 @@ def load_service_config(path: Path | str | None = None) -> ServiceConfig:
         threshold = clamp_service_threshold(float(raw.get("threshold", DEFAULT_MATCH_THRESHOLD)))
         require_motion = bool(raw.get("require_motion", False))
         require_open_eyes = bool(raw.get("require_open_eyes", False))
+        max_failed_attempts = clamp_max_failed_attempts(
+            raw.get("max_failed_attempts", DEFAULT_MAX_FAILED_ATTEMPTS)
+        )
         return ServiceConfig(
             threshold=threshold,
             require_motion=require_motion,
             require_open_eyes=require_open_eyes,
+            max_failed_attempts=max_failed_attempts,
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         logger.warning("Failed to load service config '%s', using defaults: %s", target, exc)
@@ -393,6 +413,7 @@ def save_service_config(cfg: ServiceConfig, path: Path | str | None = None) -> P
         "threshold": clamp_service_threshold(float(cfg.threshold)),
         "require_motion": bool(cfg.require_motion),
         "require_open_eyes": bool(cfg.require_open_eyes),
+        "max_failed_attempts": clamp_max_failed_attempts(cfg.max_failed_attempts),
     }
     raw = (json.dumps(payload, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
     _atomic_write_bytes(target, raw)

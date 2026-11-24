@@ -804,6 +804,8 @@ class IREnrollmentApp(tk.Tk):
             threshold=thresh,
             require_motion=bool(self.require_motion_var.get()),
             require_open_eyes=bool(self.require_open_eyes_var.get()),
+            # This legacy window has no lockout control; keep the configured limit.
+            max_failed_attempts=load_service_config().max_failed_attempts,
         )
         try:
             save_service_config(cfg)

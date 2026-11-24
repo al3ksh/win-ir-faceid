@@ -105,6 +105,10 @@
     toggleOpenEyes: $("toggleOpenEyes"),
     toggleMotion: $("toggleMotion"),
     thresholdSlider: $("thresholdSlider"),
+    toggleLockout: $("toggleLockout"),
+    lockoutSliderBlock: $("lockoutSliderBlock"),
+    lockoutSlider: $("lockoutSlider"),
+    lockoutValue: $("lockoutValue"),
     thresholdValue: $("thresholdValue"),
     scoreStats: $("scoreStats"),
     scoreRange: $("scoreRange"),
@@ -1296,6 +1300,7 @@
     const thresh = Number(cfg.threshold ?? 0.65).toFixed(2);
     els.thresholdSlider.value = thresh;
     els.thresholdValue.textContent = thresh;
+    renderLockoutControls(cfg.max_failed_attempts ?? 5, cfg.max_failed_attempts_limit ?? 10);
 
     renderFeedMode(boot.feed_mode || "subtract");
     renderModelsRow(Boolean(boot.models_ready), null);
@@ -1308,15 +1313,32 @@
         : state.cameras.some((c) => c.is_ir === true);
   }
 
+  // 0 = lockout off; otherwise the number of failed face scans before Face ID locks.
+  function renderLockoutControls(limit, maxLimit) {
+    const n = Math.max(0, Math.round(Number(limit) || 0));
+    if (maxLimit) els.lockoutSlider.max = String(maxLimit);
+    els.toggleLockout.checked = n > 0;
+    if (n > 0) els.lockoutSlider.value = String(n);
+    els.lockoutValue.textContent = els.lockoutSlider.value;
+    els.lockoutSliderBlock.classList.toggle("hidden", n === 0);
+  }
+
+  function currentLockoutLimit() {
+    return els.toggleLockout.checked ? parseInt(els.lockoutSlider.value, 10) || 1 : 0;
+  }
+
   async function persistSecurityConfig() {
     const a = api();
     if (!a) return;
     const threshold = parseFloat(els.thresholdSlider.value);
     const requireMotion = Boolean(els.toggleMotion.checked);
     const requireOpenEyes = Boolean(els.toggleOpenEyes.checked);
-    const res = await a.update_config(threshold, requireMotion, requireOpenEyes);
+    const res = await a.update_config(threshold, requireMotion, requireOpenEyes, currentLockoutLimit());
     if (res && res.ok) {
       renderServiceStatus(res.service_status, res.config_dirty);
+      if (res.config && res.config.max_failed_attempts !== undefined) {
+        renderLockoutControls(res.config.max_failed_attempts);
+      }
     }
   }
 
@@ -1450,7 +1472,7 @@
   function openUpdateModal(info) {
     if (!els.updateModal || !info) return;
     closeCameraDropdown(false);
-    const current = info.current_version || (state.bootstrap && state.bootstrap.version) || "0.3.1";
+    const current = info.current_version || (state.bootstrap && state.bootstrap.version) || "0.4.0";
     const latest = info.latest_version || current;
     els.updateVersionLine.textContent = `v${current} -> v${latest}`;
 
@@ -1796,6 +1818,14 @@
       els.thresholdValue.textContent = parseFloat(els.thresholdSlider.value).toFixed(2);
     });
     els.thresholdSlider.addEventListener("change", persistSecurityConfig);
+    els.toggleLockout.addEventListener("change", () => {
+      els.lockoutSliderBlock.classList.toggle("hidden", !els.toggleLockout.checked);
+      persistSecurityConfig();
+    });
+    els.lockoutSlider.addEventListener("input", () => {
+      els.lockoutValue.textContent = els.lockoutSlider.value;
+    });
+    els.lockoutSlider.addEventListener("change", persistSecurityConfig);
 
     if (els.btnBitlockerPill) {
       els.btnBitlockerPill.addEventListener("click", openBitlockerModal);
@@ -1935,7 +1965,7 @@
         }
         if (typeof a.check_for_updates !== "function") return;
 
-        const current = (state.bootstrap && state.bootstrap.version) || "0.3.1";
+        const current = (state.bootstrap && state.bootstrap.version) || "0.4.0";
         els.btnVersion.disabled = true;
         els.btnVersion.textContent = "Checking...";
         try {

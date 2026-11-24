@@ -43,9 +43,11 @@ from engine.recognizer import (
     enhance_ir_bgr,
 )
 from engine.store import (
+    MAX_FAILED_ATTEMPTS_LIMIT,
     ProfileStore,
     ServiceConfig,
     UserProfile,
+    clamp_max_failed_attempts,
     clamp_service_threshold,
     load_service_config,
     save_service_config,
@@ -1793,6 +1795,8 @@ class WinIRFaceIDController:
                 "threshold": float(self._config.threshold),
                 "require_motion": bool(self._config.require_motion),
                 "require_open_eyes": bool(self._config.require_open_eyes),
+                "max_failed_attempts": int(self._config.max_failed_attempts),
+                "max_failed_attempts_limit": MAX_FAILED_ATTEMPTS_LIMIT,
             }
             config_dirty = self._config_dirty
             feed_mode = self._feed_mode
@@ -2080,13 +2084,23 @@ class WinIRFaceIDController:
         threshold: float,
         require_motion: bool,
         require_open_eyes: bool,
+        max_failed_attempts: int | None = None,
     ) -> dict[str, Any]:
-        """Persist updated ServiceConfig to data/service_config.json."""
+        """Persist updated ServiceConfig to data/service_config.json.
+
+        ``max_failed_attempts`` of ``None`` keeps the current Face ID lockout limit.
+        """
         clean_thresh = clamp_service_threshold(float(threshold))
+        if max_failed_attempts is None:
+            with self._lock:
+                clean_limit = int(self._config.max_failed_attempts)
+        else:
+            clean_limit = clamp_max_failed_attempts(max_failed_attempts)
         cfg = ServiceConfig(
             threshold=clean_thresh,
             require_motion=bool(require_motion),
             require_open_eyes=bool(require_open_eyes),
+            max_failed_attempts=clean_limit,
         )
         if self._service_config:
             try:
@@ -2113,6 +2127,7 @@ class WinIRFaceIDController:
                 "threshold": cfg.threshold,
                 "require_motion": cfg.require_motion,
                 "require_open_eyes": cfg.require_open_eyes,
+                "max_failed_attempts": cfg.max_failed_attempts,
             },
             "config_dirty": dirty,
             "service_status": svc_status,
@@ -2511,8 +2526,11 @@ class _JsApiBridge:
         threshold: float,
         require_motion: bool,
         require_open_eyes: bool,
+        max_failed_attempts: int | None = None,
     ) -> dict[str, Any]:
-        return self._ctrl.update_config(threshold, require_motion, require_open_eyes)
+        return self._ctrl.update_config(
+            threshold, require_motion, require_open_eyes, max_failed_attempts
+        )
 
     def save_password(self, username: str, domain: str, password: str) -> dict[str, Any]:
         return self._ctrl.save_password(username, domain, password)

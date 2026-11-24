@@ -25,7 +25,7 @@
           </svg>
           <span class="brand-name">WinIRFaceID</span>
         </button>
-        <button class="version-pill tabular" id="btnVersion" type="button" title="Check for updates">v0.3.1</button>
+        <button class="version-pill tabular" id="btnVersion" type="button" title="Check for updates">v0.4.0</button>
       </div>
 
       <div class="header-right">
@@ -353,6 +353,38 @@
                 <span>0.30</span><span>1.00</span>
               </div>
               <div class="score-stats-text tabular" id="scoreStatsText"></div>
+            </div>
+          </div>
+
+          <label class="toggle-row" for="toggleLockout">
+            <div class="toggle-copy">
+              <span class="row-label">Lock Face ID after failed scans</span>
+              <span class="row-desc">Then only PIN, fingerprint or password work until Windows is unlocked with one of them. Survives restarts.</span>
+            </div>
+            <span class="switch">
+              <input type="checkbox" id="toggleLockout">
+              <span class="switch-track"></span>
+            </span>
+          </label>
+
+          <div class="slider-block" id="lockoutSliderBlock">
+            <div class="slider-header">
+              <span class="row-label">Failed scans allowed</span>
+              <span class="slider-value tabular" id="lockoutValue">5</span>
+            </div>
+            <input
+              type="range"
+              id="lockoutSlider"
+              class="range-slider"
+              min="1"
+              max="10"
+              step="1"
+              value="5"
+            >
+            <div class="slider-labels">
+              <span>1</span>
+              <span>5</span>
+              <span>10</span>
             </div>
           </div>
         </section>

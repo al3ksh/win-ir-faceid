@@ -26,7 +26,12 @@ import win32pipe
 import win32security
 import ntsecuritycon
 
-from engine.store import ServiceConfig, UserProfile
+from engine.store import (
+    DEFAULT_MAX_FAILED_ATTEMPTS,
+    ServiceConfig,
+    UserProfile,
+    clamp_max_failed_attempts,
+)
 
 PIPE_NAME = r"\\.\pipe\WinIRFaceID"
 _SECURITY_SQOS_PRESENT = 0x00100000
@@ -268,6 +273,9 @@ class ServiceProfileClient:
             threshold=float(cfg.get("threshold", ServiceConfig().threshold)),
             require_motion=bool(cfg.get("require_motion", False)),
             require_open_eyes=bool(cfg.get("require_open_eyes", False)),
+            max_failed_attempts=clamp_max_failed_attempts(
+                cfg.get("max_failed_attempts", DEFAULT_MAX_FAILED_ATTEMPTS)
+            ),
         )
 
     def save_config(self, cfg: ServiceConfig) -> ServiceConfig:
@@ -277,6 +285,7 @@ class ServiceProfileClient:
                 "threshold": float(cfg.threshold),
                 "require_motion": bool(cfg.require_motion),
                 "require_open_eyes": bool(cfg.require_open_eyes),
+                "max_failed_attempts": clamp_max_failed_attempts(cfg.max_failed_attempts),
             }
         )
         out = resp.get("config") or {}
@@ -284,4 +293,7 @@ class ServiceProfileClient:
             threshold=float(out.get("threshold", cfg.threshold)),
             require_motion=bool(out.get("require_motion", cfg.require_motion)),
             require_open_eyes=bool(out.get("require_open_eyes", cfg.require_open_eyes)),
+            max_failed_attempts=clamp_max_failed_attempts(
+                out.get("max_failed_attempts", cfg.max_failed_attempts)
+            ),
         )

@@ -289,6 +289,7 @@ def _resolve_serve_options(args: argparse.Namespace) -> tuple[float, bool, bool]
 
 def _cmd_serve(args: argparse.Namespace) -> int:
     from engine.ipc_server import IRFaceVerifier, NamedPipeServer
+    from engine.lockout import BiometricLockout, SessionUnlockWatcher
 
     ensure_models()
     store = ProfileStore()
@@ -301,27 +302,37 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         require_motion=require_motion,
         require_open_eyes=require_open_eyes,
     )
+    # The persistent failed-scan lockout only runs under the SYSTEM service: its state file
+    # is ACL-restricted to SYSTEM/Administrators and the unlock watcher needs WTS access.
+    lockout = BiometricLockout() if args.service else None
+    unlock_watcher = SessionUnlockWatcher(lockout) if lockout is not None else None
     server = NamedPipeServer(
         pipe_name=args.pipe,
         store=store,
         verifier=verifier,
         service_mode=args.service,
+        lockout=lockout,
     )
     startup_msg = (
         f"WinIRFaceID IPC server v{__version__} listening on {args.pipe} "
         f"(service_mode={bool(args.service)}, enrolled_users={enrolled_count}, "
         f"threshold={threshold:.2f}, require_motion={require_motion}, "
-        f"require_open_eyes={require_open_eyes})"
+        f"require_open_eyes={require_open_eyes}, "
+        f"face_id_locked={lockout.is_locked() if lockout is not None else 'n/a'})"
     )
     logger.info(startup_msg)
     print(startup_msg, flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
+    if unlock_watcher is not None:
+        unlock_watcher.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down IPC server...", flush=True)
     finally:
+        if unlock_watcher is not None:
+            unlock_watcher.stop()
         server.close()
         sys.stdout.flush()
         sys.stderr.flush()

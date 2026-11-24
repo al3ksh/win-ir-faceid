@@ -850,7 +850,11 @@ def test_ir_face_verifier_require_motion_blocks_static_and_passes_on_motion(tmp_
         camera_discoverer=lambda: [dummy_cam],
         worker_factory=lambda **_kw: worker_static,
     )
-    assert verifier_static.verify(timeout_ms=150) == {"status": "failed", "reason": "timeout"}
+    assert verifier_static.verify(timeout_ms=150) == {
+        "status": "failed",
+        "reason": "timeout",
+        "face_detected": True,
+    }
 
     # Now verify 3D head motion triggers consecutive matches
     worker_motion = MagicMock()
@@ -931,7 +935,11 @@ def test_ir_face_verifier_require_open_eyes_rejects_closed_and_matches_open(tmp_
         camera_discoverer=lambda: [dummy_cam],
         worker_factory=lambda **_kw: worker_closed,
     )
-    assert verifier_closed.verify(timeout_ms=150) == {"status": "failed", "reason": "timeout"}
+    assert verifier_closed.verify(timeout_ms=150) == {
+        "status": "failed",
+        "reason": "timeout",
+        "face_detected": True,
+    }
 
     # Combined require_motion + require_open_eyes: blink (open -> closed -> open -> open)
     # registers motion on the closed frame and unlocks once eyes reopen!
@@ -988,6 +996,7 @@ def test_ir_face_verifier_no_enrolled_cancel_and_camera_error(tmp_path: Path) ->
     assert verifier2.verify(timeout_ms=2000, cancel_event=cancel_evt) == {
         "status": "failed",
         "reason": "cancelled",
+        "face_detected": False,
     }
     worker.stop.assert_called_once()
 
