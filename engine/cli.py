@@ -7,6 +7,7 @@ import getpass
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Sequence
 
@@ -326,6 +327,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     sys.stderr.flush()
     if unlock_watcher is not None:
         unlock_watcher.start()
+    threading.Thread(target=verifier.warm_up, name="WinIRFaceID-WarmUp", daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

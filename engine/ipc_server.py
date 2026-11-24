@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import ntsecuritycon
+import numpy as np
 import pywintypes
 import win32api
 import win32con
@@ -137,11 +138,34 @@ class IRFaceVerifier:
         self.min_eye_open_score = float(min_eye_open_score)
         self._camera_discoverer = camera_discoverer
         self._worker_factory = worker_factory
+        self._recognizer_lock = threading.Lock()
 
     def _get_recognizer(self) -> FaceRecognizer:
-        if self._recognizer is None:
-            self._recognizer = FaceRecognizer()
-        return self._recognizer
+        with self._recognizer_lock:
+            if self._recognizer is None:
+                self._recognizer = FaceRecognizer()
+            return self._recognizer
+
+    def warm_up(self) -> None:
+        """Load the models and run one dummy inference so the first real scan is fast.
+
+        OpenCV builds the YuNet / SFace graphs lazily on the first forward pass, which
+        otherwise delays the first unlock after boot by a second or two. A scan that
+        starts meanwhile simply waits for the lock.
+        """
+        started = time.monotonic()
+        try:
+            with self._recognizer_lock:
+                if self._recognizer is None:
+                    self._recognizer = FaceRecognizer()
+                rec = self._recognizer
+                blank = np.zeros((480, 640, 3), dtype=np.uint8)
+                rec.detect_largest(blank)
+                rec._recognizer.feature(np.zeros((112, 112, 3), dtype=np.uint8))
+        except Exception as exc:  # warm-up is best effort; verify loads models on demand
+            logger.warning("Model warm-up failed: %s", exc)
+            return
+        logger.info("Face models warmed up in %.1f s.", time.monotonic() - started)
 
     def _get_candidates(self, username: str) -> list[UserProfile]:
         clean = username.strip()

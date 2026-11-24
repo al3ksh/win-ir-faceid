@@ -1636,3 +1636,28 @@ def test_gui_app_controller_headless_http_security_and_lifecycle(
     with pytest.raises(Exception):
         urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1.0)
 
+
+
+def test_verifier_warm_up_runs_dummy_inference(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    from engine.ipc_server import IRFaceVerifier
+
+    rec = MagicMock()
+    verifier = IRFaceVerifier(ProfileStore(tmp_path / "profiles.enc"), recognizer=rec)
+    verifier.warm_up()
+    rec.detect_largest.assert_called_once()
+    rec._recognizer.feature.assert_called_once()
+    assert verifier._get_recognizer() is rec
+
+
+def test_verifier_warm_up_failure_is_not_fatal(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    from engine.ipc_server import IRFaceVerifier
+
+    rec = MagicMock()
+    rec.detect_largest.side_effect = RuntimeError("model broken")
+    verifier = IRFaceVerifier(ProfileStore(tmp_path / "profiles.enc"), recognizer=rec)
+    verifier.warm_up()  # logged, not raised
+    assert verifier._get_recognizer() is rec

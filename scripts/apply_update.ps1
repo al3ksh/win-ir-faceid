@@ -6,7 +6,7 @@
     re-verifies its SHA-256 checksum, safely extracts the archive (blocking path traversal and
     symlinks), stops WinIRFaceIDService, backs up existing payload files, swaps in the updated
     code and native binaries (without touching data\, models\, runtime\, .venv\, or wheels\),
-    updates pip dependencies only if requirements.txt changed, registers the updated Credential
+    refuses updates that change Python dependencies (those need the full installer), registers the updated Credential
     Provider DLL, restarts and verifies the service, and rolls back automatically on failure.
 #>
 # Permanent backward-compatible CLI contract (v0.3.0+): -ZipPath, -ExpectedSha256,
@@ -162,12 +162,18 @@ function Replace-DirectoryClean {
     Copy-TreeClean -Source $Source -Destination $Destination
 }
 
-function Get-FileSha256OrEmpty {
+function Get-RequirementsFingerprint {
+    # Content-only view of requirements.txt: ignores line endings, blank lines,
+    # comments, case and order, so a CRLF/LF-only difference never counts as a change.
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return ""
     }
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $lines = Get-Content -LiteralPath $Path |
+        ForEach-Object { ($_ -replace '#.*$', '').Trim().ToLowerInvariant() } |
+        Where-Object { $_ -ne "" } |
+        Sort-Object -Unique
+    return ($lines -join "`n")
 }
 
 function Expand-VerifiedZipSafe {
@@ -336,6 +342,15 @@ try {
         throw "Invalid update payload: missing 'bin\WinIRFaceIDProvider.dll'."
     }
 
+    # Delta updates never install Python packages: pip would pull unpinned code from
+    # PyPI into the environment the SYSTEM service runs from. A release that changes
+    # dependencies must be installed with the full offline installer instead.
+    $oldReqs = Get-RequirementsFingerprint -Path (Join-Path $ResolvedTarget "requirements.txt")
+    $newReqs = Get-RequirementsFingerprint -Path (Join-Path $ExtractDir "requirements.txt")
+    if ($oldReqs -ne "" -and $newReqs -ne "" -and $oldReqs -ne $newReqs) {
+        throw "This update changes Python dependencies and cannot be applied as a delta update. Install it with the full WinIRFaceID-Setup installer from GitHub Releases."
+    }
+
     # 6. Wait for GUI process to exit if requested.
     if ($WaitPid -gt 0) {
         Write-UpdateLog "Waiting up to 8s for PID $WaitPid to exit..."
@@ -389,12 +404,6 @@ try {
     }
     Write-UpdateLog "Backed up existing payload to protected staging."
 
-    # Record SHA-256 of existing vs incoming requirements.txt.
-    $targetReqPath = Join-Path $ResolvedTarget "requirements.txt"
-    $sourceReqPath = Join-Path $ExtractDir "requirements.txt"
-    $oldReqHash = Get-FileSha256OrEmpty -Path $targetReqPath
-    $newReqHash = Get-FileSha256OrEmpty -Path $sourceReqPath
-
     # 9. Cleanly replace payload directories (removing stale files; never touch data\, models\, runtime\, .venv\, or wheels\).
     $PayloadTouched = $true
     foreach ($dirName in $PayloadDirs) {
@@ -424,20 +433,7 @@ try {
     }
     Write-UpdateLog "Payload swap completed."
 
-    # 10. Run pip install only if requirements.txt changed and .venv exists.
-    $venvPython = Join-Path $ResolvedTarget ".venv\Scripts\python.exe"
-    if (($oldReqHash -ne $newReqHash) -and ($newReqHash -ne "") -and (Test-Path -LiteralPath $venvPython) -and (Test-Path -LiteralPath $targetReqPath)) {
-        Write-UpdateLog "requirements.txt changed ($oldReqHash -> $newReqHash); updating Python dependencies..."
-        & $venvPython -m pip install --disable-pip-version-check --no-input -r $targetReqPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "pip install failed with exit code $LASTEXITCODE."
-        }
-    }
-    else {
-        Write-UpdateLog "requirements.txt unchanged or .venv missing; skipping pip."
-    }
-
-    # 11. Install updated Credential Provider DLL.
+    # 10. Install updated Credential Provider DLL.
     $cpInstallScript = Join-Path $ResolvedTarget "credential_provider\install.ps1"
     $targetDllPath = Join-Path $ResolvedTarget "bin\WinIRFaceIDProvider.dll"
     if ((Test-Path -LiteralPath $cpInstallScript) -and (Test-Path -LiteralPath $targetDllPath)) {
@@ -448,7 +444,7 @@ try {
         }
     }
 
-    # 12. Start WinIRFaceIDService and verify Named Pipe up to 15 seconds.
+    # 11. Start WinIRFaceIDService and verify Named Pipe up to 15 seconds.
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($null -ne $svc) {
         Write-UpdateLog "Starting $ServiceName..."
